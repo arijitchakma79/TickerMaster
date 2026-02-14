@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -154,4 +155,139 @@ async def generate_agent_decision(
             "quantity": 0,
             "confidence": 0.35,
             "rationale": "OpenRouter call failed. Fallback to no-trade to preserve simulation integrity.",
+        }
+
+
+def _fallback_tracker_intent(prompt: str) -> Dict[str, Any]:
+    text = prompt.strip()
+    upper = text.upper()
+    symbol_match = re.search(r"\b[A-Z]{1,5}\b", upper)
+    symbol = symbol_match.group(0) if symbol_match else "AAPL"
+    threshold_match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
+    threshold = float(threshold_match.group(1)) if threshold_match else 2.0
+    lower = text.lower()
+    intent = "create_agent"
+    if "pause" in lower or "stop" in lower:
+        intent = "pause_agent"
+    elif "delete" in lower or "remove" in lower:
+        intent = "delete_agent"
+    elif "status" in lower or "what are you seeing" in lower:
+        intent = "status"
+    return {
+        "intent": intent,
+        "symbol": symbol,
+        "name": f"{symbol} Associate",
+        "auto_simulate": "simulate" in lower,
+        "triggers": {
+            "price_change_pct": threshold,
+            "volume_spike_ratio": 1.8,
+            "sentiment_bearish_threshold": -0.25,
+            "sentiment_bullish_threshold": 0.25,
+        },
+        "response": f"Prepared {intent} plan for {symbol} with {threshold:.2f}% price trigger and sentiment checks.",
+    }
+
+
+async def parse_tracker_instruction(settings: Settings, prompt: str) -> Dict[str, Any]:
+    if not settings.openai_api_key:
+        return _fallback_tracker_intent(prompt)
+
+    system = (
+        "You are a hedge-fund associate assistant. Convert user instruction into strict JSON with keys: "
+        "intent(create_agent|update_agent|delete_agent|pause_agent|resume_agent|status|research_note), "
+        "symbol, name, auto_simulate(boolean), triggers(object), response(string). "
+        "triggers should include any of: price_change_pct, volume_spike_ratio, sentiment_bearish_threshold, "
+        "sentiment_bullish_threshold, x_bearish_threshold, rsi_low, rsi_high. "
+        "No markdown."
+    )
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.openai_api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            parsed = _safe_json_extract(content)
+            if not parsed:
+                return _fallback_tracker_intent(prompt)
+            parsed.setdefault("triggers", {})
+            parsed.setdefault("auto_simulate", False)
+            parsed.setdefault("response", "Instruction parsed.")
+            return parsed
+    except Exception:
+        return _fallback_tracker_intent(prompt)
+
+
+async def tracker_agent_chat_response(
+    settings: Settings,
+    agent: Dict[str, Any],
+    market_state: Dict[str, Any],
+    research_state: Dict[str, Any],
+    user_message: str,
+) -> Dict[str, str]:
+    if not settings.openai_api_key:
+        symbol = str(agent.get("symbol", ""))
+        sentiment = float(research_state.get("aggregate_sentiment", 0.0))
+        return {
+            "response": (
+                f"{agent.get('name', 'Agent')} update for {symbol}: price {market_state.get('price')} and sentiment {sentiment:.2f}. "
+                "I am monitoring catalyst risk, social tone, and volume regime for trigger changes."
+            ),
+            "model": "fallback-template",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    system = (
+        "You are a buy-side research associate agent briefing a hedge fund manager. "
+        "Be concise, specific, and action-oriented. Mention current market state, social sentiment, and next steps. "
+        "No investment guarantee language."
+    )
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "agent": agent,
+                        "market_state": market_state,
+                        "research_state": research_state,
+                        "manager_message": user_message,
+                    },
+                    ensure_ascii=True,
+                ),
+            },
+        ],
+        "temperature": 0.25,
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.openai_api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            return {
+                "response": content,
+                "model": "gpt-4o-mini",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+    except Exception:
+        return {
+            "response": "Briefing unavailable due to model request failure. Continue monitoring price, flow, and sentiment drift.",
+            "model": "fallback-template",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
         }

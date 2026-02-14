@@ -7,10 +7,16 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import httpx
+try:
+    from requests_oauthlib import OAuth1Session
+except Exception:  # pragma: no cover
+    OAuth1Session = None  # type: ignore[assignment]
 
 from app.config import Settings
 from app.schemas import ResearchRequest, ResearchResponse, SentimentBreakdown, SourceLink
+from app.services.agent_logger import log_agent_activity
 from app.services.prediction_markets import fetch_kalshi_markets, fetch_polymarket_markets
+from app.services.research_cache import get_cached_research, set_cached_research
 
 
 POSITIVE_WORDS = {
@@ -105,14 +111,35 @@ async def _perplexity_summary(ticker: str, settings: Settings) -> Dict[str, Any]
     }
 
     try:
+        await log_agent_activity(
+            module="research",
+            agent_name="Perplexity Sonar",
+            action=f"Fetching AI summary for {ticker}",
+            status="running",
+        )
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post("https://api.perplexity.ai/chat/completions", headers=headers, json=body)
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
+            citations = data.get("citations", [])
+            links = [
+                SourceLink(source="Perplexity", title=f"Source {idx + 1}", url=url)
+                for idx, url in enumerate(citations[:6])
+                if isinstance(url, str)
+            ]
+            if not links:
+                links = [SourceLink(source="Perplexity", title=f"{ticker} catalysts", url="https://www.perplexity.ai")]
+            await log_agent_activity(
+                module="research",
+                agent_name="Perplexity Sonar",
+                action=f"Summary complete for {ticker}",
+                status="success",
+                details={"citations": len(links)},
+            )
             return {
                 "summary": content,
-                "links": [SourceLink(source="Perplexity", title=f"{ticker} catalysts", url="https://www.perplexity.ai")],
+                "links": links,
                 "score": _sentiment_score_from_text(content),
             }
     except Exception as exc:
@@ -125,7 +152,17 @@ async def _perplexity_summary(ticker: str, settings: Settings) -> Dict[str, Any]
 
 
 async def _x_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
-    if not settings.x_api_bearer_token:
+    bearer = settings.x_api_bearer_token.strip()
+    # Ignore clearly invalid placeholders accidentally copied from other providers.
+    if bearer.startswith("sk-or-"):
+        bearer = ""
+
+    if not bearer and not (
+        settings.x_consumer_key
+        and settings.x_consumer_secret
+        and settings.x_access_token
+        and settings.x_access_token_secret
+    ):
         text = f"Demo X flow for {ticker}: traders are debating valuation vs. AI-driven revenue acceleration."
         return {
             "summary": text,
@@ -133,23 +170,48 @@ async def _x_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
             "score": _sentiment_score_from_text(text),
         }
 
-    headers = {"Authorization": f"Bearer {settings.x_api_bearer_token}"}
+    headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
     params = {
         "query": f"${ticker} lang:en -is:retweet",
         "max_results": 25,
         "tweet.fields": "created_at,text,public_metrics",
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get("https://api.twitter.com/2/tweets/search/recent", headers=headers, params=params)
+    tweets: List[Dict[str, Any]] = []
+    error_msg = ""
+
+    if headers:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get("https://api.twitter.com/2/tweets/search/recent", headers=headers, params=params)
+                resp.raise_for_status()
+                tweets = resp.json().get("data", [])
+        except Exception as exc:
+            error_msg = f"X v2 bearer fetch failed: {exc}"
+
+    # Fallback: OAuth1 v1.1 search for free-tier/user-token scenarios.
+    if not tweets and OAuth1Session is not None and settings.x_consumer_key and settings.x_consumer_secret and settings.x_access_token and settings.x_access_token_secret:
+        try:
+            oauth = OAuth1Session(
+                client_key=settings.x_consumer_key,
+                client_secret=settings.x_consumer_secret,
+                resource_owner_key=settings.x_access_token,
+                resource_owner_secret=settings.x_access_token_secret,
+            )
+            resp = oauth.get(
+                "https://api.twitter.com/1.1/search/tweets.json",
+                params={"q": f"${ticker} -filter:retweets", "lang": "en", "count": 25, "result_type": "recent"},
+                timeout=15,
+            )
             resp.raise_for_status()
-            tweets = resp.json().get("data", [])
-    except Exception as exc:
-        tweets = []
-        error_msg = f"X fetch failed: {exc}"
-    else:
-        error_msg = ""
+            statuses = resp.json().get("statuses", [])
+            tweets = [{"text": status.get("text", ""), "created_at": status.get("created_at")} for status in statuses]
+            error_msg = ""
+        except Exception as exc:
+            if error_msg:
+                error_msg = f"{error_msg}; OAuth1 fallback failed: {exc}"
+            else:
+                error_msg = f"X OAuth1 fallback failed: {exc}"
 
     if not tweets:
         summary = error_msg or f"No high-signal X posts found for {ticker}."
@@ -159,11 +221,20 @@ async def _x_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
         score = _sentiment_score_from_text(joined)
         summary = f"Parsed {len(tweets)} recent X posts for {ticker}. Crowd tone is {_label(score)}."
 
-    return {
+    result = {
         "summary": summary,
         "links": [SourceLink(source="X", title=f"{ticker} search", url=f"https://x.com/search?q=%24{ticker}")],
         "score": score,
+        "posts": tweets[:25],
     }
+    await log_agent_activity(
+        module="research",
+        agent_name="X Sentiment",
+        action=f"Collected X posts for {ticker}",
+        status="success" if tweets else "pending",
+        details={"count": len(tweets), "score": round(score, 3)},
+    )
+    return result
 
 
 async def _reddit_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
@@ -198,13 +269,22 @@ async def _reddit_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
         score = _sentiment_score_from_text(joined)
         summary = f"Reddit chatter sampled from {len(posts)} posts. Sentiment skew is {_label(score)}."
 
-    return {
+    result = {
         "summary": summary,
         "links": [
             SourceLink(source="Reddit", title=f"{ticker} search", url=f"https://www.reddit.com/search/?q={ticker}")
         ],
         "score": score,
+        "posts": posts[:20],
     }
+    await log_agent_activity(
+        module="research",
+        agent_name="Reddit Sentiment",
+        action=f"Collected Reddit posts for {ticker}",
+        status="success" if posts else "pending",
+        details={"count": len(posts), "score": round(score, 3)},
+    )
+    return result
 
 
 def _build_narratives(items: List[SentimentBreakdown]) -> List[str]:
@@ -222,6 +302,10 @@ def _build_narratives(items: List[SentimentBreakdown]) -> List[str]:
 
 async def run_research(request: ResearchRequest, settings: Settings) -> ResearchResponse:
     ticker = request.ticker.upper().strip()
+    cache_key = f"research:{request.timeframe}:{int(request.include_prediction_markets)}"
+    cached = get_cached_research(ticker, cache_key)
+    if cached:
+        return ResearchResponse(**cached)
 
     perplexity_task = _perplexity_summary(ticker, settings)
     x_task = _x_summary(ticker, settings)
@@ -261,7 +345,8 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
         )
         prediction_markets = kalshi_markets + polymarket_markets
 
-    aggregate = float(sum(item.score for item in breakdown) / max(1, len(breakdown)))
+    # Composite weighting from spec: Perplexity 45%, Reddit 30%, X 25%
+    aggregate = float((breakdown[0].score * 0.45) + (breakdown[2].score * 0.30) + (breakdown[1].score * 0.25))
 
     links = [
         SourceLink(source="Perplexity Sonar", title="Perplexity", url="https://www.perplexity.ai"),
@@ -272,10 +357,11 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
         SourceLink(source="Morningstar", title="Morningstar", url="https://www.morningstar.com/"),
         SourceLink(source="Reuters", title="Reuters Markets", url="https://www.reuters.com/markets/"),
         SourceLink(source="J.P. Morgan", title="J.P. Morgan Insights", url="https://www.jpmorgan.com/insights"),
-        SourceLink(source="Yahoo Finance", title="Yahoo Finance", url="https://finance.yahoo.com/"),
+        SourceLink(source="Alpaca Market Data", title="Alpaca Docs", url="https://docs.alpaca.markets/docs/about-market-data-api"),
+        SourceLink(source="Finnhub", title="Finnhub API", url="https://finnhub.io/"),
     ]
 
-    return ResearchResponse(
+    response = ResearchResponse(
         ticker=ticker,
         generated_at=datetime.now(timezone.utc).isoformat(),
         aggregate_sentiment=round(aggregate, 3),
@@ -285,3 +371,23 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
         prediction_markets=prediction_markets,
         tool_links=links,
     )
+    set_cached_research(ticker, cache_key, response.model_dump(), ttl_minutes=15)
+    await log_agent_activity(
+        module="research",
+        agent_name="Composite Sentiment",
+        action=f"Computed weighted sentiment for {ticker}",
+        status="success",
+        details={"score": response.aggregate_sentiment, "recommendation": response.recommendation},
+    )
+    return response
+
+
+async def get_x_sentiment(ticker: str, settings: Settings) -> Dict[str, Any]:
+    out = await _x_summary(ticker.upper().strip(), settings)
+    return {
+        "ticker": ticker.upper().strip(),
+        "sentiment_score": round(float(out.get("score", 0.0)), 3),
+        "summary": str(out.get("summary", "")),
+        "posts": out.get("posts", []),
+        "links": [link.model_dump() if hasattr(link, "model_dump") else link for link in out.get("links", [])],
+    }

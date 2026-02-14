@@ -12,6 +12,7 @@ async def health(request: Request):
     settings = request.app.state.settings
     return {
         "ok": True,
+        "status": "ok",
         "app": settings.app_name,
         "environment": settings.environment,
         "timestamp": datetime.now(timezone.utc).isoformat(),

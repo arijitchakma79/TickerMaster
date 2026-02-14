@@ -11,8 +11,10 @@ import numpy as np
 
 from app.config import Settings
 from app.schemas import AgentConfig, SimulationStartRequest, SimulationState, TradeRecord
+from app.services.agent_logger import log_agent_activity
 from app.services.llm import generate_agent_decision
 from app.services.market_data import fetch_sp500_returns_window
+from app.services.simulation_store import complete_simulation_record, create_simulation_record
 from app.ws_manager import WSManager
 
 
@@ -81,6 +83,9 @@ class SessionRuntime:
     trades: Deque[TradeRecord] = field(default_factory=lambda: deque(maxlen=200))
     recent_prices: Deque[float] = field(default_factory=lambda: deque(maxlen=50))
     running: bool = True
+    simulation_record_id: str | None = None
+    paused: bool = False
+    paused_at: datetime | None = None
 
 
 class SimulationOrchestrator:
@@ -122,6 +127,10 @@ class SimulationOrchestrator:
             volatility=request.volatility,
             agents=runtime_agents,
             recent_prices=deque([request.initial_price], maxlen=50),
+            simulation_record_id=create_simulation_record(
+                config=request.model_dump(),
+                user_id=request.user_id,
+            ),
         )
         self.sessions[session_id] = runtime
         self.tasks[session_id] = asyncio.create_task(self._run_loop(runtime), name=f"simulation-{session_id}")
@@ -136,6 +145,13 @@ class SimulationOrchestrator:
             },
             channel="simulation",
         )
+        await log_agent_activity(
+            module="simulation",
+            agent_name="Simulation Orchestrator",
+            action=f"Started simulation {session_id} for {runtime.ticker}",
+            status="success",
+            details={"agents": list(runtime_agents.keys()), "duration_seconds": request.duration_seconds},
+        )
 
         return self._to_state(runtime)
 
@@ -145,6 +161,8 @@ class SimulationOrchestrator:
             return False
 
         runtime.running = False
+        runtime.paused = False
+        runtime.paused_at = None
         task = self.tasks.get(session_id)
         if task and not task.done():
             task.cancel()
@@ -160,7 +178,62 @@ class SimulationOrchestrator:
             },
             channel="simulation",
         )
+        if runtime.simulation_record_id:
+            complete_simulation_record(
+                record_id=runtime.simulation_record_id,
+                results=self._to_state(runtime).model_dump(),
+                status="completed",
+            )
+        await log_agent_activity(
+            module="simulation",
+            agent_name="Simulation Orchestrator",
+            action=f"Stopped simulation {session_id}",
+            status="success",
+        )
         return True
+
+    async def pause(self, session_id: str) -> SimulationState | None:
+        runtime = self.sessions.get(session_id)
+        if not runtime or not runtime.running:
+            return None
+        if runtime.paused:
+            return self._to_state(runtime)
+
+        runtime.paused = True
+        runtime.paused_at = datetime.now(timezone.utc)
+        await self.ws_manager.broadcast(
+            {
+                "channel": "simulation",
+                "type": "simulation_paused",
+                "session_id": session_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+            channel="simulation",
+        )
+        return self._to_state(runtime)
+
+    async def resume(self, session_id: str) -> SimulationState | None:
+        runtime = self.sessions.get(session_id)
+        if not runtime or not runtime.running:
+            return None
+        if not runtime.paused:
+            return self._to_state(runtime)
+
+        now = datetime.now(timezone.utc)
+        if runtime.paused_at:
+            runtime.ends_at = runtime.ends_at + (now - runtime.paused_at)
+        runtime.paused = False
+        runtime.paused_at = None
+        await self.ws_manager.broadcast(
+            {
+                "channel": "simulation",
+                "type": "simulation_resumed",
+                "session_id": session_id,
+                "timestamp": now.isoformat(),
+            },
+            channel="simulation",
+        )
+        return self._to_state(runtime)
 
     def get(self, session_id: str) -> SimulationState | None:
         runtime = self.sessions.get(session_id)
@@ -289,6 +362,7 @@ class SimulationOrchestrator:
                     "risk_limit": config.risk_limit,
                     "aggressiveness": config.aggressiveness,
                     "max_trade_size": config.trade_size * 4,
+                    "strategy_prompt": config.strategy_prompt,
                 },
             )
 
@@ -353,10 +427,23 @@ class SimulationOrchestrator:
             rationale=rationale,
         )
         runtime.trades.appendleft(trade)
+        asyncio.create_task(
+            log_agent_activity(
+                module="simulation",
+                agent_name=agent.config.name,
+                action=f"{side.upper()} {valid_qty} {runtime.ticker} @ {round(fill_price, 2)}",
+                status="success",
+                details={"slippage_bps": round(slippage_bps, 2), "rationale": rationale},
+            )
+        )
         return trade
 
     async def _run_loop(self, runtime: SessionRuntime) -> None:
         while runtime.running and datetime.now(timezone.utc) < runtime.ends_at:
+            if runtime.paused:
+                await asyncio.sleep(0.2)
+                continue
+
             runtime.tick += 1
 
             market_return = self._sample_market_return(runtime.volatility)
@@ -408,6 +495,12 @@ class SimulationOrchestrator:
             await asyncio.sleep(1)
 
         runtime.running = False
+        if runtime.simulation_record_id:
+            complete_simulation_record(
+                record_id=runtime.simulation_record_id,
+                results=self._to_state(runtime).model_dump(),
+                status="completed",
+            )
         await self.ws_manager.broadcast(
             {
                 "channel": "simulation",
@@ -423,6 +516,7 @@ class SimulationOrchestrator:
             session_id=runtime.session_id,
             ticker=runtime.ticker,
             running=runtime.running,
+            paused=runtime.paused,
             tick=runtime.tick,
             current_price=round(runtime.current_price, 4),
             volatility=runtime.volatility,

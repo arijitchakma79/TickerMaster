@@ -5,10 +5,11 @@ TickerMaster is a real-time sandbox for learning trading dynamics through AI age
 Core product surfaces:
 1. `Research`: Perplexity Sonar + X + Reddit + prediction-market context.
 2. `Simulation`: Multi-agent arena with order-book impact, slippage, delayed news propagation, and crash regimes.
-3. `Tracker`: Yahoo-style watchlist with valuation metrics, spike detection, and alert pipeline.
+3. `Tracker`: Real-time watchlist with valuation metrics, spike detection, and alert pipeline.
 
 ## Stack
-- Backend: `FastAPI` + `WebSockets` + `yfinance`
+- Backend: `FastAPI` + `WebSockets`
+- Market Data: `Alpaca` (primary) + `Finnhub` (fallback)
 - Frontend: `React` + `TypeScript` + `Vite` + `Recharts`
 - Agent models: `OpenRouter` (open-source model default: `meta-llama/llama-3.1-8b-instruct`)
 - Commentary model: `OpenAI`
@@ -35,29 +36,70 @@ TickerMaster/
   .gitignore
 ```
 
-## Quick Start
+## Step-by-Step Startup
 
-### 1) Configure environment
-Copy `.env.example` to `.env` in the project root or into `backend/.env` and set keys.
+### 1) Create `.env` in repo root
+Create `/TickerMaster/.env` and include at minimum:
 
-### 2) Run backend
+```env
+# Supabase
+SUPABASE_URL=https://<your-project>.supabase.co
+SUPABASE_KEY=<your-publishable-key>
+SUPABASE_SERVICE_KEY=<your-secret-service-role-key>
+DATABASE_URL=postgresql://postgres:<password>@db.<project>.supabase.co:5432/postgres
+
+# Backend URL
+BACKEND_URL=http://localhost:8000
+```
+
+Add your API keys for Alpaca / Finnhub / Perplexity / OpenAI / OpenRouter / X / Browserbase / Modal as needed.
+
+### 2) Apply database schema in Supabase
+In Supabase Dashboard:
+1. Open `SQL Editor`.
+2. Paste contents of `supabase/schema.sql`.
+3. Run it once.
+
+This creates tables like `research_cache`, `agent_activity`, `simulations`, `tracker_agents`, and `tracker_alerts`.
+
+### 3) Start backend (Terminal A)
 ```bash
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 3) Run frontend
+Backend URL: `http://localhost:8000`
+
+### 4) Start frontend (Terminal B)
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-Frontend: `http://localhost:5173`  
-Backend: `http://localhost:8000`
+Frontend URL: `http://localhost:5173`
+
+### 5) Verify backend is healthy
+```bash
+curl http://localhost:8000/api/health
+curl http://localhost:8000/api/ticker/NVDA/quote
+curl http://localhost:8000/api/ticker/NVDA/ai-research
+curl http://localhost:8000/api/ticker/NVDA/sentiment
+curl "http://localhost:8000/api/prediction-markets?query=fed"
+curl http://localhost:8000/api/ticker/NVDA/x-sentiment
+```
+
+### 6) Optional: verify Supabase writes
+Use Supabase SQL Editor or REST to confirm rows are being inserted into:
+- `research_cache`
+- `agent_activity`
+- `simulations`
+- `tracker_alerts`
+
+If cache writes appear but activity/alerts do not, confirm backend is using `SUPABASE_SERVICE_KEY` (not only publishable key).
 
 ## API Highlights
 - `POST /research/analyze`
@@ -81,8 +123,8 @@ Backend: `http://localhost:8000`
 - Perplexity Sonar API for catalyst synthesis.
 - X API and Reddit API ingestion for public sentiment flow.
 - Kalshi + Polymarket adapters for prediction-market context.
-- Finance graphing via Yahoo-style candles and metric tables.
-- Tool links exposed in UI for Morningstar / Reuters / J.P. Morgan / Yahoo Finance.
+- Finance graphing via Alpaca/Finnhub candles and metric tables.
+- Tool links exposed in UI for Morningstar / Reuters / J.P. Morgan / Alpaca / Finnhub.
 
 ### Simulation
 - Natural-language sandbox trigger endpoint for Modal (`/simulation/modal/sandbox`).
@@ -132,7 +174,8 @@ Then open Kitchen to test/deploy your Recipe and wire alert payloads:
 - Morningstar: https://www.morningstar.com/
 - Reuters Markets: https://www.reuters.com/markets/
 - J.P. Morgan Insights: https://www.jpmorgan.com/insights
-- Yahoo Finance: https://finance.yahoo.com/
+- Alpaca Market Data: https://docs.alpaca.markets/docs/about-market-data-api
+- Finnhub: https://finnhub.io/
 
 ## Notes
 - This MVP is educational and not investment advice.

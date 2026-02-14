@@ -1,19 +1,31 @@
 import { useEffect, useMemo, useState } from "react";
-import { addAlert, getTrackerSnapshot, setWatchlist, triggerTrackerPoll } from "../lib/api";
+import { addAlert, getTrackerSnapshot, searchTickerDirectory, triggerTrackerPoll } from "../lib/api";
 import { formatCompactNumber, formatCurrency, formatPercent } from "../lib/format";
-import type { TrackerSnapshot, WSMessage } from "../lib/types";
+import { resolveTickerCandidate } from "../lib/tickerInput";
+import type { TickerLookup, TrackerSnapshot, WSMessage } from "../lib/types";
+import WatchlistBar from "./WatchlistBar";
 
 interface Props {
   activeTicker: string;
   onTickerChange: (ticker: string) => void;
   trackerEvent?: WSMessage;
+  watchlist: string[];
+  onWatchlistChange: (tickers: string[]) => Promise<string[]>;
 }
 
-export default function TrackerPanel({ activeTicker, onTickerChange, trackerEvent }: Props) {
-  const [watchlistInput, setWatchlistInput] = useState("AAPL,MSFT,NVDA,TSLA,SPY");
+export default function TrackerPanel({
+  activeTicker,
+  onTickerChange,
+  trackerEvent,
+  watchlist,
+  onWatchlistChange
+}: Props) {
+  const [watchlistInput, setWatchlistInput] = useState("");
+  const [watchlistInputFocused, setWatchlistInputFocused] = useState(false);
+  const [watchlistSuggestions, setWatchlistSuggestions] = useState<TickerLookup[]>([]);
+  const [watchlistSearchLoading, setWatchlistSearchLoading] = useState(false);
   const [snapshot, setSnapshot] = useState<TrackerSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
-  const [alertTicker, setAlertTicker] = useState(activeTicker);
   const [threshold, setThreshold] = useState(2);
   const [direction, setDirection] = useState<"up" | "down" | "either">("either");
 
@@ -35,25 +47,75 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
     [snapshot]
   );
 
-  async function handleUpdateWatchlist() {
+  useEffect(() => {
+    const query = watchlistInput.trim();
+    if (!query) {
+      setWatchlistSuggestions([]);
+      setWatchlistSearchLoading(false);
+      return;
+    }
+
+    let active = true;
+    const timer = window.setTimeout(() => {
+      setWatchlistSearchLoading(true);
+      void searchTickerDirectory(query, 8)
+        .then((results) => {
+          if (!active) return;
+          setWatchlistSuggestions(results);
+        })
+        .catch(() => {
+          if (!active) return;
+          setWatchlistSuggestions([]);
+        })
+        .finally(() => {
+          if (!active) return;
+          setWatchlistSearchLoading(false);
+        });
+    }, 180);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [watchlistInput]);
+
+  const availableWatchlistSuggestions = useMemo(
+    () => watchlistSuggestions.filter((entry) => !watchlist.includes(entry.ticker)),
+    [watchlistSuggestions, watchlist]
+  );
+  const resolvedInputTicker = useMemo(
+    () => resolveTickerCandidate(watchlistInput, watchlistSuggestions),
+    [watchlistInput, watchlistSuggestions]
+  );
+  const alertTargetTicker = resolvedInputTicker || activeTicker;
+
+  async function handleAddToWatchlist(rawInput?: string) {
+    const candidate = rawInput ?? watchlistInput;
+    const resolvedTicker = resolveTickerCandidate(candidate, watchlistSuggestions);
+    if (!resolvedTicker) return;
+    if (watchlist.includes(resolvedTicker)) {
+      setWatchlistInput("");
+      onTickerChange(resolvedTicker);
+      return;
+    }
+
     setLoading(true);
     try {
-      const values = watchlistInput
-        .split(",")
-        .map((token) => token.trim().toUpperCase())
-        .filter(Boolean);
-      const updated = await setWatchlist(values);
-      setWatchlistInput(updated.join(","));
+      await onWatchlistChange([...watchlist, resolvedTicker]);
       const refreshed = await triggerTrackerPoll();
       setSnapshot(refreshed);
+      onTickerChange(resolvedTicker);
+      setWatchlistInput("");
+      setWatchlistInputFocused(false);
     } finally {
       setLoading(false);
     }
   }
 
   async function handleAddAlert() {
+    if (!alertTargetTicker) return;
     await addAlert({
-      ticker: alertTicker.trim().toUpperCase(),
+      ticker: alertTargetTicker,
       threshold_percent: threshold,
       direction
     });
@@ -69,31 +131,84 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
     }
   }
 
+  function handleRemoveWatchlistTicker(symbol: string) {
+    if (watchlist.length <= 1) return;
+    void onWatchlistChange(watchlist.filter((tickerSymbol) => tickerSymbol !== symbol));
+  }
+
   return (
     <section className="panel stack stagger">
       <header className="panel-header">
         <h2>Tracker</h2>
-        <p>Yahoo-style ticker monitor with valuation metrics, alerting, and live anomaly detection pipeline.</p>
+        <p>Real-time ticker monitor with valuation metrics, alerting, and live anomaly detection pipeline.</p>
       </header>
 
-      <div className="glass-card card-row tracker-actions">
-        <label>
-          Watchlist
-          <input value={watchlistInput} onChange={(event) => setWatchlistInput(event.target.value.toUpperCase())} />
+      <WatchlistBar
+        watchlist={watchlist}
+        activeTicker={activeTicker}
+        onSelectTicker={onTickerChange}
+        onRemoveTicker={handleRemoveWatchlistTicker}
+      />
+
+      <div className="glass-card card-row tracker-actions tracker-watchlist-card">
+        <label className="watchlist-add-field">
+          Add Company / Ticker
+          <div className="ticker-autocomplete">
+            <input
+              value={watchlistInput}
+              placeholder="Type Tesla, Apple, Nvidia, SPY…"
+              onFocus={() => setWatchlistInputFocused(true)}
+              onBlur={() => setTimeout(() => setWatchlistInputFocused(false), 120)}
+              onChange={(event) => setWatchlistInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") return;
+                event.preventDefault();
+                const topSuggestion = availableWatchlistSuggestions[0]?.ticker;
+                void handleAddToWatchlist(topSuggestion ?? watchlistInput);
+              }}
+            />
+            {watchlistInputFocused && watchlistInput.trim() ? (
+              <div className="ticker-suggestions" role="listbox" aria-label="Ticker suggestions">
+                {availableWatchlistSuggestions.length > 0 ? (
+                  availableWatchlistSuggestions.map((entry) => (
+                    <button
+                      key={`${entry.ticker}-${entry.name}`}
+                      type="button"
+                      className="ticker-suggestion"
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => void handleAddToWatchlist(entry.ticker)}
+                    >
+                      <span className="ticker-suggestion-symbol">{entry.ticker}</span>
+                      <span className="ticker-suggestion-name">{entry.name}</span>
+                    </button>
+                  ))
+                ) : watchlistSearchLoading ? (
+                  <p className="ticker-suggestion-empty">Searching…</p>
+                ) : (
+                  <p className="ticker-suggestion-empty">No matches found</p>
+                )}
+              </div>
+            ) : null}
+          </div>
         </label>
-        <button onClick={handleUpdateWatchlist} disabled={loading}>
-          Update List
+        <button onClick={() => void handleAddToWatchlist()} disabled={loading || watchlistInput.trim().length === 0}>
+          Add To Watchlist
         </button>
         <button className="secondary" onClick={handlePoll} disabled={loading}>
-          {loading ? "Polling…" : "Poll Now"}
+          {loading ? "Refreshing…" : "Refresh Market Data"}
         </button>
       </div>
 
       <div className="glass-card card-row tracker-actions">
-        <label>
-          Alert Ticker
-          <input value={alertTicker} onChange={(event) => setAlertTicker(event.target.value.toUpperCase())} />
-        </label>
+        <div className="tracker-alert-target">
+          <p className="muted">Alert Target</p>
+          <strong>{alertTargetTicker}</strong>
+          <p className="muted">
+            {resolvedInputTicker
+              ? "Using the ticker resolved from Add Company / Ticker."
+              : "Using the currently selected watchlist ticker."}
+          </p>
+        </div>
         <label>
           Threshold %
           <input

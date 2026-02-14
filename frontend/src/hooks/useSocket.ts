@@ -7,35 +7,77 @@ export function useSocket() {
   const [connected, setConnected] = useState(false);
 
   useEffect(() => {
-    const socket = new WebSocket(getWsUrl());
+    let closed = false;
+    let socket: WebSocket | null = null;
+    let heartbeat: number | null = null;
+    let reconnectTimer: number | null = null;
 
-    socket.onopen = () => {
-      setConnected(true);
-      socket.send("ping");
-    };
-
-    socket.onclose = () => {
-      setConnected(false);
-    };
-
-    socket.onmessage = (ev) => {
-      try {
-        const message = JSON.parse(ev.data) as WSMessage;
-        setEvents((prev) => [message, ...prev].slice(0, 120));
-      } catch {
-        // Ignore malformed payloads.
+    const clearHeartbeat = () => {
+      if (heartbeat !== null) {
+        window.clearInterval(heartbeat);
+        heartbeat = null;
       }
     };
 
-    const heartbeat = window.setInterval(() => {
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send("ping");
+    const clearReconnect = () => {
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
-    }, 10000);
+    };
+
+    const scheduleReconnect = () => {
+      if (closed || reconnectTimer !== null) return;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, 2000);
+    };
+
+    const connect = () => {
+      if (closed) return;
+      socket = new WebSocket(getWsUrl());
+
+      socket.onopen = () => {
+        setConnected(true);
+        clearReconnect();
+        socket?.send("ping");
+        clearHeartbeat();
+        heartbeat = window.setInterval(() => {
+          if (socket?.readyState === WebSocket.OPEN) {
+            socket.send("ping");
+          }
+        }, 10000);
+      };
+
+      socket.onclose = () => {
+        setConnected(false);
+        clearHeartbeat();
+        scheduleReconnect();
+      };
+
+      socket.onerror = () => {
+        setConnected(false);
+      };
+
+      socket.onmessage = (ev) => {
+        try {
+          const message = JSON.parse(ev.data) as WSMessage;
+          if (message.type === "pong") return;
+          setEvents((prev) => [message, ...prev].slice(0, 120));
+        } catch {
+          // Ignore malformed payloads.
+        }
+      };
+    };
+
+    connect();
 
     return () => {
-      window.clearInterval(heartbeat);
-      socket.close();
+      closed = true;
+      clearReconnect();
+      clearHeartbeat();
+      socket?.close();
     };
   }, []);
 

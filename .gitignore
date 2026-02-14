@@ -21,6 +21,10 @@ node_modules/
 dist/
 .vite/
 *.tsbuildinfo
+.next/
+out/
+build/
+.modal/
 
 # macOS
 .DS_Store

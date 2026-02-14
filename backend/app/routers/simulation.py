@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from app.schemas import SimulationStartRequest
 from app.services.modal_integration import modal_cron_health, spin_modal_sandbox
+from app.services.user_context import get_user_id_from_request
 
 router = APIRouter(prefix="/simulation", tags=["simulation"])
 
@@ -17,6 +18,8 @@ class SandboxRequest(BaseModel):
 @router.post("/start")
 async def start_simulation(payload: SimulationStartRequest, request: Request):
     orchestrator = request.app.state.orchestrator
+    if not payload.user_id:
+        payload.user_id = get_user_id_from_request(request)
     return await orchestrator.start(payload)
 
 
@@ -27,6 +30,24 @@ async def stop_simulation(session_id: str, request: Request):
     if not stopped:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"ok": True, "session_id": session_id}
+
+
+@router.post("/pause/{session_id}")
+async def pause_simulation(session_id: str, request: Request):
+    orchestrator = request.app.state.orchestrator
+    state = await orchestrator.pause(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found or not running")
+    return state
+
+
+@router.post("/resume/{session_id}")
+async def resume_simulation(session_id: str, request: Request):
+    orchestrator = request.app.state.orchestrator
+    state = await orchestrator.resume(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found or not running")
+    return state
 
 
 @router.get("/state/{session_id}")
