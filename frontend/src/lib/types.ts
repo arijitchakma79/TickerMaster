@@ -94,6 +94,18 @@ export interface TickerLookup {
   instrument_type?: string | null;
 }
 
+export interface AgentActivity {
+  module?: string;
+  agent_name?: string;
+  action?: string;
+  status?: string;
+  details?: Record<string, unknown>;
+  created_at?: string;
+  timestamp?: string;
+  channel?: string;
+  type?: string;
+}
+
 export interface TrackerSnapshot {
   generated_at: string;
   tickers: MarketMetric[];

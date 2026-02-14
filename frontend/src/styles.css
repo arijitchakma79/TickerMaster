@@ -1269,6 +1269,57 @@ pre {
   font-size: 0.72rem;
 }
 
+.live-wire-action {
+  margin: 0;
+  font-size: 0.84rem;
+  line-height: 1.35;
+}
+
+.live-wire-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.live-wire-status {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  padding: 2px 8px;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  background: var(--card-soft-bg);
+}
+
+.live-wire-status.running {
+  color: #ffd59e;
+  border-color: #e4b26f;
+  background: rgba(228, 178, 111, 0.16);
+}
+
+.live-wire-status.success {
+  color: #b6f3cf;
+  border-color: #77c99a;
+  background: rgba(119, 201, 154, 0.16);
+}
+
+.live-wire-status.error {
+  color: #ffb8b8;
+  border-color: #d98f8f;
+  background: rgba(217, 143, 143, 0.16);
+}
+
+.live-wire-status.pending {
+  color: #b9d7ff;
+  border-color: #7ea9db;
+  background: rgba(126, 169, 219, 0.16);
+}
+
 .research-rail,
 .tracker-prefs-rail {
   display: flex;

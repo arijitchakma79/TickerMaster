@@ -16,8 +16,6 @@ async def log_agent_activity(
     status: str = "success",
 ) -> None:
     client = get_supabase()
-    if client is None:
-        return
 
     payload = {
         "user_id": user_id,
@@ -29,10 +27,11 @@ async def log_agent_activity(
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    try:
-        client.table("agent_activity").insert(payload).execute()
-    except Exception:
-        pass
+    if client is not None:
+        try:
+            client.table("agent_activity").insert(payload).execute()
+        except Exception:
+            pass
     await broadcast_activity(payload)
 
 

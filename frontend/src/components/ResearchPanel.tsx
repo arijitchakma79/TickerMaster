@@ -2,13 +2,14 @@ import { useEffect, useMemo, useState } from "react";
 import {
   fetchAdvancedStockData,
   fetchCandles,
+  getAgentActivity,
   runDeepResearch,
   runResearch,
   searchTickerDirectory
 } from "../lib/api";
 import { formatCompactNumber, formatPercent } from "../lib/format";
 import { resolveTickerCandidate } from "../lib/tickerInput";
-import type { AdvancedStockData, CandlePoint, DeepResearchResponse, ResearchResponse, TickerLookup, WSMessage } from "../lib/types";
+import type { AgentActivity, AdvancedStockData, CandlePoint, DeepResearchResponse, ResearchResponse, TickerLookup, WSMessage } from "../lib/types";
 import StockChart from "./StockChart";
 
 interface Props {
@@ -16,6 +17,74 @@ interface Props {
   onTickerChange: (ticker: string) => void;
   connected: boolean;
   events: WSMessage[];
+}
+
+function normalizeSymbol(value: string) {
+  return value.trim().toUpperCase().replace(/\./g, "-");
+}
+
+function containsTickerToken(action: string, ticker: string) {
+  if (!ticker) return true;
+  const tokens = action
+    .toUpperCase()
+    .replace(/\./g, "-")
+    .split(/[^A-Z0-9-]+/)
+    .filter(Boolean);
+  return tokens.includes(ticker);
+}
+
+function activityTime(item: AgentActivity) {
+  const raw = item.created_at ?? item.timestamp;
+  if (!raw) return 0;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeActivity(raw: AgentActivity | WSMessage): AgentActivity | null {
+  if (!raw || typeof raw !== "object") return null;
+  const action = typeof raw.action === "string" ? raw.action : "";
+  const agentName = typeof raw.agent_name === "string" ? raw.agent_name : "";
+  const channel = typeof raw.channel === "string" ? raw.channel : undefined;
+  const type = typeof raw.type === "string" ? raw.type : undefined;
+  const isAgentPayload = Boolean(action || agentName || type === "agent_activity" || channel === "agents");
+  if (!isAgentPayload) return null;
+  return {
+    module: typeof raw.module === "string" ? raw.module : undefined,
+    agent_name: agentName || undefined,
+    action: action || undefined,
+    status: typeof raw.status === "string" ? raw.status : undefined,
+    details: raw.details && typeof raw.details === "object" ? (raw.details as Record<string, unknown>) : undefined,
+    created_at: typeof raw.created_at === "string" ? raw.created_at : undefined,
+    timestamp: typeof raw.timestamp === "string" ? raw.timestamp : undefined,
+    channel,
+    type,
+  };
+}
+
+function activityMatchesTicker(item: AgentActivity, ticker: string) {
+  if (!ticker) return true;
+  const details = item.details;
+  if (details && typeof details === "object") {
+    const detailSymbol = (details as Record<string, unknown>).symbol;
+    if (typeof detailSymbol === "string" && normalizeSymbol(detailSymbol) === ticker) return true;
+  }
+  if (typeof item.action === "string" && containsTickerToken(item.action, ticker)) return true;
+  return false;
+}
+
+function activityKey(item: AgentActivity) {
+  return [
+    item.created_at ?? item.timestamp ?? "",
+    item.agent_name ?? "",
+    item.action ?? "",
+    item.status ?? "",
+  ].join("|");
+}
+
+function statusClass(status: string | undefined) {
+  const value = (status ?? "running").toLowerCase();
+  if (value === "success" || value === "error" || value === "pending") return value;
+  return "running";
 }
 
 export default function ResearchPanel({ activeTicker, onTickerChange, connected, events }: Props) {
@@ -35,12 +104,32 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
   const [chartInterval, setChartInterval] = useState("1d");
   const [showSma, setShowSma] = useState(true);
   const [showEma, setShowEma] = useState(true);
+  const [agentHistory, setAgentHistory] = useState<AgentActivity[]>([]);
   const [error, setError] = useState("");
+  const normalizedTicker = useMemo(() => normalizeSymbol(activeTicker), [activeTicker]);
 
   const sentimentLabel = useMemo(() => {
     if (!research) return "-";
     return `${formatPercent(research.aggregate_sentiment * 100)} / ${research.recommendation.replace("_", " ")}`;
   }, [research]);
+
+  const liveWireActivity = useMemo(() => {
+    const merged = new Map<string, AgentActivity>();
+
+    for (const candidate of [...events, ...agentHistory]) {
+      const normalized = normalizeActivity(candidate);
+      if (!normalized) continue;
+      if (!activityMatchesTicker(normalized, normalizedTicker)) continue;
+      const key = activityKey(normalized);
+      if (!merged.has(key)) {
+        merged.set(key, normalized);
+      }
+    }
+
+    return Array.from(merged.values())
+      .sort((a, b) => activityTime(b) - activityTime(a))
+      .slice(0, 24);
+  }, [agentHistory, events, normalizedTicker]);
 
   useEffect(() => {
     const query = tickerInput.trim();
@@ -73,6 +162,31 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
       window.clearTimeout(timer);
     };
   }, [tickerInput]);
+
+  useEffect(() => {
+    let active = true;
+
+    const loadActivity = async () => {
+      try {
+        const items = await getAgentActivity(120);
+        if (!active) return;
+        setAgentHistory(items);
+      } catch {
+        if (!active) return;
+        setAgentHistory([]);
+      }
+    };
+
+    void loadActivity();
+    const poll = window.setInterval(() => {
+      void loadActivity();
+    }, 15000);
+
+    return () => {
+      active = false;
+      window.clearInterval(poll);
+    };
+  }, [normalizedTicker]);
 
   async function handleAnalyze(rawInput?: string) {
     setLoading(true);
@@ -388,14 +502,20 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
           </span>
         </div>
         <div className="event-list">
-          {events.length === 0 ? <p className="muted">Waiting for events…</p> : null}
-          {events.slice(0, 24).map((event, idx) => (
-            <article key={`${event.type}-${idx}`} className="event-item">
+          {liveWireActivity.length === 0 ? <p className="muted">No AI agent activity for {normalizedTicker} yet.</p> : null}
+          {liveWireActivity.map((event, idx) => (
+            <article key={`${activityKey(event)}-${idx}`} className="event-item">
               <div className="event-meta">
-                <strong>{event.type}</strong>
-                <span>{typeof event.channel === "string" ? event.channel : "global"}</span>
+                <strong>{event.agent_name ?? "AI Agent"}</strong>
+                <span>{event.module ?? "research"}</span>
               </div>
-              {typeof event.timestamp === "string" ? <time>{new Date(event.timestamp).toLocaleTimeString()}</time> : null}
+              <p className="live-wire-action">{event.action ?? "Processing request..."}</p>
+              <div className="live-wire-footer">
+                <span className={`live-wire-status ${statusClass(event.status)}`}>{(event.status ?? "running").toLowerCase()}</span>
+                {event.created_at || event.timestamp ? (
+                  <time>{new Date(event.created_at ?? event.timestamp ?? "").toLocaleTimeString()}</time>
+                ) : null}
+              </div>
             </article>
           ))}
         </div>

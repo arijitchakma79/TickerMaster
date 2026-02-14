@@ -1,5 +1,7 @@
 import axios from "axios";
+import { searchTickerDirectory as searchTickerDirectoryOnline } from "./tickerDirectory";
 import type {
+  AgentActivity,
   AdvancedStockData,
   AgentConfig,
   CandlePoint,
@@ -14,7 +16,11 @@ import type {
   TrackerSnapshot
 } from "./types";
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+function trimTrailingSlashes(value: string) {
+  return value.replace(/\/+$/, "");
+}
+
+const API_URL = trimTrailingSlashes(import.meta.env.VITE_API_URL ?? "http://localhost:8000");
 
 const client = axios.create({
   baseURL: API_URL,
@@ -25,9 +31,9 @@ export const getApiUrl = () => API_URL;
 
 export const getWsUrl = () => {
   const explicit = import.meta.env.VITE_WS_URL;
-  if (explicit) return explicit;
-  const fromHttp = API_URL.replace(/^http/, "ws");
-  return `${fromHttp}/ws/stream?channels=global,simulation,tracker`;
+  if (explicit) return trimTrailingSlashes(explicit);
+  const fromHttp = API_URL.replace(/^https?/i, (prefix) => (prefix.toLowerCase() === "https" ? "wss" : "ws"));
+  return `${fromHttp}/ws/stream?channels=global,simulation,tracker,agents`;
 };
 
 export async function runResearch(ticker: string, timeframe = "7d"): Promise<ResearchResponse> {
@@ -58,12 +64,7 @@ export async function fetchRealtimeQuote(ticker: string): Promise<MarketMetric> 
 }
 
 export async function searchTickerDirectory(query: string, limit = 8): Promise<TickerLookup[]> {
-  const cleanQuery = query.trim();
-  if (!cleanQuery) return [];
-  const { data } = await client.get<{ query: string; results: TickerLookup[] }>("/research/search/tickers", {
-    params: { query: cleanQuery, limit }
-  });
-  return data.results;
+  return searchTickerDirectoryOnline(query, limit);
 }
 export async function startSimulation(payload: {
   ticker: string;
@@ -130,6 +131,13 @@ export async function addAlert(payload: { ticker: string; threshold_percent: num
 export async function fetchIntegrations() {
   const { data } = await client.get<Record<string, boolean>>("/integrations");
   return data;
+}
+
+export async function getAgentActivity(limit = 80, module?: string): Promise<AgentActivity[]> {
+  const params: { limit: number; module?: string } = { limit };
+  if (module) params.module = module;
+  const { data } = await client.get<{ items?: AgentActivity[] }>("/api/agents/activity", { params });
+  return Array.isArray(data.items) ? data.items : [];
 }
 
 export async function requestCommentary(prompt: string, context?: Record<string, unknown>) {
