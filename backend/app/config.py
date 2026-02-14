@@ -118,6 +118,12 @@ class Settings:
 
     modal_token_id: str = ""
     modal_token_secret: str = ""
+    modal_simulation_app_name: str = "tickermaster-simulation"
+    modal_sandbox_timeout_seconds: int = 600
+    modal_sandbox_idle_timeout_seconds: int = 120
+    modal_sandbox_python_version: str = "3.11"
+    modal_inference_function_name: str = "agent_inference"
+    modal_inference_timeout_seconds: int = 15
 
     poke_recipe_enabled: bool = True
     poke_api_key: str = ""
@@ -175,6 +181,12 @@ def get_settings() -> Settings:
         browserbase_project_id=_env("BROWSERBASE_PROJECT_ID"),
         modal_token_id=_env("MODAL_TOKEN_ID"),
         modal_token_secret=_env("MODAL_TOKEN_SECRET"),
+        modal_simulation_app_name=_env("MODAL_SIMULATION_APP_NAME", "tickermaster-simulation"),
+        modal_sandbox_timeout_seconds=_env_int("MODAL_SANDBOX_TIMEOUT_SECONDS", 600),
+        modal_sandbox_idle_timeout_seconds=_env_int("MODAL_SANDBOX_IDLE_TIMEOUT_SECONDS", 120),
+        modal_sandbox_python_version=_env("MODAL_SANDBOX_PYTHON_VERSION", "3.11"),
+        modal_inference_function_name=_env("MODAL_INFERENCE_FUNCTION_NAME", "agent_inference"),
+        modal_inference_timeout_seconds=_env_int("MODAL_INFERENCE_TIMEOUT_SECONDS", 15),
         poke_recipe_enabled=_env_bool("POKE_RECIPE_ENABLED", True),
         poke_api_key=_env("POKE_API_KEY"),
         poke_recipe_slug=_env("POKE_RECIPE_SLUG"),

@@ -7,6 +7,8 @@ import type {
   CandlePoint,
   DeepResearchResponse,
   MarketMetric,
+  ModalCronHealthResponse,
+  ModalSandboxResponse,
   ResearchResponse,
   TrackerAgent,
   TrackerAgentDetail,
@@ -72,6 +74,7 @@ export async function startSimulation(payload: {
   initial_price: number;
   starting_cash: number;
   volatility: number;
+  inference_runtime?: "direct" | "modal";
   agents: AgentConfig[];
 }): Promise<SimulationState> {
   const { data } = await client.post<SimulationState>("/simulation/start", payload);
@@ -148,8 +151,13 @@ export async function requestCommentary(prompt: string, context?: Record<string,
   return data;
 }
 
-export async function spinModalSandbox(prompt: string, session_id: string) {
-  const { data } = await client.post("/simulation/modal/sandbox", { prompt, session_id });
+export async function spinModalSandbox(prompt: string, session_id: string): Promise<ModalSandboxResponse> {
+  const { data } = await client.post<ModalSandboxResponse>("/simulation/modal/sandbox", { prompt, session_id });
+  return data;
+}
+
+export async function getModalCronHealth(): Promise<ModalCronHealthResponse> {
+  const { data } = await client.get<ModalCronHealthResponse>("/simulation/modal/cron-health");
   return data;
 }
 

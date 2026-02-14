@@ -10,15 +10,25 @@ import {
 } from "recharts";
 import {
   fetchRealtimeQuote,
+  getModalCronHealth,
   pauseSimulation,
   requestCommentary,
   resumeSimulation,
+  spinModalSandbox,
   startSimulation,
   stopSimulation
 } from "../lib/api";
 import EventRail from "./EventRail";
 import { formatCurrency, formatPercent } from "../lib/format";
-import type { AgentConfig, MarketMetric, SimulationState, TradeRecord, WSMessage } from "../lib/types";
+import type {
+  AgentConfig,
+  MarketMetric,
+  ModalCronHealthResponse,
+  ModalSandboxResponse,
+  SimulationState,
+  TradeRecord,
+  WSMessage
+} from "../lib/types";
 import blackrockLogo from "../images/blackrock.png";
 import citadelLogo from "../images/citadel.png";
 import crowdLogo from "../images/crowd.png";
@@ -29,6 +39,7 @@ import vanguardLogo from "../images/vanguard.png";
 interface Props {
   activeTicker: string;
   onTickerChange: (ticker: string) => void;
+  watchlist: string[];
   connected: boolean;
   simulationEvent?: WSMessage;
   simulationLifecycleEvent?: WSMessage;
@@ -57,6 +68,78 @@ const DEFAULT_CUSTOM = {
   style: 56,
   news: 42
 };
+
+const STRATEGY_TEMPLATES = [
+  {
+    label: "Momentum",
+    prompt: "I am a momentum trader. Buy upside breakouts with rising volume and cut losses quickly when trend structure fails."
+  },
+  {
+    label: "Contrarian",
+    prompt: "I am a contrarian trader. Buy oversold flushes below short-term fair value and trim into rapid mean reversion bounces."
+  },
+  {
+    label: "Risk-Off",
+    prompt: "I prioritize drawdown control. Trade smaller in high-volatility regimes, keep cash high during crash headlines, and avoid revenge trades."
+  },
+  {
+    label: "News Reversal",
+    prompt: "I trade post-news dislocations. Fade initial overreaction after catalyst headlines and only size up when follow-through confirms."
+  }
+] as const;
+
+type RuntimeMode = "modal" | "local";
+
+const ALL_MARKET_PROMPT_PATTERN =
+  /\b(all stocks|all tickers|entire market|whole market|market-wide|across the market)\b/i;
+
+const TICKER_PROMPT_STOPWORDS = new Set([
+  "A",
+  "AI",
+  "ALL",
+  "AM",
+  "AND",
+  "AS",
+  "AT",
+  "BE",
+  "BUY",
+  "CASH",
+  "CRASH",
+  "DO",
+  "FOR",
+  "FROM",
+  "HOLD",
+  "IF",
+  "IN",
+  "IS",
+  "IT",
+  "LONG",
+  "MARKET",
+  "MY",
+  "NEWS",
+  "OF",
+  "ON",
+  "OR",
+  "PRICE",
+  "RISK",
+  "SELL",
+  "SHORT",
+  "SO",
+  "STOCK",
+  "STOCKS",
+  "STRATEGY",
+  "THAT",
+  "THE",
+  "THIS",
+  "TO",
+  "TRADE",
+  "TRADING",
+  "USE",
+  "VOL",
+  "VOLATILITY",
+  "WHEN",
+  "WITH"
+]);
 
 const INSTITUTIONAL_AGENTS: AgentConfig[] = [
   {
@@ -219,9 +302,52 @@ function deriveVolatilityFromQuote(changePercent?: number | null) {
   return Number(clamp(0.008, 0.012 + Math.abs(changePercent) / 140, 0.08).toFixed(4));
 }
 
+function normalizeSymbol(value: string) {
+  return value.trim().toUpperCase().replace(/\./g, "-");
+}
+
+function extractTickerCandidatesFromPrompt(prompt: string): string[] {
+  const matches = prompt.match(/\b[A-Za-z]{1,5}(?:[.-][A-Za-z]{1,2})?\b/g) ?? [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+
+  for (const token of matches) {
+    const symbol = normalizeSymbol(token);
+    if (!symbol) continue;
+    if (TICKER_PROMPT_STOPWORDS.has(symbol)) continue;
+    if (!/^[A-Z][A-Z0-9-]{0,9}$/.test(symbol)) continue;
+    if (!seen.has(symbol)) {
+      seen.add(symbol);
+      out.push(symbol);
+    }
+  }
+
+  return out;
+}
+
+function resolveTickersFromPrompt(prompt: string, activeTicker: string, watchlist: string[]): string[] {
+  const inferred = extractTickerCandidatesFromPrompt(prompt);
+  if (inferred.length > 0) return inferred;
+
+  if (ALL_MARKET_PROMPT_PATTERN.test(prompt)) {
+    const normalizedWatchlist = watchlist.map(normalizeSymbol).filter(Boolean);
+    if (normalizedWatchlist.length > 0) {
+      const deduped = Array.from(new Set(normalizedWatchlist));
+      if (deduped.includes("SPY")) {
+        return ["SPY", ...deduped.filter((symbol) => symbol !== "SPY")];
+      }
+      return deduped;
+    }
+  }
+
+  const fallback = normalizeSymbol(activeTicker) || "AAPL";
+  return [fallback];
+}
+
 export default function SimulationPanel({
   activeTicker,
   onTickerChange,
+  watchlist,
   connected,
   simulationEvent,
   simulationLifecycleEvent
@@ -249,6 +375,13 @@ export default function SimulationPanel({
   const [liveQuote, setLiveQuote] = useState<MarketMetric | null>(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
   const [quoteError, setQuoteError] = useState("");
+  const [runtimeMode, setRuntimeMode] = useState<RuntimeMode>("modal");
+  const [modalHealth, setModalHealth] = useState<ModalCronHealthResponse | null>(null);
+  const [modalHealthError, setModalHealthError] = useState("");
+  const [modalSandboxResult, setModalSandboxResult] = useState<ModalSandboxResponse | null>(null);
+  const [modalSandboxLoading, setModalSandboxLoading] = useState(false);
+  const [modalSandboxError, setModalSandboxError] = useState("");
+  const [promptInferredTickers, setPromptInferredTickers] = useState<string[]>([]);
 
   useEffect(() => {
     const symbol = activeTicker.trim().toUpperCase();
@@ -276,6 +409,25 @@ export default function SimulationPanel({
       active = false;
     };
   }, [activeTicker]);
+
+  useEffect(() => {
+    let active = true;
+    setModalHealthError("");
+    void getModalCronHealth()
+      .then((health) => {
+        if (!active) return;
+        setModalHealth(health);
+      })
+      .catch(() => {
+        if (!active) return;
+        setModalHealth(null);
+        setModalHealthError("Modal runtime health unavailable.");
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!simulationEvent || simulationEvent.type !== "tick") return;
@@ -449,10 +601,22 @@ export default function SimulationPanel({
     setEditingAgentPrompt("");
   }
 
+  function buildSandboxPrompt(ticker: string, configuredAgents: AgentConfig[], targetTickers: string[]): string {
+    const customStrategies = configuredAgents
+      .filter((agent) => userAgentNames.has(agent.name))
+      .map((agent) => `${agent.name}: ${agent.strategy_prompt || "No custom prompt provided."}`)
+      .slice(0, 3);
+
+    const agentList = configuredAgents.map((agent) => agent.name).join(", ");
+    const strategyBlock =
+      customStrategies.length > 0 ? customStrategies.join(" | ") : `Use preset arena agents for ${ticker}.`;
+    const universe = targetTickers.join(", ");
+    return `Run a ${ticker} multi-agent simulation with realistic slippage and delayed news. Preferred universe: ${universe}. Agents: ${agentList}. Custom strategies: ${strategyBlock}`;
+  }
+
   async function handlePlay() {
     setLoading(true);
-    const cleanTicker = activeTicker.trim().toUpperCase() || "AAPL";
-    onTickerChange(cleanTicker);
+    setModalSandboxError("");
     try {
       if (session?.running && session.paused) {
         const resumed = await resumeSimulation(session.session_id);
@@ -463,6 +627,17 @@ export default function SimulationPanel({
       if (session?.running && !session.paused) {
         return;
       }
+
+      const strategyContext = [
+        customPrompt,
+        ...addedCustomAgents.map((entry) => entry.config.strategy_prompt || "")
+      ]
+        .join(" ")
+        .trim();
+      const resolvedTickers = resolveTickersFromPrompt(strategyContext, activeTicker, watchlist);
+      const cleanTicker = resolvedTickers[0] ?? (normalizeSymbol(activeTicker) || "AAPL");
+      setPromptInferredTickers(resolvedTickers);
+      onTickerChange(cleanTicker);
 
       let quote = liveQuote;
       if (!quote || quote.ticker !== cleanTicker) {
@@ -483,6 +658,7 @@ export default function SimulationPanel({
         initial_price: initialPrice,
         starting_cash: Math.max(1000, Number(startingCapital) || DEFAULT_SETTINGS.startingCash),
         volatility,
+        inference_runtime: runtimeMode === "modal" ? "modal" : "direct",
         agents: configuredAgents
       });
       setSession(next);
@@ -490,6 +666,24 @@ export default function SimulationPanel({
       setPriceSeries([{ tick: 0, price: next.current_price }]);
       setAutoCommentary("");
       setAutoCommentaryModel("");
+      setModalSandboxResult(null);
+
+      if (runtimeMode === "modal") {
+        setModalSandboxLoading(true);
+        const sandboxPrompt = buildSandboxPrompt(cleanTicker, configuredAgents, resolvedTickers);
+        try {
+          const sandbox = await spinModalSandbox(sandboxPrompt, next.session_id);
+          setModalSandboxResult(sandbox);
+          if (sandbox.status === "failed") {
+            setModalSandboxError(sandbox.error || sandbox.hint || "Modal sandbox launch failed.");
+          }
+        } catch {
+          setModalSandboxResult(null);
+          setModalSandboxError("Modal sandbox launch failed. Simulation continues on local engine.");
+        } finally {
+          setModalSandboxLoading(false);
+        }
+      }
     } finally {
       setLoading(false);
     }
@@ -531,6 +725,10 @@ export default function SimulationPanel({
       setAutoCommentary("");
       setAutoCommentaryModel("");
       setAutoCommentaryLoading(false);
+      setModalSandboxResult(null);
+      setModalSandboxLoading(false);
+      setModalSandboxError("");
+      setPromptInferredTickers([]);
       setAddedCustomAgents([]);
       setCustomEmoji("");
       setCustomAgentSequence(2);
@@ -571,6 +769,22 @@ export default function SimulationPanel({
     : liveQuote
       ? `${formatCurrency(liveQuote.price)} · ${formatPercent(liveQuote.change_percent)}`
       : quoteError || `Fallback quote: ${formatCurrency(DEFAULT_SETTINGS.fallbackInitialPrice)}`;
+  const modalHealthLine = modalHealth
+    ? `${modalHealth.status.toUpperCase()} · ${modalHealth.message}`
+    : modalHealthError || "Modal runtime status unavailable.";
+  const modalRunLine = modalSandboxResult
+    ? `${modalSandboxResult.status.toUpperCase()}${modalSandboxResult.sandbox_id ? ` · ${modalSandboxResult.sandbox_id}` : ""}`
+    : "No sandbox launched yet.";
+  const inferenceRuntimeLine =
+    runtimeMode === "modal"
+      ? "Modal function first, then OpenRouter fallback."
+      : "Direct OpenRouter from backend.";
+  const inferenceFunctionLine =
+    modalHealth?.inference_function_name
+      ? `${modalHealth.inference_function_name} (${modalHealth.inference_timeout_seconds ?? 15}s timeout)`
+      : "Not configured";
+  const promptUniverseLine =
+    promptInferredTickers.length > 0 ? promptInferredTickers.join(", ") : "No ticker inferred from prompt yet.";
 
   return (
     <section className="panel stack stagger">
@@ -624,6 +838,23 @@ export default function SimulationPanel({
             disabled={customEditorDisabled}
           />
         </label>
+
+        <div className="strategy-template-row">
+          <span className="muted">Quick Templates</span>
+          <div className="strategy-template-chips">
+            {STRATEGY_TEMPLATES.map((template) => (
+              <button
+                key={template.label}
+                type="button"
+                className="secondary strategy-template-chip"
+                onClick={() => setCustomPrompt(template.prompt)}
+                disabled={customEditorDisabled}
+              >
+                {template.label}
+              </button>
+            ))}
+          </div>
+        </div>
 
         <div className="custom-slider-grid">
           <label>
@@ -803,6 +1034,36 @@ export default function SimulationPanel({
         <p className="muted">
           {quoteLine} · Uses live quote + dynamic volatility + default arena bankroll.
         </p>
+
+        <label className="session-runtime-field">
+          Sandbox Runtime
+          <select
+            value={runtimeMode}
+            onChange={(event) => setRuntimeMode(event.target.value as RuntimeMode)}
+            disabled={loading || Boolean(session?.running)}
+          >
+            <option value="modal">Modal Sandbox</option>
+            <option value="local">Local Engine</option>
+          </select>
+        </label>
+
+        <div className="runtime-status-card">
+          <p className="muted">Modal Health: {modalHealthLine}</p>
+          <p className="muted">Inference Runtime: {inferenceRuntimeLine}</p>
+          <p className="muted">Inference Function: {inferenceFunctionLine}</p>
+          <p className="muted">Prompt Universe: {promptUniverseLine}</p>
+          {runtimeMode === "modal" ? <p className="muted">Current Sandbox: {modalRunLine}</p> : null}
+          {modalSandboxLoading ? <p className="muted">Launching Modal sandbox…</p> : null}
+          {modalHealth?.status === "missing_dependency" && modalHealth.install_hint ? (
+            <p className="error">{modalHealth.install_hint}</p>
+          ) : null}
+          {modalSandboxError ? <p className="error">{modalSandboxError}</p> : null}
+          {modalSandboxResult?.dashboard_url ? (
+            <a href={modalSandboxResult.dashboard_url} target="_blank" rel="noreferrer">
+              Open Modal App Dashboard
+            </a>
+          ) : null}
+        </div>
 
         <label className="session-capital-field">
           Starting Capital

@@ -71,6 +71,7 @@ class SessionRuntime:
     session_id: str
     ticker: str
     duration_seconds: int
+    inference_runtime: str
     started_at: datetime
     ends_at: datetime
     current_price: float
@@ -121,6 +122,7 @@ class SimulationOrchestrator:
             session_id=session_id,
             ticker=request.ticker.upper().strip(),
             duration_seconds=request.duration_seconds,
+            inference_runtime=request.inference_runtime,
             started_at=now,
             ends_at=ends_at,
             current_price=request.initial_price,
@@ -364,6 +366,7 @@ class SimulationOrchestrator:
                     "max_trade_size": config.trade_size * 4,
                     "strategy_prompt": config.strategy_prompt,
                 },
+                use_modal_inference=runtime.inference_runtime == "modal",
             )
 
             llm_side = llm.get("side", "hold")

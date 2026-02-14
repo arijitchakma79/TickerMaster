@@ -188,6 +188,34 @@ export interface SimulationState {
   };
 }
 
+export interface ModalSandboxResponse {
+  status: "started" | "failed" | "stub" | string;
+  message?: string;
+  error?: string;
+  hint?: string;
+  session_id: string;
+  sandbox_id?: string;
+  app_name?: string;
+  dashboard_url?: string;
+  prompt_preview?: string;
+  stdout_preview?: string[];
+  metadata?: Record<string, unknown>;
+  link?: string;
+}
+
+export interface ModalCronHealthResponse {
+  status: "configured" | "stub" | string;
+  message: string;
+  polling_interval_seconds: number;
+  app_name?: string;
+  sdk_available?: boolean;
+  sandbox_timeout_seconds?: number;
+  sandbox_idle_timeout_seconds?: number;
+  inference_function_name?: string;
+  inference_timeout_seconds?: number;
+  install_hint?: string;
+}
+
 export interface WSMessage {
   channel?: string;
   type: string;

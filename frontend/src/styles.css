@@ -780,6 +780,31 @@ th {
   max-width: 320px;
 }
 
+.session-runtime-field {
+  max-width: 320px;
+}
+
+.runtime-status-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: var(--card-soft-bg-3);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.runtime-status-card p {
+  margin: 0;
+}
+
+.runtime-status-card a {
+  font-size: 0.82rem;
+  text-decoration: none;
+  border-bottom: 1px dashed rgba(15, 143, 115, 0.4);
+  width: fit-content;
+}
+
 .start-trading-button {
   width: 100%;
   padding: 18px 18px;
@@ -836,6 +861,24 @@ th {
 .custom-agent-prompt-row textarea {
   width: 100%;
   min-height: 136px;
+}
+
+.strategy-template-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.strategy-template-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.strategy-template-chip {
+  padding: 7px 11px;
+  font-size: 0.78rem;
+  letter-spacing: 0.01em;
 }
 
 .custom-slider-grid {

@@ -181,6 +181,7 @@ export default function App() {
             <SimulationPanel
               activeTicker={ticker}
               onTickerChange={setTicker}
+              watchlist={watchlist}
               connected={connected}
               simulationEvent={lastSimulationTick}
               simulationLifecycleEvent={lastSimulationLifecycle}
