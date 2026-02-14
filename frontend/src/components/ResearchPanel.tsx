@@ -8,15 +8,17 @@ import {
 } from "../lib/api";
 import { formatCompactNumber, formatPercent } from "../lib/format";
 import { resolveTickerCandidate } from "../lib/tickerInput";
-import type { AdvancedStockData, CandlePoint, DeepResearchResponse, ResearchResponse, TickerLookup } from "../lib/types";
+import type { AdvancedStockData, CandlePoint, DeepResearchResponse, ResearchResponse, TickerLookup, WSMessage } from "../lib/types";
 import StockChart from "./StockChart";
 
 interface Props {
   activeTicker: string;
   onTickerChange: (ticker: string) => void;
+  connected: boolean;
+  events: WSMessage[];
 }
 
-export default function ResearchPanel({ activeTicker, onTickerChange }: Props) {
+export default function ResearchPanel({ activeTicker, onTickerChange, connected, events }: Props) {
   const [tickerInput, setTickerInput] = useState(activeTicker);
   const [tickerInputFocused, setTickerInputFocused] = useState(false);
   const [tickerSuggestions, setTickerSuggestions] = useState<TickerLookup[]>([]);
@@ -375,6 +377,27 @@ export default function ResearchPanel({ activeTicker, onTickerChange }: Props) {
               ) : null}
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <div className="glass-card live-wire-log">
+        <div className="panel-header">
+          <h3>Live Wire</h3>
+          <span className={connected ? "dot dot-live" : "dot dot-offline"}>
+            {connected ? "Socket Live" : "Socket Offline"}
+          </span>
+        </div>
+        <div className="event-list">
+          {events.length === 0 ? <p className="muted">Waiting for events…</p> : null}
+          {events.slice(0, 24).map((event, idx) => (
+            <article key={`${event.type}-${idx}`} className="event-item">
+              <div className="event-meta">
+                <strong>{event.type}</strong>
+                <span>{typeof event.channel === "string" ? event.channel : "global"}</span>
+              </div>
+              {typeof event.timestamp === "string" ? <time>{new Date(event.timestamp).toLocaleTimeString()}</time> : null}
+            </article>
+          ))}
         </div>
       </div>
     </section>

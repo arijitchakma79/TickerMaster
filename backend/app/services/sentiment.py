@@ -357,7 +357,8 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
         SourceLink(source="Morningstar", title="Morningstar", url="https://www.morningstar.com/"),
         SourceLink(source="Reuters", title="Reuters Markets", url="https://www.reuters.com/markets/"),
         SourceLink(source="J.P. Morgan", title="J.P. Morgan Insights", url="https://www.jpmorgan.com/insights"),
-        SourceLink(source="Yahoo Finance", title="Yahoo Finance", url="https://finance.yahoo.com/"),
+        SourceLink(source="Alpaca Market Data", title="Alpaca Docs", url="https://docs.alpaca.markets/docs/about-market-data-api"),
+        SourceLink(source="Finnhub", title="Finnhub API", url="https://finnhub.io/"),
     ]
 
     response = ResearchResponse(

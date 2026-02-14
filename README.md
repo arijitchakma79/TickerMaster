@@ -5,10 +5,11 @@ TickerMaster is a real-time sandbox for learning trading dynamics through AI age
 Core product surfaces:
 1. `Research`: Perplexity Sonar + X + Reddit + prediction-market context.
 2. `Simulation`: Multi-agent arena with order-book impact, slippage, delayed news propagation, and crash regimes.
-3. `Tracker`: Yahoo-style watchlist with valuation metrics, spike detection, and alert pipeline.
+3. `Tracker`: Real-time watchlist with valuation metrics, spike detection, and alert pipeline.
 
 ## Stack
-- Backend: `FastAPI` + `WebSockets` + `yfinance`
+- Backend: `FastAPI` + `WebSockets`
+- Market Data: `Alpaca` (primary) + `Finnhub` (fallback)
 - Frontend: `React` + `TypeScript` + `Vite` + `Recharts`
 - Agent models: `OpenRouter` (open-source model default: `meta-llama/llama-3.1-8b-instruct`)
 - Commentary model: `OpenAI`
@@ -51,7 +52,7 @@ DATABASE_URL=postgresql://postgres:<password>@db.<project>.supabase.co:5432/post
 BACKEND_URL=http://localhost:8000
 ```
 
-Add your API keys for Perplexity / OpenAI / OpenRouter / X / Browserbase / Modal as needed.
+Add your API keys for Alpaca / Finnhub / Perplexity / OpenAI / OpenRouter / X / Browserbase / Modal as needed.
 
 ### 2) Apply database schema in Supabase
 In Supabase Dashboard:
@@ -122,8 +123,8 @@ If cache writes appear but activity/alerts do not, confirm backend is using `SUP
 - Perplexity Sonar API for catalyst synthesis.
 - X API and Reddit API ingestion for public sentiment flow.
 - Kalshi + Polymarket adapters for prediction-market context.
-- Finance graphing via Yahoo-style candles and metric tables.
-- Tool links exposed in UI for Morningstar / Reuters / J.P. Morgan / Yahoo Finance.
+- Finance graphing via Alpaca/Finnhub candles and metric tables.
+- Tool links exposed in UI for Morningstar / Reuters / J.P. Morgan / Alpaca / Finnhub.
 
 ### Simulation
 - Natural-language sandbox trigger endpoint for Modal (`/simulation/modal/sandbox`).
@@ -173,7 +174,8 @@ Then open Kitchen to test/deploy your Recipe and wire alert payloads:
 - Morningstar: https://www.morningstar.com/
 - Reuters Markets: https://www.reuters.com/markets/
 - J.P. Morgan Insights: https://www.jpmorgan.com/insights
-- Yahoo Finance: https://finance.yahoo.com/
+- Alpaca Market Data: https://docs.alpaca.markets/docs/about-market-data-api
+- Finnhub: https://finnhub.io/
 
 ## Notes
 - This MVP is educational and not investment advice.

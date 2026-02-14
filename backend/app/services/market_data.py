@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
@@ -7,10 +8,8 @@ from typing import Any, Dict, List, Tuple
 import httpx
 import numpy as np
 
+from app.config import get_settings
 from app.schemas import CandlestickPoint, MarketMetric, TickerLookup
-
-YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
-YAHOO_ALLOWED_TYPES = {"EQUITY", "ETF", "MUTUALFUND", "INDEX"}
 
 _LAST_METRIC_CACHE: dict[str, MarketMetric] = {}
 _LAST_CANDLES_CACHE: dict[str, List[CandlestickPoint]] = {}
@@ -29,7 +28,7 @@ def _safe_int(value: Any) -> int | None:
     try:
         if value is None:
             return None
-        return int(value)
+        return int(float(value))
     except (TypeError, ValueError):
         return None
 
@@ -70,183 +69,467 @@ def _synthetic_candles(symbol: str, count: int = 30) -> List[CandlestickPoint]:
     return points
 
 
-def _yahoo_quote(symbol: str) -> Dict[str, Any] | None:
-    url = "https://query1.finance.yahoo.com/v7/finance/quote"
-    params = {"symbols": symbol}
-    try:
-        with httpx.Client(timeout=10.0) as client:
-            resp = client.get(url, params=params)
-            resp.raise_for_status()
-            results = resp.json().get("quoteResponse", {}).get("result", [])
-            if results:
-                return results[0]
-    except Exception:
-        return None
-    return None
+def _settings():
+    return get_settings()
 
 
-def _normalize_interval(interval: str) -> str:
-    allowed = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "1d", "5d", "1wk", "1mo", "3mo"}
-    return interval if interval in allowed else "1d"
+def _iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _normalize_range(period: str) -> str:
-    allowed = {
-        "1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max",
-    }
-    return period if period in allowed else "1mo"
-
-
-def _yahoo_chart(symbol: str, period: str = "1mo", interval: str = "1d") -> Dict[str, Any] | None:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": _normalize_range(period), "interval": _normalize_interval(interval)}
-    try:
-        with httpx.Client(timeout=12.0) as client:
-            resp = client.get(url, params=params)
-            resp.raise_for_status()
-            return resp.json().get("chart", {})
-    except Exception:
-        return None
-
-
-def _yahoo_quote_summary(symbol: str, modules: list[str]) -> Dict[str, Any] | None:
-    url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-    params = {"modules": ",".join(modules)}
-    try:
-        with httpx.Client(timeout=14.0) as client:
-            resp = client.get(url, params=params, headers={"User-Agent": "TickerMaster/1.0 (research@treehacks.dev)"})
-            resp.raise_for_status()
-            data = resp.json().get("quoteSummary", {})
-            results = data.get("result") or []
-            if results and isinstance(results[0], dict):
-                return results[0]
-    except Exception:
-        return None
-    return None
-
-
-def _stooq_candles(symbol: str, period: str = "1mo") -> List[CandlestickPoint]:
-    stooq_symbol = f"{symbol.lower()}.us"
-    url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
-    try:
-        with httpx.Client(timeout=12.0) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            lines = [line.strip() for line in resp.text.splitlines() if line.strip()]
-    except Exception:
-        return []
-
-    if len(lines) <= 1:
-        return []
-
-    period_map = {
+def _period_days(period: str) -> int:
+    mapping = {
+        "1d": 1,
         "5d": 5,
-        "1mo": 22,
-        "3mo": 66,
-        "6mo": 132,
-        "1y": 252,
-        "2y": 504,
-        "5y": 1260,
+        "1mo": 31,
+        "3mo": 93,
+        "6mo": 186,
+        "1y": 365,
+        "2y": 730,
+        "5y": 1825,
+        "10y": 3650,
+        "ytd": 365,
+        "max": 3650,
     }
-    take = period_map.get(period, 66)
+    return mapping.get(period, 31)
+
+
+def _alpaca_timeframe(interval: str) -> str:
+    mapping = {
+        "1m": "1Min",
+        "2m": "2Min",
+        "5m": "5Min",
+        "15m": "15Min",
+        "30m": "30Min",
+        "60m": "1Hour",
+        "90m": "1Hour",
+        "1h": "1Hour",
+        "1d": "1Day",
+        "5d": "1Day",
+        "1wk": "1Week",
+        "1mo": "1Month",
+        "3mo": "1Month",
+    }
+    return mapping.get(interval, "1Day")
+
+
+def _finnhub_resolution(interval: str) -> str:
+    mapping = {
+        "1m": "1",
+        "2m": "1",
+        "5m": "5",
+        "15m": "15",
+        "30m": "30",
+        "60m": "60",
+        "90m": "60",
+        "1h": "60",
+        "1d": "D",
+        "5d": "D",
+        "1wk": "W",
+        "1mo": "M",
+        "3mo": "M",
+    }
+    return mapping.get(interval, "D")
+
+
+def _normalize_market_cap(value: Any) -> float | None:
+    cap = _safe_float(value)
+    if cap is None:
+        return None
+    # Finnhub profile often returns market cap in millions.
+    return cap * 1_000_000 if 0 < cap < 10_000_000 else cap
+
+
+def _alpaca_headers() -> dict[str, str] | None:
+    settings = _settings()
+    if not settings.alpaca_api_key or not settings.alpaca_api_secret:
+        return None
+    return {
+        "APCA-API-KEY-ID": settings.alpaca_api_key,
+        "APCA-API-SECRET-KEY": settings.alpaca_api_secret,
+        "Accept": "application/json",
+    }
+
+
+def _alpaca_get(path: str, params: dict[str, Any] | None = None, *, trading: bool = False) -> Any:
+    headers = _alpaca_headers()
+    if headers is None:
+        return None
+
+    settings = _settings()
+    base = settings.alpaca_trading_url if trading else settings.alpaca_data_url
+    url = f"{base.rstrip('/')}{path}"
+
+    try:
+        with httpx.Client(timeout=12.0, headers=headers) as client:
+            resp = client.get(url, params=params)
+            if resp.status_code in {401, 403, 404, 429}:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        return None
+
+
+def _finnhub_get(path: str, params: dict[str, Any] | None = None) -> Any:
+    settings = _settings()
+    if not settings.finnhub_api_key:
+        return None
+
+    query = dict(params or {})
+    query["token"] = settings.finnhub_api_key
+    url = f"{settings.finnhub_api_url.rstrip('/')}{path}"
+
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            resp = client.get(url, params=query)
+            if resp.status_code in {401, 403, 404, 429}:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        return None
+
+
+def _alpaca_snapshot(symbol: str) -> dict[str, Any] | None:
+    payload = _alpaca_get(
+        f"/v2/stocks/{symbol}/snapshot",
+        params={"feed": _settings().alpaca_data_feed},
+    )
+    if isinstance(payload, dict) and "snapshot" in payload and isinstance(payload["snapshot"], dict):
+        return payload["snapshot"]
+    if isinstance(payload, dict) and (
+        "latestTrade" in payload or "dailyBar" in payload or "prevDailyBar" in payload
+    ):
+        return payload
+    return None
+
+
+def _alpaca_metric(symbol: str) -> MarketMetric | None:
+    snapshot = _alpaca_snapshot(symbol)
+    if not snapshot:
+        return None
+
+    latest_trade = snapshot.get("latestTrade") or {}
+    daily_bar = snapshot.get("dailyBar") or {}
+    prev_daily_bar = snapshot.get("prevDailyBar") or {}
+
+    price = _safe_float(latest_trade.get("p")) or _safe_float(daily_bar.get("c"))
+    prev_close = _safe_float(prev_daily_bar.get("c")) or _safe_float(daily_bar.get("o")) or price
+
+    if price is None:
+        return None
+
+    change_percent = ((price - prev_close) / prev_close * 100) if prev_close else 0.0
+
+    return MarketMetric(
+        ticker=symbol,
+        price=round(price, 2),
+        change_percent=round(change_percent, 2),
+        pe_ratio=None,
+        beta=None,
+        volume=_safe_int(daily_bar.get("v")),
+        market_cap=None,
+    )
+
+
+def _finnhub_quote(symbol: str) -> dict[str, Any] | None:
+    payload = _finnhub_get("/quote", {"symbol": symbol})
+    if not isinstance(payload, dict):
+        return None
+
+    price = _safe_float(payload.get("c"))
+    if price is None:
+        return None
+
+    prev = _safe_float(payload.get("pc")) or price
+    change_percent = _safe_float(payload.get("dp"))
+    if change_percent is None:
+        change_percent = ((price - prev) / prev * 100) if prev else 0.0
+
+    return {
+        "price": price,
+        "change_percent": change_percent,
+        "volume": _safe_int(payload.get("v")),
+    }
+
+
+def _finnhub_basic_metrics(symbol: str) -> dict[str, Any]:
+    payload = _finnhub_get("/stock/metric", {"symbol": symbol, "metric": "all"})
+    metrics = payload.get("metric") if isinstance(payload, dict) else None
+    return metrics if isinstance(metrics, dict) else {}
+
+
+def _finnhub_profile(symbol: str) -> dict[str, Any]:
+    payload = _finnhub_get("/stock/profile2", {"symbol": symbol})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _finnhub_recommendation(symbol: str) -> dict[str, Any]:
+    payload = _finnhub_get("/stock/recommendation", {"symbol": symbol})
+    if isinstance(payload, list) and payload:
+        first = payload[0]
+        if isinstance(first, dict):
+            return first
+    return {}
+
+
+def _finnhub_price_target(symbol: str) -> dict[str, Any]:
+    payload = _finnhub_get("/stock/price-target", {"symbol": symbol})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _finnhub_insider_transactions(symbol: str) -> list[dict[str, Any]]:
+    today = datetime.now(timezone.utc).date()
+    start = (today - timedelta(days=365)).isoformat()
+    payload = _finnhub_get(
+        "/stock/insider-transactions",
+        {
+            "symbol": symbol,
+            "from": start,
+            "to": today.isoformat(),
+        },
+    )
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    for row in rows[:30]:
+        if not isinstance(row, dict):
+            continue
+        shares = _safe_float(row.get("share"))
+        txn_price = _safe_float(row.get("transactionPrice"))
+        value = (shares * txn_price) if shares is not None and txn_price is not None else None
+        out.append(
+            {
+                "start_date": row.get("filingDate") or row.get("transactionDate"),
+                "filer_name": row.get("name") or "Insider",
+                "filer_relation": row.get("officerTitle") or row.get("position") or "Insider",
+                "money_text": row.get("transactionCode") or row.get("transactionType") or "Insider transaction",
+                "shares": shares,
+                "value": value,
+                "ownership": row.get("shareOwned") or row.get("change") or "",
+            }
+        )
+    return out
+
+
+def _alpaca_bars(symbol: str, period: str = "1mo", interval: str = "1d") -> List[CandlestickPoint]:
+    timeframe = _alpaca_timeframe(interval)
+    days = _period_days(period)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+
+    if timeframe.endswith("Min"):
+        limit = min(10_000, max(1000, days * 390))
+    else:
+        limit = min(10_000, max(200, days * 2))
+
+    payload = _alpaca_get(
+        f"/v2/stocks/{symbol}/bars",
+        params={
+            "feed": _settings().alpaca_data_feed,
+            "timeframe": timeframe,
+            "start": _iso_z(start),
+            "end": _iso_z(end),
+            "adjustment": "raw",
+            "sort": "asc",
+            "limit": limit,
+        },
+    )
+    bars = payload.get("bars") if isinstance(payload, dict) else None
+    if not isinstance(bars, list):
+        return []
 
     out: List[CandlestickPoint] = []
-    for line in lines[1:]:
-        parts = line.split(",")
-        if len(parts) < 6:
+    for bar in bars:
+        if not isinstance(bar, dict):
             continue
-        date_s, open_s, high_s, low_s, close_s, vol_s = parts[:6]
-        try:
-            dt = datetime.fromisoformat(date_s).replace(tzinfo=timezone.utc)
-            out.append(
-                CandlestickPoint(
-                    timestamp=dt.isoformat(),
-                    open=round(float(open_s), 2),
-                    high=round(float(high_s), 2),
-                    low=round(float(low_s), 2),
-                    close=round(float(close_s), 2),
-                    volume=float(vol_s),
-                )
+        close = _safe_float(bar.get("c"))
+        if close is None:
+            continue
+        open_ = _safe_float(bar.get("o")) or close
+        high = _safe_float(bar.get("h")) or close
+        low = _safe_float(bar.get("l")) or close
+        volume = _safe_float(bar.get("v")) or 0.0
+
+        ts = bar.get("t")
+        if isinstance(ts, str):
+            try:
+                timestamp = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+            except ValueError:
+                continue
+        else:
+            continue
+
+        out.append(
+            CandlestickPoint(
+                timestamp=timestamp,
+                open=round(open_, 2),
+                high=round(high, 2),
+                low=round(low, 2),
+                close=round(close, 2),
+                volume=float(volume),
             )
-        except Exception:
+        )
+    return out
+
+
+def _finnhub_candles(symbol: str, period: str = "1mo", interval: str = "1d") -> List[CandlestickPoint]:
+    days = _period_days(period)
+    end = int(datetime.now(timezone.utc).timestamp())
+    start = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+
+    payload = _finnhub_get(
+        "/stock/candle",
+        {
+            "symbol": symbol,
+            "resolution": _finnhub_resolution(interval),
+            "from": start,
+            "to": end,
+        },
+    )
+    if not isinstance(payload, dict) or payload.get("s") != "ok":
+        return []
+
+    closes = payload.get("c") or []
+    opens = payload.get("o") or []
+    highs = payload.get("h") or []
+    lows = payload.get("l") or []
+    volumes = payload.get("v") or []
+    timestamps = payload.get("t") or []
+
+    size = min(len(closes), len(opens), len(highs), len(lows), len(volumes), len(timestamps))
+    out: List[CandlestickPoint] = []
+    for idx in range(size):
+        close = _safe_float(closes[idx])
+        if close is None:
+            continue
+        open_ = _safe_float(opens[idx]) or close
+        high = _safe_float(highs[idx]) or close
+        low = _safe_float(lows[idx]) or close
+        volume = _safe_float(volumes[idx]) or 0.0
+        ts = _safe_int(timestamps[idx])
+        if ts is None:
             continue
 
-    return out[-take:] if out else []
+        out.append(
+            CandlestickPoint(
+                timestamp=datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                open=round(open_, 2),
+                high=round(high, 2),
+                low=round(low, 2),
+                close=round(close, 2),
+                volume=float(volume),
+            )
+        )
+    return out
 
 
-def _stooq_latest_quote(symbol: str) -> Dict[str, Any] | None:
-    points = _stooq_candles(symbol, period="1mo")
-    if not points:
+def _alpaca_asset_by_symbol(symbol: str) -> dict[str, Any] | None:
+    payload = _alpaca_get(f"/v2/assets/{symbol}", trading=True)
+    return payload if isinstance(payload, dict) else None
+
+
+def _finnhub_search(query: str, limit: int = 8) -> List[TickerLookup]:
+    payload = _finnhub_get("/search", {"q": query})
+    rows = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+
+    out: List[TickerLookup] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if not symbol or symbol in seen:
+            continue
+
+        description = str(row.get("description") or symbol).strip() or symbol
+        exchange = str(row.get("exchange") or row.get("mic") or "").strip() or None
+        instrument_type = str(row.get("type") or "").strip() or None
+
+        out.append(
+            TickerLookup(
+                ticker=symbol,
+                name=description,
+                exchange=exchange,
+                instrument_type=instrument_type,
+            )
+        )
+        seen.add(symbol)
+        if len(out) >= limit:
+            break
+
+    return out
+
+
+def _metric_from_finnhub(symbol: str) -> MarketMetric | None:
+    quote = _finnhub_quote(symbol)
+    if not quote:
         return None
-    latest = points[-1]
-    prev = points[-2] if len(points) > 1 else latest
-    prev_close = prev.close or latest.close
-    change = ((latest.close - prev_close) / prev_close * 100) if prev_close else 0.0
-    return {
-        "price": latest.close,
-        "change_percent": change,
-        "volume": int(latest.volume),
-    }
+
+    basic = _finnhub_basic_metrics(symbol)
+    profile = _finnhub_profile(symbol)
+
+    pe_ratio = _safe_float(basic.get("peTTM")) or _safe_float(basic.get("peBasicExclExtraTTM"))
+    beta = _safe_float(basic.get("beta"))
+    market_cap = _normalize_market_cap(basic.get("marketCapitalization")) or _normalize_market_cap(
+        profile.get("marketCapitalization")
+    )
+
+    return MarketMetric(
+        ticker=symbol,
+        price=round(float(quote["price"]), 2),
+        change_percent=round(float(quote["change_percent"]), 2),
+        pe_ratio=round(pe_ratio, 2) if pe_ratio is not None and not math.isnan(pe_ratio) else None,
+        beta=round(beta, 2) if beta is not None and not math.isnan(beta) else None,
+        volume=_safe_int(quote.get("volume") or basic.get("10DayAverageTradingVolume")),
+        market_cap=market_cap,
+    )
 
 
 def fetch_metric(ticker: str) -> MarketMetric:
     symbol = ticker.upper().strip()
-    quote = _yahoo_quote(symbol)
-    if not quote:
-        stooq = _stooq_latest_quote(symbol)
-        if stooq:
-            out = MarketMetric(
-                ticker=symbol,
-                price=round(float(stooq["price"]), 2),
-                change_percent=round(float(stooq["change_percent"]), 2),
-                pe_ratio=None,
-                beta=None,
-                volume=_safe_int(stooq.get("volume")),
-                market_cap=None,
-            )
-            _LAST_METRIC_CACHE[symbol] = out
-            return out
-        cached = _LAST_METRIC_CACHE.get(symbol)
-        if cached:
-            return cached
-        raise RuntimeError(f"No quote data available for {symbol}")
 
-    price = _safe_float(quote.get("regularMarketPrice"))
-    prev = _safe_float(quote.get("regularMarketPreviousClose")) or price
-    if price is None:
-        stooq = _stooq_latest_quote(symbol)
-        if stooq:
-            out = MarketMetric(
-                ticker=symbol,
-                price=round(float(stooq["price"]), 2),
-                change_percent=round(float(stooq["change_percent"]), 2),
-                pe_ratio=None,
-                beta=None,
-                volume=_safe_int(stooq.get("volume")),
-                market_cap=None,
-            )
-            _LAST_METRIC_CACHE[symbol] = out
-            return out
-        cached = _LAST_METRIC_CACHE.get(symbol)
-        if cached:
-            return cached
-        raise RuntimeError(f"No price data available for {symbol}")
+    # Primary provider: Alpaca (real-time snapshot).
+    alpaca_metric = _alpaca_metric(symbol)
+    if alpaca_metric is not None:
+        # Opportunistically enrich with Finnhub fundamentals (no hard dependency).
+        basic = _finnhub_basic_metrics(symbol)
+        profile = _finnhub_profile(symbol)
+        pe_ratio = _safe_float(basic.get("peTTM")) or _safe_float(basic.get("peBasicExclExtraTTM"))
+        beta = _safe_float(basic.get("beta"))
+        market_cap = _normalize_market_cap(basic.get("marketCapitalization")) or _normalize_market_cap(
+            profile.get("marketCapitalization")
+        )
 
-    change_percent = ((price - prev) / prev * 100) if prev else 0.0
-    pe_ratio = _safe_float(quote.get("trailingPE"))
-    beta = _safe_float(quote.get("beta"))
-    volume = _safe_int(quote.get("regularMarketVolume"))
-    market_cap = _safe_float(quote.get("marketCap"))
+        out = MarketMetric(
+            ticker=alpaca_metric.ticker,
+            price=alpaca_metric.price,
+            change_percent=alpaca_metric.change_percent,
+            pe_ratio=round(pe_ratio, 2) if pe_ratio is not None and not math.isnan(pe_ratio) else None,
+            beta=round(beta, 2) if beta is not None and not math.isnan(beta) else None,
+            volume=alpaca_metric.volume,
+            market_cap=market_cap,
+        )
+        _LAST_METRIC_CACHE[symbol] = out
+        return out
 
-    out = MarketMetric(
-        ticker=symbol,
-        price=round(price, 2),
-        change_percent=round(change_percent, 2),
-        pe_ratio=round(pe_ratio, 2) if pe_ratio is not None and not math.isnan(pe_ratio) else None,
-        beta=round(beta, 2) if beta is not None and not math.isnan(beta) else None,
-        volume=volume,
-        market_cap=market_cap,
-    )
+    # Backup provider: Finnhub.
+    finnhub_metric = _metric_from_finnhub(symbol)
+    if finnhub_metric is not None:
+        _LAST_METRIC_CACHE[symbol] = finnhub_metric
+        return finnhub_metric
+
+    cached = _LAST_METRIC_CACHE.get(symbol)
+    if cached is not None:
+        return cached
+
+    # Last-resort sandbox fallback.
+    out = _synthetic_metric(symbol)
     _LAST_METRIC_CACHE[symbol] = out
     return out
 
@@ -266,137 +549,72 @@ async def search_tickers(query: str, limit: int = 8) -> List[TickerLookup]:
     if not clean_query:
         return []
 
-    params = {
-        "q": clean_query,
-        "quotesCount": max(1, min(limit * 3, 50)),
-        "newsCount": 0,
-        "enableFuzzyQuery": "true",
-    }
-    headers = {
-        "User-Agent": "TickerMaster/1.0 (+https://tickermaster.local)",
-        "Accept": "application/json",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=8.0, headers=headers) as client:
-            response = await client.get(YAHOO_SEARCH_URL, params=params)
-            response.raise_for_status()
-            payload = response.json()
-    except Exception:
-        return []
-
-    seen = set()
     out: List[TickerLookup] = []
-    for item in payload.get("quotes", []):
-        symbol = str(item.get("symbol", "")).upper().strip()
-        if not symbol or symbol in seen:
-            continue
+    seen: set[str] = set()
 
-        quote_type = str(item.get("quoteType", "")).upper().strip()
-        if quote_type and quote_type not in YAHOO_ALLOWED_TYPES:
-            continue
+    # Primary: Alpaca exact symbol lookup.
+    symbol_candidate = clean_query.upper().strip()
+    if symbol_candidate.replace(".", "").isalnum() and len(symbol_candidate) <= 8:
+        asset = await asyncio.to_thread(_alpaca_asset_by_symbol, symbol_candidate)
+        if isinstance(asset, dict):
+            asset_symbol = str(asset.get("symbol") or "").upper().strip()
+            if asset_symbol:
+                out.append(
+                    TickerLookup(
+                        ticker=asset_symbol,
+                        name=str(asset.get("name") or asset_symbol),
+                        exchange=str(asset.get("exchange") or "").strip() or None,
+                        instrument_type=str(asset.get("asset_class") or "").strip() or None,
+                    )
+                )
+                seen.add(asset_symbol)
 
-        name = item.get("shortname") or item.get("longname") or symbol
-        if not isinstance(name, str) or not name.strip():
-            name = symbol
+    # Backup: Finnhub search API.
+    if len(out) < limit:
+        backup = await asyncio.to_thread(_finnhub_search, clean_query, max(limit * 2, 8))
+        for item in backup:
+            if item.ticker in seen:
+                continue
+            out.append(item)
+            seen.add(item.ticker)
+            if len(out) >= limit:
+                break
 
-        exchange = item.get("exchDisp") or item.get("exchange")
-        exchange_name = str(exchange).strip() if isinstance(exchange, str) else None
-        instrument_type = quote_type or None
-
-        out.append(
-            TickerLookup(
-                ticker=symbol,
-                name=name.strip(),
-                exchange=exchange_name or None,
-                instrument_type=instrument_type,
-            )
-        )
-        seen.add(symbol)
-        if len(out) >= limit:
-            break
-
-    return out
+    return out[:limit]
 
 
 def fetch_candles(ticker: str, period: str = "1mo", interval: str = "1d") -> List[CandlestickPoint]:
     symbol = ticker.upper().strip()
     cache_key = f"{symbol}:{period}:{interval}"
-    chart = _yahoo_chart(symbol, period=period, interval=interval)
-    if not chart:
-        stooq = _stooq_candles(symbol, period=period)
-        if stooq:
-            _LAST_CANDLES_CACHE[cache_key] = stooq
-            return stooq
-        cached = _LAST_CANDLES_CACHE.get(cache_key)
-        if cached:
-            return cached
-        raise RuntimeError(f"No candle data available for {symbol}")
 
-    results = chart.get("result") or []
-    if not results:
-        stooq = _stooq_candles(symbol, period=period)
-        if stooq:
-            _LAST_CANDLES_CACHE[cache_key] = stooq
-            return stooq
-        cached = _LAST_CANDLES_CACHE.get(cache_key)
-        if cached:
-            return cached
-        raise RuntimeError(f"No candle data available for {symbol}")
+    # Primary provider: Alpaca bars.
+    alpaca = _alpaca_bars(symbol, period=period, interval=interval)
+    if alpaca:
+        _LAST_CANDLES_CACHE[cache_key] = alpaca
+        return alpaca
 
-    result = results[0]
-    timestamps = result.get("timestamp") or []
-    quote = (result.get("indicators", {}).get("quote") or [{}])[0]
-    opens = quote.get("open") or []
-    highs = quote.get("high") or []
-    lows = quote.get("low") or []
-    closes = quote.get("close") or []
-    volumes = quote.get("volume") or []
+    # Backup provider: Finnhub candles.
+    finnhub = _finnhub_candles(symbol, period=period, interval=interval)
+    if finnhub:
+        _LAST_CANDLES_CACHE[cache_key] = finnhub
+        return finnhub
 
-    points: List[CandlestickPoint] = []
-    for idx, ts in enumerate(timestamps):
-        if idx >= len(closes):
-            break
-        c = closes[idx]
-        if c is None:
-            continue
-        o = opens[idx] if idx < len(opens) and opens[idx] is not None else c
-        h = highs[idx] if idx < len(highs) and highs[idx] is not None else c
-        l = lows[idx] if idx < len(lows) and lows[idx] is not None else c
-        v = volumes[idx] if idx < len(volumes) and volumes[idx] is not None else 0
-        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-        points.append(
-            CandlestickPoint(
-                timestamp=dt.isoformat(),
-                open=round(float(o), 2),
-                high=round(float(h), 2),
-                low=round(float(l), 2),
-                close=round(float(c), 2),
-                volume=float(v),
-            )
-        )
-
-    if points:
-        _LAST_CANDLES_CACHE[cache_key] = points
-        return points
-    stooq = _stooq_candles(symbol, period=period)
-    if stooq:
-        _LAST_CANDLES_CACHE[cache_key] = stooq
-        return stooq
     cached = _LAST_CANDLES_CACHE.get(cache_key)
     if cached:
         return cached
-    raise RuntimeError(f"No candle data available for {symbol}")
+
+    # Last-resort sandbox fallback.
+    synthetic = _synthetic_candles(symbol, count=max(20, min(240, _period_days(period))))
+    _LAST_CANDLES_CACHE[cache_key] = synthetic
+    return synthetic
 
 
 def fetch_sp500_returns_window(period: str = "10y") -> Tuple[np.ndarray, float]:
-    chart = _yahoo_chart("^GSPC", period=period, interval="1d")
-    closes: List[float] = []
+    bars = _alpaca_bars("SPY", period=period, interval="1d")
+    if not bars:
+        bars = _finnhub_candles("SPY", period=period, interval="1d")
 
-    if chart and chart.get("result"):
-        result = chart["result"][0]
-        quote = (result.get("indicators", {}).get("quote") or [{}])[0]
-        closes = [float(c) for c in (quote.get("close") or []) if c is not None]
+    closes = [float(point.close) for point in bars if point.close is not None]
 
     if len(closes) < 3:
         rng = np.random.default_rng(42)
@@ -412,72 +630,77 @@ def fetch_sp500_returns_window(period: str = "10y") -> Tuple[np.ndarray, float]:
     return returns, annualized_vol
 
 
+def _recommendation_label(row: dict[str, Any]) -> str | None:
+    if not row:
+        return None
+
+    strong_buy = _safe_int(row.get("strongBuy")) or 0
+    buy = _safe_int(row.get("buy")) or 0
+    hold = _safe_int(row.get("hold")) or 0
+    sell = _safe_int(row.get("sell")) or 0
+    strong_sell = _safe_int(row.get("strongSell")) or 0
+
+    bullish = strong_buy + buy
+    bearish = strong_sell + sell
+
+    if bullish > bearish + hold:
+        return "buy"
+    if bearish > bullish + hold:
+        return "sell"
+    if hold > 0:
+        return "hold"
+    return None
+
+
 def fetch_advanced_stock_data(ticker: str) -> Dict[str, Any]:
     symbol = ticker.upper().strip()
-    modules = [
-        "price",
-        "summaryDetail",
-        "financialData",
-        "defaultKeyStatistics",
-        "summaryProfile",
-        "calendarEvents",
-        "recommendationTrend",
-        "insiderTransactions",
-        "majorHoldersBreakdown",
-        "upgradeDowngradeHistory",
-    ]
-    summary = _yahoo_quote_summary(symbol, modules) or {}
-    quote = _yahoo_quote(symbol) or {}
 
-    insider: list[dict[str, Any]] = []
+    profile = _finnhub_profile(symbol)
+    basic = _finnhub_basic_metrics(symbol)
+    recommendation_row = _finnhub_recommendation(symbol)
+    price_target = _finnhub_price_target(symbol)
 
-    if not insider:
-        insider_raw = ((summary.get("insiderTransactions") or {}).get("transactions") or [])
-        for row in insider_raw[:30]:
-            if not isinstance(row, dict):
-                continue
-            insider.append(
-                {
-                    "start_date": ((row.get("startDate") or {}).get("fmt") if isinstance(row.get("startDate"), dict) else None),
-                    "filer_name": (row.get("filerName") or row.get("filer") or ""),
-                    "filer_relation": (row.get("filerRelation") or ""),
-                    "money_text": (row.get("moneyText") or ""),
-                    "shares": ((row.get("shares") or {}).get("raw") if isinstance(row.get("shares"), dict) else row.get("shares")),
-                    "value": ((row.get("value") or {}).get("raw") if isinstance(row.get("value"), dict) else row.get("value")),
-                    "ownership": (row.get("ownership") or ""),
-                }
-            )
+    try:
+        metric = fetch_metric(symbol)
+    except Exception:
+        metric = _synthetic_metric(symbol)
+
+    insider = _finnhub_insider_transactions(symbol)
     if not insider:
         insider = _sec_form4_fallback(symbol)
 
-    def _get_fmt(section: str, key: str) -> Any:
-        block = summary.get(section) or {}
-        value = block.get(key)
-        if isinstance(value, dict):
-            return value.get("raw", value.get("fmt"))
-        return value
+    trailing_pe = _safe_float(basic.get("peTTM")) or _safe_float(basic.get("peBasicExclExtraTTM"))
+    forward_pe = _safe_float(basic.get("peForward"))
+    eps_trailing = _safe_float(basic.get("epsTTM"))
+    eps_forward = _safe_float(basic.get("epsForward"))
+    dividend_yield = _safe_float(basic.get("dividendYieldIndicatedAnnual"))
+    fifty_two_week_high = _safe_float(basic.get("52WeekHigh"))
+    fifty_two_week_low = _safe_float(basic.get("52WeekLow"))
+    avg_volume = _safe_float(basic.get("10DayAverageTradingVolume")) or _safe_float(
+        basic.get("3MonthAverageTradingVolume")
+    )
 
     return {
         "ticker": symbol,
-        "company_name": (quote.get("longName") or quote.get("shortName") or symbol),
-        "exchange": quote.get("fullExchangeName"),
-        "sector": (summary.get("summaryProfile") or {}).get("sector"),
-        "industry": (summary.get("summaryProfile") or {}).get("industry"),
-        "website": (summary.get("summaryProfile") or {}).get("website"),
-        "description": (summary.get("summaryProfile") or {}).get("longBusinessSummary"),
-        "market_cap": (_get_fmt("summaryDetail", "marketCap") or quote.get("marketCap")),
-        "beta": _get_fmt("summaryDetail", "beta"),
-        "trailing_pe": _get_fmt("summaryDetail", "trailingPE"),
-        "forward_pe": _get_fmt("summaryDetail", "forwardPE"),
-        "eps_trailing": _get_fmt("defaultKeyStatistics", "trailingEps"),
-        "eps_forward": _get_fmt("defaultKeyStatistics", "forwardEps"),
-        "dividend_yield": _get_fmt("summaryDetail", "dividendYield"),
-        "fifty_two_week_high": _get_fmt("summaryDetail", "fiftyTwoWeekHigh"),
-        "fifty_two_week_low": _get_fmt("summaryDetail", "fiftyTwoWeekLow"),
-        "avg_volume": _get_fmt("summaryDetail", "averageVolume"),
-        "volume": quote.get("regularMarketVolume"),
-        "recommendation": _get_fmt("financialData", "recommendationKey"),
-        "target_mean_price": _get_fmt("financialData", "targetMeanPrice"),
+        "company_name": (profile.get("name") or symbol),
+        "exchange": profile.get("exchange") or profile.get("mic"),
+        "sector": profile.get("finnhubIndustry"),
+        "industry": profile.get("finnhubIndustry"),
+        "website": profile.get("weburl"),
+        "description": profile.get("description"),
+        "market_cap": metric.market_cap or _normalize_market_cap(profile.get("marketCapitalization")),
+        "beta": metric.beta if metric.beta is not None else _safe_float(basic.get("beta")),
+        "trailing_pe": trailing_pe,
+        "forward_pe": forward_pe,
+        "eps_trailing": eps_trailing,
+        "eps_forward": eps_forward,
+        "dividend_yield": dividend_yield,
+        "fifty_two_week_high": fifty_two_week_high,
+        "fifty_two_week_low": fifty_two_week_low,
+        "avg_volume": avg_volume,
+        "volume": metric.volume,
+        "recommendation": _recommendation_label(recommendation_row),
+        "target_mean_price": _safe_float(price_target.get("targetMean")),
         "insider_transactions": insider,
     }
 

@@ -44,7 +44,7 @@ export default function App() {
     return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   });
 
-  const { connected, lastSimulationTick, lastSimulationLifecycle, lastTrackerSnapshot } = useSocket();
+  const { connected, events, lastSimulationTick, lastSimulationLifecycle, lastTrackerSnapshot } = useSocket();
 
   useEffect(() => {
     getWatchlist()
@@ -174,7 +174,9 @@ export default function App() {
 
       <main className={tab === "simulation" ? "layout-grid layout-grid-single" : "layout-grid"}>
         <div>
-          {tab === "research" ? <ResearchPanel activeTicker={ticker} onTickerChange={setTicker} /> : null}
+          {tab === "research" ? (
+            <ResearchPanel activeTicker={ticker} onTickerChange={setTicker} connected={connected} events={events} />
+          ) : null}
           {tab === "simulation" ? (
             <SimulationPanel
               activeTicker={ticker}

@@ -76,6 +76,15 @@ class Settings:
     supabase_service_key: str = ""
     database_url: str = ""
 
+    alpaca_api_key: str = ""
+    alpaca_api_secret: str = ""
+    alpaca_data_url: str = "https://data.alpaca.markets"
+    alpaca_trading_url: str = "https://paper-api.alpaca.markets"
+    alpaca_data_feed: str = "iex"
+
+    finnhub_api_key: str = ""
+    finnhub_api_url: str = "https://finnhub.io/api/v1"
+
     openai_api_key: str = ""
     openrouter_api_key: str = ""
     openrouter_model: str = "meta-llama/llama-3.1-8b-instruct"
@@ -132,6 +141,13 @@ def get_settings() -> Settings:
         supabase_key=_env("SUPABASE_KEY"),
         supabase_service_key=_env("SUPABASE_SERVICE_KEY"),
         database_url=_env("DATABASE_URL"),
+        alpaca_api_key=_env("ALPACA_API_KEY") or _env("APCA_API_KEY_ID"),
+        alpaca_api_secret=_env("ALPACA_API_SECRET") or _env("APCA_API_SECRET_KEY"),
+        alpaca_data_url=_env("ALPACA_DATA_URL", "https://data.alpaca.markets"),
+        alpaca_trading_url=_env("ALPACA_TRADING_URL", "https://paper-api.alpaca.markets"),
+        alpaca_data_feed=_env("ALPACA_DATA_FEED", "iex"),
+        finnhub_api_key=_env("FINNHUB_API_KEY"),
+        finnhub_api_url=_env("FINNHUB_API_URL", "https://finnhub.io/api/v1"),
         openai_api_key=_env("OPENAI_API_KEY"),
         openrouter_api_key=_env("OPENROUTER_API_KEY"),
         openrouter_model=_env("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct"),

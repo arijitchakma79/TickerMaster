@@ -140,7 +140,7 @@ export default function TrackerPanel({
     <section className="panel stack stagger">
       <header className="panel-header">
         <h2>Tracker</h2>
-        <p>Yahoo-style ticker monitor with valuation metrics, alerting, and live anomaly detection pipeline.</p>
+        <p>Real-time ticker monitor with valuation metrics, alerting, and live anomaly detection pipeline.</p>
       </header>
 
       <WatchlistBar

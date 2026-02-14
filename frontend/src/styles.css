@@ -1232,6 +1232,43 @@ pre {
   overflow: visible;
 }
 
+.live-wire-log {
+  max-height: 340px;
+  overflow: auto;
+}
+
+.event-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.event-item {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: var(--card-soft-bg-4);
+}
+
+.event-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-size: 0.82rem;
+}
+
+.event-meta strong {
+  font-size: 0.82rem;
+}
+
+.event-meta span {
+  color: var(--muted);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.72rem;
+}
+
 .research-rail,
 .tracker-prefs-rail {
   display: flex;
