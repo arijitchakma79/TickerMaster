@@ -1,8 +1,12 @@
 import axios from "axios";
 import type {
+  AdvancedStockData,
   AgentConfig,
   CandlePoint,
+  DeepResearchResponse,
   ResearchResponse,
+  TrackerAgent,
+  TrackerAgentDetail,
   SimulationState,
   TrackerSnapshot
 } from "./types";
@@ -38,6 +42,11 @@ export async function fetchCandles(ticker: string, period = "3mo", interval = "1
     { params: { period, interval } }
   );
   return data.points;
+}
+
+export async function fetchAdvancedStockData(ticker: string): Promise<AdvancedStockData> {
+  const { data } = await client.get<AdvancedStockData>(`/research/advanced/${ticker}`);
+  return data;
 }
 
 export async function startSimulation(payload: {
@@ -102,5 +111,35 @@ export async function requestCommentary(prompt: string, context?: Record<string,
 
 export async function spinModalSandbox(prompt: string, session_id: string) {
   const { data } = await client.post("/simulation/modal/sandbox", { prompt, session_id });
+  return data;
+}
+
+export async function runDeepResearch(ticker: string): Promise<DeepResearchResponse> {
+  const { data } = await client.post<DeepResearchResponse>(`/research/deep/${ticker}`);
+  return data;
+}
+
+export async function createTrackerAgent(payload: {
+  symbol: string;
+  name: string;
+  triggers: Record<string, unknown>;
+  auto_simulate?: boolean;
+}): Promise<TrackerAgent> {
+  const { data } = await client.post<TrackerAgent>("/api/tracker/agents", payload);
+  return data;
+}
+
+export async function listTrackerAgents(): Promise<TrackerAgent[]> {
+  const { data } = await client.get<TrackerAgent[]>("/api/tracker/agents");
+  return data;
+}
+
+export async function deleteTrackerAgent(agentId: string): Promise<{ ok: boolean }> {
+  const { data } = await client.delete<{ ok: boolean }>(`/api/tracker/agents/${agentId}`);
+  return data;
+}
+
+export async function getTrackerAgentDetail(agentId: string): Promise<TrackerAgentDetail> {
+  const { data } = await client.get<TrackerAgentDetail>(`/api/tracker/agents/${agentId}/detail`);
   return data;
 }

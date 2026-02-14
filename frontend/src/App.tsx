@@ -12,6 +12,10 @@ import sunIcon from "./images/sun.png";
 
 type Tab = "research" | "simulation" | "tracker";
 type Theme = "light" | "dark";
+interface AgentFocusRequest {
+  agentId: string;
+  requestedAt: number;
+}
 
 function tabFromQuery(): Tab {
   const params = new URLSearchParams(window.location.search);
@@ -24,6 +28,7 @@ export default function App() {
   const [tab, setTab] = useState<Tab>(tabFromQuery());
   const [ticker, setTicker] = useState((new URLSearchParams(window.location.search).get("ticker") ?? "AAPL").toUpperCase());
   const [integrations, setIntegrations] = useState<Record<string, boolean>>({});
+  const [focusAgent, setFocusAgent] = useState<AgentFocusRequest | null>(null);
   const [theme, setTheme] = useState<Theme>(() => {
     const stored = window.localStorage.getItem("tickermaster-theme");
     if (stored === "light" || stored === "dark") return stored;
@@ -47,6 +52,18 @@ export default function App() {
     if (tab === "simulation") return "Simulation Arena";
     return "Ticker Tracker";
   }, [tab]);
+
+  function handleRailNavigate(target: { tab: Tab; ticker?: string; agentId?: string }) {
+    setTab(target.tab);
+    if (target.ticker) onTickerChange(target.ticker);
+    if (target.tab === "tracker" && target.agentId) {
+      setFocusAgent({ agentId: target.agentId, requestedAt: Date.now() });
+    }
+  }
+
+  function onTickerChange(nextTicker: string) {
+    setTicker(nextTicker.toUpperCase());
+  }
 
   return (
     <div className="app-shell">
@@ -117,21 +134,26 @@ export default function App() {
 
       <main className="layout-grid">
         <div>
-          {tab === "research" ? <ResearchPanel activeTicker={ticker} onTickerChange={setTicker} /> : null}
+          {tab === "research" ? <ResearchPanel activeTicker={ticker} onTickerChange={onTickerChange} /> : null}
           {tab === "simulation" ? (
             <SimulationPanel
               activeTicker={ticker}
-              onTickerChange={setTicker}
+              onTickerChange={onTickerChange}
               simulationEvent={lastSimulationTick}
               simulationLifecycleEvent={lastSimulationLifecycle}
             />
           ) : null}
           {tab === "tracker" ? (
-            <TrackerPanel activeTicker={ticker} onTickerChange={setTicker} trackerEvent={lastTrackerSnapshot} />
+            <TrackerPanel
+              activeTicker={ticker}
+              onTickerChange={onTickerChange}
+              trackerEvent={lastTrackerSnapshot}
+              focusAgent={focusAgent}
+            />
           ) : null}
         </div>
 
-        <EventRail events={events} connected={connected} />
+        <EventRail events={events} connected={connected} onNavigate={handleRailNavigate} />
       </main>
     </div>
   );

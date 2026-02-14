@@ -1,24 +1,40 @@
 import { useEffect, useMemo, useState } from "react";
-import { addAlert, getTrackerSnapshot, setWatchlist, triggerTrackerPoll } from "../lib/api";
+import {
+  addAlert,
+  createTrackerAgent,
+  deleteTrackerAgent,
+  getTrackerAgentDetail,
+  getTrackerSnapshot,
+  listTrackerAgents,
+  setWatchlist,
+  triggerTrackerPoll
+} from "../lib/api";
 import { formatCompactNumber, formatCurrency, formatPercent } from "../lib/format";
-import type { TrackerSnapshot, WSMessage } from "../lib/types";
+import type { TrackerAgent, TrackerAgentDetail, TrackerSnapshot, WSMessage } from "../lib/types";
 
 interface Props {
   activeTicker: string;
   onTickerChange: (ticker: string) => void;
   trackerEvent?: WSMessage;
+  focusAgent?: { agentId: string; requestedAt: number } | null;
 }
 
-export default function TrackerPanel({ activeTicker, onTickerChange, trackerEvent }: Props) {
+export default function TrackerPanel({ activeTicker, onTickerChange, trackerEvent, focusAgent }: Props) {
   const [watchlistInput, setWatchlistInput] = useState("AAPL,MSFT,NVDA,TSLA,SPY");
+  const [newSymbol, setNewSymbol] = useState("");
   const [snapshot, setSnapshot] = useState<TrackerSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [alertTicker, setAlertTicker] = useState(activeTicker);
   const [threshold, setThreshold] = useState(2);
   const [direction, setDirection] = useState<"up" | "down" | "either">("either");
+  const [agentName, setAgentName] = useState(`${activeTicker} Watch`);
+  const [agents, setAgents] = useState<TrackerAgent[]>([]);
+  const [selectedAgent, setSelectedAgent] = useState<TrackerAgentDetail | null>(null);
+  const [agentLoading, setAgentLoading] = useState(false);
 
   useEffect(() => {
     getTrackerSnapshot().then(setSnapshot).catch(() => null);
+    listTrackerAgents().then(setAgents).catch(() => setAgents([]));
   }, []);
 
   useEffect(() => {
@@ -29,6 +45,18 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
       alerts_triggered: Array.isArray(trackerEvent.alerts) ? (trackerEvent.alerts as TrackerSnapshot["alerts_triggered"]) : []
     });
   }, [trackerEvent]);
+
+  useEffect(() => {
+    if (!focusAgent?.agentId) return;
+    setAgentLoading(true);
+    getTrackerAgentDetail(focusAgent.agentId)
+      .then((detail) => {
+        setSelectedAgent(detail);
+        onTickerChange(detail.agent.symbol);
+      })
+      .catch(() => null)
+      .finally(() => setAgentLoading(false));
+  }, [focusAgent?.agentId, focusAgent?.requestedAt, onTickerChange]);
 
   const sorted = useMemo(
     () => [...(snapshot?.tickers ?? [])].sort((a, b) => Math.abs(b.change_percent) - Math.abs(a.change_percent)),
@@ -51,12 +79,94 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
     }
   }
 
+  async function handleAddSymbol() {
+    const symbol = newSymbol.trim().toUpperCase();
+    if (!symbol) return;
+    const existing = (snapshot?.tickers ?? []).map((item) => item.ticker.toUpperCase());
+    if (existing.includes(symbol)) {
+      setNewSymbol("");
+      return;
+    }
+    setLoading(true);
+    try {
+      const next = [...existing, symbol];
+      const updated = await setWatchlist(next);
+      setWatchlistInput(updated.join(","));
+      const refreshed = await triggerTrackerPoll();
+      setSnapshot(refreshed);
+      setNewSymbol("");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleRemoveSymbol(symbol: string) {
+    const existing = (snapshot?.tickers ?? []).map((item) => item.ticker.toUpperCase());
+    const next = existing.filter((ticker) => ticker !== symbol.toUpperCase());
+    setLoading(true);
+    try {
+      const updated = await setWatchlist(next);
+      setWatchlistInput(updated.join(","));
+      const refreshed = await triggerTrackerPoll();
+      setSnapshot(refreshed);
+      if (activeTicker.toUpperCase() === symbol.toUpperCase() && refreshed.tickers[0]?.ticker) {
+        onTickerChange(refreshed.tickers[0].ticker);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleAddAlert() {
     await addAlert({
       ticker: alertTicker.trim().toUpperCase(),
       threshold_percent: threshold,
       direction
     });
+  }
+
+  async function handleDeployAgent() {
+    const symbol = alertTicker.trim().toUpperCase();
+    if (!symbol) return;
+    setLoading(true);
+    try {
+      await createTrackerAgent({
+        symbol,
+        name: agentName.trim() || `${symbol} Watch`,
+        triggers: {
+          price_change_pct: threshold,
+          direction
+        },
+        auto_simulate: true
+      });
+      const refreshed = await listTrackerAgents();
+      setAgents(refreshed);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleOpenAgent(agent: TrackerAgent) {
+    setAgentLoading(true);
+    try {
+      const detail = await getTrackerAgentDetail(agent.id);
+      setSelectedAgent(detail);
+      onTickerChange(agent.symbol);
+    } finally {
+      setAgentLoading(false);
+    }
+  }
+
+  async function handleDeleteAgent(agent: TrackerAgent) {
+    setLoading(true);
+    try {
+      await deleteTrackerAgent(agent.id);
+      const refreshed = await listTrackerAgents();
+      setAgents(refreshed);
+      if (selectedAgent?.agent.id === agent.id) setSelectedAgent(null);
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function handlePoll() {
@@ -81,6 +191,13 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
           Watchlist
           <input value={watchlistInput} onChange={(event) => setWatchlistInput(event.target.value.toUpperCase())} />
         </label>
+        <label>
+          Add Symbol
+          <input value={newSymbol} onChange={(event) => setNewSymbol(event.target.value.toUpperCase())} maxLength={12} />
+        </label>
+        <button className="secondary" onClick={handleAddSymbol} disabled={loading || !newSymbol.trim()}>
+          Add Stock
+        </button>
         <button onClick={handleUpdateWatchlist} disabled={loading}>
           Update List
         </button>
@@ -93,6 +210,10 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
         <label>
           Alert Ticker
           <input value={alertTicker} onChange={(event) => setAlertTicker(event.target.value.toUpperCase())} />
+        </label>
+        <label>
+          Agent Name
+          <input value={agentName} onChange={(event) => setAgentName(event.target.value)} />
         </label>
         <label>
           Threshold %
@@ -114,6 +235,33 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
           </select>
         </label>
         <button onClick={handleAddAlert}>Add Alert</button>
+        <button className="secondary" onClick={handleDeployAgent} disabled={loading}>
+          {loading ? "Deploying…" : "Deploy Agent"}
+        </button>
+      </div>
+
+      <div className="glass-card">
+        <div className="panel-header">
+          <h3>Tracker Agents</h3>
+          <span className="muted">{agents.length} active</span>
+        </div>
+        <div className="card-row wrap">
+          {agents.map((agent) => (
+            <article key={agent.id} className="glass-card" style={{ minWidth: 240, padding: "0.75rem" }}>
+              <div className="source-title">
+                <strong>{agent.name}</strong>
+                <span className={`pill ${agent.status === "active" ? "bullish" : "neutral"}`}>{agent.status}</span>
+              </div>
+              <p className="muted">{agent.symbol}</p>
+              <p className="muted">Triggers: {JSON.stringify(agent.triggers)}</p>
+              <div className="inline-links">
+                <button onClick={() => void handleOpenAgent(agent)}>{agentLoading ? "Opening…" : "View Agent"}</button>
+                <button className="secondary" onClick={() => void handleDeleteAgent(agent)}>Delete</button>
+              </div>
+            </article>
+          ))}
+          {agents.length === 0 ? <p className="muted">No deployed agents yet.</p> : null}
+        </div>
       </div>
 
       <div className="glass-card">
@@ -133,6 +281,7 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
                 <th>Volume</th>
                 <th>Mkt Cap</th>
                 <th>Signal</th>
+                <th>Watchlist</th>
               </tr>
             </thead>
             <tbody>
@@ -153,6 +302,18 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
                     <td>{formatCompactNumber(item.volume)}</td>
                     <td>{formatCompactNumber(item.market_cap)}</td>
                     <td>{signal}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleRemoveSymbol(item.ticker);
+                        }}
+                      >
+                        Remove
+                      </button>
+                    </td>
                   </tr>
                 );
               })}
@@ -173,6 +334,76 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
           {(snapshot?.alerts_triggered ?? []).length === 0 ? <p className="muted">No triggers in the latest poll.</p> : null}
         </div>
       </div>
+
+      {selectedAgent ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="modal-overlay"
+          onClick={() => setSelectedAgent(null)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(2, 6, 23, 0.72)",
+            display: "grid",
+            placeItems: "center",
+            zIndex: 50
+          }}
+        >
+          <div
+            className="glass-card"
+            onClick={(e) => e.stopPropagation()}
+            style={{ width: "min(920px, 94vw)", maxHeight: "84vh", overflow: "auto", padding: "1rem" }}
+          >
+            <div className="panel-header">
+              <h3>{selectedAgent.agent.name} ({selectedAgent.agent.symbol})</h3>
+              <button className="secondary" onClick={() => setSelectedAgent(null)}>Close</button>
+            </div>
+            <div className="kpi-grid">
+              <div>
+                <p className="muted">Price</p>
+                <h3>{selectedAgent.market ? formatCurrency(selectedAgent.market.price) : "-"}</h3>
+              </div>
+              <div>
+                <p className="muted">Change</p>
+                <h3 className={selectedAgent.market && selectedAgent.market.change_percent >= 0 ? "text-green" : "text-red"}>
+                  {selectedAgent.market ? formatPercent(selectedAgent.market.change_percent) : "-"}
+                </h3>
+              </div>
+              <div>
+                <p className="muted">Volume</p>
+                <h3>{selectedAgent.market ? formatCompactNumber(selectedAgent.market.volume) : "-"}</h3>
+              </div>
+            </div>
+
+            <div className="card-row card-row-split" style={{ marginTop: "0.75rem" }}>
+              <div className="glass-card">
+                <h4>Recent Agent Actions</h4>
+                {(selectedAgent.recent_actions ?? []).slice(0, 20).map((action, idx) => (
+                  <article key={`action-${idx}`} className="alert-item">
+                    <strong>{String(action.agent_name ?? "Tracker")}</strong>
+                    <p>{String(action.action ?? "-")}</p>
+                    <p className="muted">{String(action.created_at ?? "")}</p>
+                  </article>
+                ))}
+                {(selectedAgent.recent_actions ?? []).length === 0 ? <p className="muted">No actions yet.</p> : null}
+              </div>
+
+              <div className="glass-card">
+                <h4>Recent Alerts</h4>
+                {(selectedAgent.recent_alerts ?? []).slice(0, 20).map((alert, idx) => (
+                  <article key={`agent-alert-${idx}`} className="alert-item">
+                    <strong>{String(alert.symbol ?? selectedAgent.agent.symbol)}</strong>
+                    <p>{String(alert.trigger_reason ?? alert.reason ?? "-")}</p>
+                    <p className="muted">{String(alert.created_at ?? "")}</p>
+                  </article>
+                ))}
+                {(selectedAgent.recent_alerts ?? []).length === 0 ? <p className="muted">No alerts yet.</p> : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }

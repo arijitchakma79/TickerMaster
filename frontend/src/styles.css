@@ -510,6 +510,12 @@ button:disabled {
   margin-top: 10px;
 }
 
+.advanced-chart {
+  width: 100%;
+  min-height: 340px;
+  margin-top: 10px;
+}
+
 .source-item,
 .alert-item {
   border: 1px solid var(--line);
@@ -705,11 +711,42 @@ pre {
   background: var(--card-soft-bg-4);
 }
 
+.event-item-button {
+  width: 100%;
+  text-align: left;
+  color: inherit;
+  background: var(--card-soft-bg-4);
+  border: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.event-item-button:hover {
+  border-color: rgba(16, 163, 127, 0.46);
+}
+
 .event-meta {
   display: flex;
   justify-content: space-between;
   margin-bottom: 4px;
   font-size: 0.82rem;
+}
+
+.event-meta-bottom {
+  margin-top: 8px;
+  margin-bottom: 6px;
+  align-items: center;
+}
+
+.event-action {
+  margin: 4px 0 0;
+  font-size: 0.86rem;
+  color: var(--ink);
+}
+
+.event-desc {
+  margin: 6px 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
 }
 
 time {
