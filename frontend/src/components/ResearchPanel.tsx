@@ -1,7 +1,14 @@
-import { useMemo, useState } from "react";
-import { fetchAdvancedStockData, fetchCandles, runDeepResearch, runResearch } from "../lib/api";
+import { useEffect, useMemo, useState } from "react";
+import {
+  fetchAdvancedStockData,
+  fetchCandles,
+  runDeepResearch,
+  runResearch,
+  searchTickerDirectory
+} from "../lib/api";
 import { formatCompactNumber, formatPercent } from "../lib/format";
-import type { AdvancedStockData, CandlePoint, DeepResearchResponse, ResearchResponse } from "../lib/types";
+import { resolveTickerCandidate } from "../lib/tickerInput";
+import type { AdvancedStockData, CandlePoint, DeepResearchResponse, ResearchResponse, TickerLookup } from "../lib/types";
 import StockChart from "./StockChart";
 
 interface Props {
@@ -11,6 +18,9 @@ interface Props {
 
 export default function ResearchPanel({ activeTicker, onTickerChange }: Props) {
   const [tickerInput, setTickerInput] = useState(activeTicker);
+  const [tickerInputFocused, setTickerInputFocused] = useState(false);
+  const [tickerSuggestions, setTickerSuggestions] = useState<TickerLookup[]>([]);
+  const [tickerSearchLoading, setTickerSearchLoading] = useState(false);
   const [timeframe, setTimeframe] = useState("7d");
   const [loading, setLoading] = useState(false);
   const [research, setResearch] = useState<ResearchResponse | null>(null);
@@ -30,10 +40,50 @@ export default function ResearchPanel({ activeTicker, onTickerChange }: Props) {
     return `${formatPercent(research.aggregate_sentiment * 100)} / ${research.recommendation.replace("_", " ")}`;
   }, [research]);
 
-  async function handleAnalyze() {
+  useEffect(() => {
+    const query = tickerInput.trim();
+    if (!query) {
+      setTickerSuggestions([]);
+      setTickerSearchLoading(false);
+      return;
+    }
+
+    let active = true;
+    const timer = window.setTimeout(() => {
+      setTickerSearchLoading(true);
+      void searchTickerDirectory(query, 8)
+        .then((results) => {
+          if (!active) return;
+          setTickerSuggestions(results);
+        })
+        .catch(() => {
+          if (!active) return;
+          setTickerSuggestions([]);
+        })
+        .finally(() => {
+          if (!active) return;
+          setTickerSearchLoading(false);
+        });
+    }, 180);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [tickerInput]);
+
+  async function handleAnalyze(rawInput?: string) {
     setLoading(true);
     setError("");
-    const ticker = tickerInput.trim().toUpperCase();
+    const seed = rawInput ?? tickerInput;
+    const ticker = resolveTickerCandidate(seed, tickerSuggestions);
+    if (!ticker) {
+      setError("Enter a ticker or company name.");
+      setLoading(false);
+      return;
+    }
+    setTickerInput(ticker);
+    setTickerInputFocused(false);
     onTickerChange(ticker);
     try {
       const [analysis, chart, advancedData] = await Promise.all([
@@ -72,10 +122,48 @@ export default function ResearchPanel({ activeTicker, onTickerChange }: Props) {
         <p>Perplexity Sonar + X + Reddit + prediction markets, summarized into high-signal narratives.</p>
       </header>
 
-      <div className="card-row research-actions">
-        <label>
+      <div className="card-row research-actions research-actions-card">
+        <label className="research-ticker-field">
           Ticker
-          <input value={tickerInput} onChange={(event) => setTickerInput(event.target.value.toUpperCase())} maxLength={12} />
+          <div className="ticker-autocomplete">
+            <input
+              value={tickerInput}
+              onFocus={() => setTickerInputFocused(true)}
+              onBlur={() => setTimeout(() => setTickerInputFocused(false), 120)}
+              onChange={(event) => setTickerInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") return;
+                event.preventDefault();
+                const topSuggestion = tickerSuggestions[0]?.ticker;
+                void handleAnalyze(topSuggestion ?? tickerInput);
+              }}
+              maxLength={48}
+              placeholder="Ticker or company name"
+            />
+            {tickerInputFocused && tickerInput.trim() ? (
+              <div className="ticker-suggestions" role="listbox" aria-label="Ticker suggestions">
+                {tickerSuggestions.length > 0 ? (
+                  tickerSuggestions.map((entry) => (
+                    <button
+                      key={`research-${entry.ticker}-${entry.name}`}
+                      type="button"
+                      className="ticker-suggestion"
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => {
+                        setTickerInput(entry.ticker);
+                        setTickerInputFocused(false);
+                      }}
+                    >
+                      <span className="ticker-suggestion-symbol">{entry.ticker}</span>
+                      <span className="ticker-suggestion-name">{entry.name}</span>
+                    </button>
+                  ))
+                ) : (
+                  <p className="ticker-suggestion-empty">{tickerSearchLoading ? "Searching…" : "No matches found"}</p>
+                )}
+              </div>
+            ) : null}
+          </div>
         </label>
         <label>
           Timeframe
@@ -129,7 +217,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange }: Props) {
             <button type="button" className={showEma ? "" : "secondary"} onClick={() => setShowEma((v) => !v)}>EMA21</button>
           </div>
         </label>
-        <button onClick={handleAnalyze} disabled={loading}>
+        <button onClick={() => void handleAnalyze()} disabled={loading}>
           {loading ? "Analyzing…" : "Run Research"}
         </button>
         <button className="secondary" onClick={handleDeepResearch} disabled={deepLoading}>

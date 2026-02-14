@@ -7,7 +7,10 @@ from typing import Any, Dict, List, Tuple
 import httpx
 import numpy as np
 
-from app.schemas import CandlestickPoint, MarketMetric
+from app.schemas import CandlestickPoint, MarketMetric, TickerLookup
+
+YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
+YAHOO_ALLOWED_TYPES = {"EQUITY", "ETF", "MUTUALFUND", "INDEX"}
 
 _LAST_METRIC_CACHE: dict[str, MarketMetric] = {}
 _LAST_CANDLES_CACHE: dict[str, List[CandlestickPoint]] = {}
@@ -256,6 +259,64 @@ def fetch_watchlist_metrics(tickers: List[str]) -> List[MarketMetric]:
         except Exception:
             continue
     return items
+
+
+async def search_tickers(query: str, limit: int = 8) -> List[TickerLookup]:
+    clean_query = query.strip()
+    if not clean_query:
+        return []
+
+    params = {
+        "q": clean_query,
+        "quotesCount": max(1, min(limit * 3, 50)),
+        "newsCount": 0,
+        "enableFuzzyQuery": "true",
+    }
+    headers = {
+        "User-Agent": "TickerMaster/1.0 (+https://tickermaster.local)",
+        "Accept": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0, headers=headers) as client:
+            response = await client.get(YAHOO_SEARCH_URL, params=params)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return []
+
+    seen = set()
+    out: List[TickerLookup] = []
+    for item in payload.get("quotes", []):
+        symbol = str(item.get("symbol", "")).upper().strip()
+        if not symbol or symbol in seen:
+            continue
+
+        quote_type = str(item.get("quoteType", "")).upper().strip()
+        if quote_type and quote_type not in YAHOO_ALLOWED_TYPES:
+            continue
+
+        name = item.get("shortname") or item.get("longname") or symbol
+        if not isinstance(name, str) or not name.strip():
+            name = symbol
+
+        exchange = item.get("exchDisp") or item.get("exchange")
+        exchange_name = str(exchange).strip() if isinstance(exchange, str) else None
+        instrument_type = quote_type or None
+
+        out.append(
+            TickerLookup(
+                ticker=symbol,
+                name=name.strip(),
+                exchange=exchange_name or None,
+                instrument_type=instrument_type,
+            )
+        )
+        seen.add(symbol)
+        if len(out) >= limit:
+            break
+
+    return out
 
 
 def fetch_candles(ticker: str, period: str = "1mo", interval: str = "1d") -> List[CandlestickPoint]:

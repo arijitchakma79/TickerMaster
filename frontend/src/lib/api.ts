@@ -4,11 +4,13 @@ import type {
   AgentConfig,
   CandlePoint,
   DeepResearchResponse,
+  MarketMetric,
   ResearchResponse,
   TrackerAgent,
   TrackerAgentDetail,
   TrackerAgentInteractResponse,
   SimulationState,
+  TickerLookup,
   TrackerSnapshot
 } from "./types";
 
@@ -50,6 +52,19 @@ export async function fetchAdvancedStockData(ticker: string): Promise<AdvancedSt
   return data;
 }
 
+export async function fetchRealtimeQuote(ticker: string): Promise<MarketMetric> {
+  const { data } = await client.get<MarketMetric>(`/research/quote/${ticker}`);
+  return data;
+}
+
+export async function searchTickerDirectory(query: string, limit = 8): Promise<TickerLookup[]> {
+  const cleanQuery = query.trim();
+  if (!cleanQuery) return [];
+  const { data } = await client.get<{ query: string; results: TickerLookup[] }>("/research/search/tickers", {
+    params: { query: cleanQuery, limit }
+  });
+  return data.results;
+}
 export async function startSimulation(payload: {
   ticker: string;
   duration_seconds: number;
@@ -64,6 +79,16 @@ export async function startSimulation(payload: {
 
 export async function stopSimulation(sessionId: string) {
   const { data } = await client.post(`/simulation/stop/${sessionId}`);
+  return data;
+}
+
+export async function pauseSimulation(sessionId: string): Promise<SimulationState> {
+  const { data } = await client.post<SimulationState>(`/simulation/pause/${sessionId}`);
+  return data;
+}
+
+export async function resumeSimulation(sessionId: string): Promise<SimulationState> {
+  const { data } = await client.post<SimulationState>(`/simulation/resume/${sessionId}`);
   return data;
 }
 
@@ -89,6 +114,11 @@ export async function getTrackerSnapshot(): Promise<TrackerSnapshot> {
 
 export async function setWatchlist(tickers: string[]) {
   const { data } = await client.post<{ watchlist: string[] }>("/tracker/watchlist", { tickers });
+  return data.watchlist;
+}
+
+export async function getWatchlist() {
+  const { data } = await client.get<{ watchlist: string[] }>("/tracker/watchlist");
   return data.watchlist;
 }
 

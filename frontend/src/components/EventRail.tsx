@@ -1,108 +1,140 @@
+import { useEffect, useMemo, useState } from "react";
+import { formatCurrency, formatPercent } from "../lib/format";
 import type { WSMessage } from "../lib/types";
 
-type TabTarget = "research" | "simulation" | "tracker";
-
 interface Props {
-  events: WSMessage[];
   connected: boolean;
-  onNavigate: (target: { tab: TabTarget; ticker?: string; agentId?: string }) => void;
+  simulationEvent?: WSMessage;
+  className?: string;
 }
 
-interface WireCard {
-  key: string;
-  module: string;
-  agentName: string;
-  action: string;
-  description: string;
-  status: string;
-  ticker?: string;
-  agentId?: string;
-  timestamp?: string;
+interface StandingRow {
+  agent: string;
+  equity: number;
+  pnl: number;
+  pnlPercent: number;
 }
 
-function extractTicker(event: WSMessage): string | undefined {
-  const details = (event.details ?? {}) as Record<string, unknown>;
-  const direct = details.symbol ?? details.ticker ?? event.symbol;
-  if (typeof direct === "string" && direct.trim()) return direct.trim().toUpperCase();
-
-  const action = typeof event.action === "string" ? event.action : "";
-  const match = action.toUpperCase().match(/\b[A-Z]{1,5}\b/);
-  return match?.[0];
-}
-
-function toCards(events: WSMessage[]): WireCard[] {
-  const items: WireCard[] = [];
-  const seen = new Set<string>();
-
-  for (const event of events) {
-    if (event.type !== "agent_activity") continue;
-    const module = String(event.module ?? "global").toLowerCase();
-    const agentName = String(event.agent_name ?? "Unnamed Agent");
-    const key = `${module}:${agentName}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    const details = (event.details ?? {}) as Record<string, unknown>;
-    items.push({
-      key,
-      module,
-      agentName,
-      action: String(event.action ?? "No action reported"),
-      description: String(details.description ?? "Running background workflow."),
-      status: String(event.status ?? "success"),
-      ticker: extractTicker(event),
-      agentId: typeof details.agent_id === "string" ? details.agent_id : undefined,
-      timestamp: (typeof event.created_at === "string" ? event.created_at : undefined) ?? (typeof event.timestamp === "string" ? event.timestamp : undefined)
-    });
-    if (items.length >= 18) break;
+function toPortfolioSnapshot(raw: unknown): Record<string, { equity?: number }> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, { equity?: number }> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (value && typeof value === "object") {
+      const equity = Number((value as Record<string, unknown>).equity);
+      out[key] = { equity: Number.isFinite(equity) ? equity : undefined };
+    }
   }
-
-  return items;
+  return out;
 }
 
-function routeFor(module: string): TabTarget {
-  if (module === "simulation") return "simulation";
-  if (module === "tracker") return "tracker";
-  return "research";
-}
+export default function EventRail({ connected, simulationEvent, className = "" }: Props) {
+  const [activeSessionId, setActiveSessionId] = useState<string>("");
+  const [ticker, setTicker] = useState<string>("-");
+  const [tick, setTick] = useState<number>(0);
+  const [baselineEquity, setBaselineEquity] = useState<Record<string, number>>({});
+  const [currentEquity, setCurrentEquity] = useState<Record<string, number>>({});
 
-export default function EventRail({ events, connected, onNavigate }: Props) {
-  const cards = toCards(events);
+  useEffect(() => {
+    if (!simulationEvent || simulationEvent.type !== "tick") return;
+
+    const sessionId = typeof simulationEvent.session_id === "string" ? simulationEvent.session_id : "";
+    const eventTicker = typeof simulationEvent.ticker === "string" ? simulationEvent.ticker : "-";
+    const eventTick = Number(simulationEvent.tick ?? 0);
+    const portfolio = toPortfolioSnapshot(simulationEvent.portfolio_snapshot);
+    const current: Record<string, number> = {};
+    for (const [agent, snapshot] of Object.entries(portfolio)) {
+      const equity = Number(snapshot.equity);
+      if (Number.isFinite(equity)) current[agent] = equity;
+    }
+
+    setTicker(eventTicker);
+    setTick(eventTick);
+    setCurrentEquity(current);
+
+    if (sessionId && sessionId !== activeSessionId) {
+      setActiveSessionId(sessionId);
+      setBaselineEquity(current);
+      return;
+    }
+
+    setBaselineEquity((prev) => {
+      const next = { ...prev };
+      for (const [agent, equity] of Object.entries(current)) {
+        if (!(agent in next)) next[agent] = equity;
+      }
+      return next;
+    });
+  }, [simulationEvent, activeSessionId]);
+
+  const standings = useMemo<StandingRow[]>(() => {
+    return Object.entries(currentEquity).map(([agent, equity]) => {
+      const base = baselineEquity[agent] ?? equity;
+      const pnl = equity - base;
+      const pnlPercent = base ? (pnl / base) * 100 : 0;
+      return { agent, equity, pnl, pnlPercent };
+    });
+  }, [currentEquity, baselineEquity]);
+
+  const winners = useMemo(
+    () => [...standings].sort((a, b) => b.pnl - a.pnl).slice(0, 4),
+    [standings]
+  );
+  const losers = useMemo(
+    () => [...standings].sort((a, b) => a.pnl - b.pnl).slice(0, 4),
+    [standings]
+  );
 
   return (
-    <aside className="event-rail glass-card">
+    <aside className={`event-rail glass-card ${className}`.trim()}>
       <div className="panel-header">
-        <h3>Live Wire</h3>
+        <h3>Market Board</h3>
         <span className={connected ? "dot dot-live" : "dot dot-offline"}>
           {connected ? "Socket Live" : "Socket Offline"}
         </span>
       </div>
-      <div className="event-list">
-        {cards.length === 0 ? <p className="muted">Waiting for agent activity…</p> : null}
-        {cards.map((card) => (
-          <button
-            type="button"
-            key={card.key}
-            className="event-item event-item-button"
-            onClick={() => onNavigate({ tab: routeFor(card.module), ticker: card.ticker, agentId: card.agentId })}
-            title="Open related module"
-          >
-            <div className="event-meta">
-              <strong>{card.agentName}</strong>
-              <span>{card.module}</span>
-            </div>
-            <p className="event-action">{card.action}</p>
-            <p className="event-desc">{card.description}</p>
-            <div className="event-meta event-meta-bottom">
-              <span className={`pill ${card.status === "success" ? "bullish" : card.status === "running" ? "neutral" : "bearish"}`}>
-                {card.status}
-              </span>
-              {card.ticker ? <span className="muted">{card.ticker}</span> : null}
-            </div>
-            {card.timestamp ? <time>{new Date(card.timestamp).toLocaleTimeString()}</time> : null}
-          </button>
-        ))}
+
+      <div className="board-meta">
+        <span>{ticker} roundtable</span>
+        <span>Tick {tick}</span>
       </div>
+
+      {standings.length === 0 ? <p className="muted">Run a simulation to view top winners and losers.</p> : null}
+
+      <section className="market-board-section">
+        <h4>Top Winners</h4>
+        <div className="board-list">
+          {winners.map((row) => (
+            <article key={`winner-${row.agent}`} className="board-item">
+              <div>
+                <p className="board-agent">{row.agent}</p>
+                <p className="board-equity">{formatCurrency(row.equity)}</p>
+              </div>
+              <div className="board-pnl positive">
+                <strong>{formatCurrency(row.pnl)}</strong>
+                <span>{formatPercent(row.pnlPercent)}</span>
+              </div>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section className="market-board-section">
+        <h4>Top Losers</h4>
+        <div className="board-list">
+          {losers.map((row) => (
+            <article key={`loser-${row.agent}`} className="board-item">
+              <div>
+                <p className="board-agent">{row.agent}</p>
+                <p className="board-equity">{formatCurrency(row.equity)}</p>
+              </div>
+              <div className={`board-pnl ${row.pnl < 0 ? "negative" : "positive"}`}>
+                <strong>{formatCurrency(row.pnl)}</strong>
+                <span>{formatPercent(row.pnlPercent)}</span>
+              </div>
+            </article>
+          ))}
+        </div>
+      </section>
     </aside>
   );
 }
