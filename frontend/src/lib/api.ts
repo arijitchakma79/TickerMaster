@@ -7,6 +7,7 @@ import type {
   ResearchResponse,
   TrackerAgent,
   TrackerAgentDetail,
+  TrackerAgentInteractResponse,
   SimulationState,
   TrackerSnapshot
 } from "./types";
@@ -141,5 +142,21 @@ export async function deleteTrackerAgent(agentId: string): Promise<{ ok: boolean
 
 export async function getTrackerAgentDetail(agentId: string): Promise<TrackerAgentDetail> {
   const { data } = await client.get<TrackerAgentDetail>(`/api/tracker/agents/${agentId}/detail`);
+  return data;
+}
+
+export async function createTrackerAgentByPrompt(prompt: string, userId?: string) {
+  const { data } = await client.post<{ ok: boolean; agent: TrackerAgent; parsed: Record<string, unknown> }>(
+    "/api/tracker/agents/nl-create",
+    { prompt, user_id: userId }
+  );
+  return data;
+}
+
+export async function interactWithTrackerAgent(agentId: string, message: string, userId?: string): Promise<TrackerAgentInteractResponse> {
+  const { data } = await client.post<TrackerAgentInteractResponse>(`/api/tracker/agents/${agentId}/interact`, {
+    message,
+    user_id: userId
+  });
   return data;
 }

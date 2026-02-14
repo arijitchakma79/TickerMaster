@@ -1,16 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   addAlert,
+  createTrackerAgentByPrompt,
   createTrackerAgent,
   deleteTrackerAgent,
+  fetchCandles,
   getTrackerAgentDetail,
+  interactWithTrackerAgent,
   getTrackerSnapshot,
   listTrackerAgents,
   setWatchlist,
   triggerTrackerPoll
 } from "../lib/api";
 import { formatCompactNumber, formatCurrency, formatPercent } from "../lib/format";
-import type { TrackerAgent, TrackerAgentDetail, TrackerSnapshot, WSMessage } from "../lib/types";
+import type { CandlePoint, TrackerAgent, TrackerAgentDetail, TrackerSnapshot, WSMessage } from "../lib/types";
+import StockChart from "./StockChart";
 
 interface Props {
   activeTicker: string;
@@ -24,6 +28,7 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
   const [newSymbol, setNewSymbol] = useState("");
   const [snapshot, setSnapshot] = useState<TrackerSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
+  const [nlPrompt, setNlPrompt] = useState("");
   const [alertTicker, setAlertTicker] = useState(activeTicker);
   const [threshold, setThreshold] = useState(2);
   const [direction, setDirection] = useState<"up" | "down" | "either">("either");
@@ -31,6 +36,11 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
   const [agents, setAgents] = useState<TrackerAgent[]>([]);
   const [selectedAgent, setSelectedAgent] = useState<TrackerAgentDetail | null>(null);
   const [agentLoading, setAgentLoading] = useState(false);
+  const [agentMessage, setAgentMessage] = useState("");
+  const [agentChat, setAgentChat] = useState<Array<{ role: "manager" | "agent"; text: string; at: string }>>([]);
+  const [agentChart, setAgentChart] = useState<{ period: string; interval: string; points: CandlePoint[] } | null>(null);
+  const [agentResearch, setAgentResearch] = useState<Record<string, unknown> | null>(null);
+  const [agentSimulation, setAgentSimulation] = useState<{ session_id: string; ticker: string } | null>(null);
 
   useEffect(() => {
     getTrackerSnapshot().then(setSnapshot).catch(() => null);
@@ -57,6 +67,16 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
       .catch(() => null)
       .finally(() => setAgentLoading(false));
   }, [focusAgent?.agentId, focusAgent?.requestedAt, onTickerChange]);
+
+  useEffect(() => {
+    if (!selectedAgent) return;
+    const timer = window.setInterval(() => {
+      getTrackerAgentDetail(selectedAgent.agent.id)
+        .then((detail) => setSelectedAgent(detail))
+        .catch(() => null);
+    }, 7000);
+    return () => window.clearInterval(timer);
+  }, [selectedAgent?.agent.id]);
 
   const sorted = useMemo(
     () => [...(snapshot?.tickers ?? [])].sort((a, b) => Math.abs(b.change_percent) - Math.abs(a.change_percent)),
@@ -151,6 +171,12 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
     try {
       const detail = await getTrackerAgentDetail(agent.id);
       setSelectedAgent(detail);
+      setAgentChat([]);
+      setAgentMessage("");
+      setAgentResearch(null);
+      setAgentSimulation(null);
+      const points = await fetchCandles(agent.symbol, "6mo", "1d");
+      setAgentChart({ period: "6mo", interval: "1d", points });
       onTickerChange(agent.symbol);
     } finally {
       setAgentLoading(false);
@@ -166,6 +192,38 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
       if (selectedAgent?.agent.id === agent.id) setSelectedAgent(null);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleDeployByPrompt() {
+    if (!nlPrompt.trim()) return;
+    setLoading(true);
+    try {
+      await createTrackerAgentByPrompt(nlPrompt.trim());
+      const refreshed = await listTrackerAgents();
+      setAgents(refreshed);
+      setNlPrompt("");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleAskAgent() {
+    if (!selectedAgent || !agentMessage.trim()) return;
+    const managerMessage = agentMessage.trim();
+    setAgentLoading(true);
+    try {
+      setAgentChat((prev) => [...prev, { role: "manager", text: managerMessage, at: new Date().toISOString() }]);
+      const response = await interactWithTrackerAgent(selectedAgent.agent.id, managerMessage);
+      setAgentChat((prev) => [...prev, { role: "agent", text: response.reply?.response ?? "", at: new Date().toISOString() }]);
+      if (response.tool_outputs?.chart) setAgentChart(response.tool_outputs.chart);
+      if (response.tool_outputs?.research) setAgentResearch(response.tool_outputs.research);
+      if (response.tool_outputs?.simulation) setAgentSimulation(response.tool_outputs.simulation);
+      setAgentMessage("");
+      const detail = await getTrackerAgentDetail(selectedAgent.agent.id);
+      setSelectedAgent(detail);
+    } finally {
+      setAgentLoading(false);
     }
   }
 
@@ -203,6 +261,20 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
         </button>
         <button className="secondary" onClick={handlePoll} disabled={loading}>
           {loading ? "Polling…" : "Poll Now"}
+        </button>
+      </div>
+
+      <div className="glass-card card-row tracker-actions">
+        <label style={{ minWidth: 340, flex: 1 }}>
+          Manager Instruction (Natural Language)
+          <input
+            value={nlPrompt}
+            onChange={(event) => setNlPrompt(event.target.value)}
+            placeholder="e.g. Track NVDA, alert if social sentiment turns very bearish or price drops 3%"
+          />
+        </label>
+        <button className="secondary" onClick={handleDeployByPrompt} disabled={loading || !nlPrompt.trim()}>
+          {loading ? "Parsing…" : "Deploy from Prompt"}
         </button>
       </div>
 
@@ -399,6 +471,67 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
                   </article>
                 ))}
                 {(selectedAgent.recent_alerts ?? []).length === 0 ? <p className="muted">No alerts yet.</p> : null}
+              </div>
+            </div>
+            <div className="glass-card" style={{ marginTop: "0.75rem" }}>
+              <div className="panel-header">
+                <h4>Agent Market Workspace</h4>
+                <span className="muted">
+                  {agentChart ? `${agentChart.period} / ${agentChart.interval}` : "Loading chart"}
+                </span>
+              </div>
+              {agentChart ? <StockChart points={agentChart.points} mode="candles" showSma showEma /> : <p className="muted">No chart yet.</p>}
+            </div>
+            <div className="glass-card" style={{ marginTop: "0.75rem" }}>
+              <h4>Ask This Agent</h4>
+              <div className="card-row">
+                <label style={{ minWidth: 320, flex: 1 }}>
+                  Message
+                  <textarea
+                    value={agentMessage}
+                    onChange={(event) => setAgentMessage(event.target.value)}
+                    rows={3}
+                    placeholder="What are you seeing in NVDA sentiment right now, and what changed since last poll?"
+                  />
+                </label>
+                <button onClick={() => void handleAskAgent()} disabled={agentLoading || !agentMessage.trim()}>
+                  {agentLoading ? "Thinking…" : "Ask Agent"}
+                </button>
+              </div>
+              <div className="stack small-gap" style={{ marginTop: "0.5rem", maxHeight: 240, overflowY: "auto" }}>
+                {agentChat.map((entry, idx) => (
+                  <article key={`agent-chat-${idx}`} className="alert-item">
+                    <strong>{entry.role === "manager" ? "Manager" : "Agent"}</strong>
+                    <p>{entry.text}</p>
+                    <p className="muted">{new Date(entry.at).toLocaleTimeString()}</p>
+                  </article>
+                ))}
+                {agentChat.length === 0 ? <p className="muted">Start a conversation. Ask for chart, research, or simulation.</p> : null}
+              </div>
+            </div>
+            {agentResearch ? (
+              <div className="glass-card" style={{ marginTop: "0.75rem" }}>
+                <h4>Tool Output: Research Snapshot</h4>
+                <pre>{JSON.stringify(agentResearch, null, 2)}</pre>
+              </div>
+            ) : null}
+            {agentSimulation ? (
+              <div className="glass-card" style={{ marginTop: "0.75rem" }}>
+                <h4>Tool Output: Simulation</h4>
+                <p>Session: <code>{agentSimulation.session_id}</code></p>
+                <p>Ticker: {agentSimulation.ticker}</p>
+              </div>
+            ) : null}
+            <div className="glass-card" style={{ marginTop: "0.75rem" }}>
+              <h4>Autonomous Activity Log</h4>
+              <div className="stack small-gap" style={{ maxHeight: 220, overflowY: "auto" }}>
+                {(selectedAgent.recent_actions ?? []).slice(0, 20).map((action, idx) => (
+                  <article key={`auto-log-${idx}`} className="alert-item">
+                    <strong>{String(action.agent_name ?? "Agent")}</strong>
+                    <p>{String(action.action ?? "-")}</p>
+                    <p className="muted">{String(action.created_at ?? "")}</p>
+                  </article>
+                ))}
               </div>
             </div>
           </div>

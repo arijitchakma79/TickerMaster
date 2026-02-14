@@ -112,6 +112,20 @@ export interface TrackerAgentDetail {
   recent_actions: Array<Record<string, unknown>>;
 }
 
+export interface TrackerAgentInteractResponse {
+  ok: boolean;
+  agent: TrackerAgent;
+  reply: { response: string; model: string; generated_at: string };
+  parsed_intent: Record<string, unknown>;
+  market_state: Record<string, unknown>;
+  research_state: Record<string, unknown>;
+  tool_outputs?: {
+    chart?: { period: string; interval: string; points: CandlePoint[] };
+    research?: Record<string, unknown>;
+    simulation?: { session_id: string; ticker: string };
+  };
+}
+
 export interface AgentConfig {
   name: string;
   personality: "quant_momentum" | "fundamental_value" | "retail_reactive";
