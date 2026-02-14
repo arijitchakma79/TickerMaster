@@ -22,6 +22,13 @@ class MarketMetric(BaseModel):
     market_cap: Optional[float] = None
 
 
+class TickerLookup(BaseModel):
+    ticker: str
+    name: str
+    exchange: Optional[str] = None
+    instrument_type: Optional[str] = None
+
+
 class CandlestickPoint(BaseModel):
     timestamp: str
     open: float
@@ -60,6 +67,7 @@ class AgentConfig(BaseModel):
     name: str
     personality: Literal["quant_momentum", "fundamental_value", "retail_reactive"]
     model: str = "meta-llama/llama-3.1-8b-instruct"
+    strategy_prompt: str = Field(default="", max_length=1200)
     aggressiveness: float = Field(0.5, ge=0, le=1)
     risk_limit: float = Field(0.5, ge=0, le=1)
     trade_size: int = Field(10, ge=1, le=1000)
@@ -91,6 +99,7 @@ class SimulationState(BaseModel):
     session_id: str
     ticker: str
     running: bool
+    paused: bool
     tick: int
     current_price: float
     volatility: float

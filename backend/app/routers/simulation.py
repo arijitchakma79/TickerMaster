@@ -29,6 +29,24 @@ async def stop_simulation(session_id: str, request: Request):
     return {"ok": True, "session_id": session_id}
 
 
+@router.post("/pause/{session_id}")
+async def pause_simulation(session_id: str, request: Request):
+    orchestrator = request.app.state.orchestrator
+    state = await orchestrator.pause(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found or not running")
+    return state
+
+
+@router.post("/resume/{session_id}")
+async def resume_simulation(session_id: str, request: Request):
+    orchestrator = request.app.state.orchestrator
+    state = await orchestrator.resume(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found or not running")
+    return state
+
+
 @router.get("/state/{session_id}")
 async def simulation_state(session_id: str, request: Request):
     orchestrator = request.app.state.orchestrator

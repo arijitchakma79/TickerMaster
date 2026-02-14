@@ -44,6 +44,13 @@ export interface MarketMetric {
   market_cap?: number | null;
 }
 
+export interface TickerLookup {
+  ticker: string;
+  name: string;
+  exchange?: string | null;
+  instrument_type?: string | null;
+}
+
 export interface TrackerSnapshot {
   generated_at: string;
   tickers: MarketMetric[];
@@ -54,6 +61,7 @@ export interface AgentConfig {
   name: string;
   personality: "quant_momentum" | "fundamental_value" | "retail_reactive";
   model: string;
+  strategy_prompt?: string;
   aggressiveness: number;
   risk_limit: number;
   trade_size: number;
@@ -76,6 +84,7 @@ export interface SimulationState {
   session_id: string;
   ticker: string;
   running: boolean;
+  paused: boolean;
   tick: number;
   current_price: number;
   volatility: number;

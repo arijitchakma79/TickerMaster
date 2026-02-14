@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import EventRail from "./components/EventRail";
-import IntegrationStatus from "./components/IntegrationStatus";
+import ResearchRail from "./components/ResearchRail";
 import ResearchPanel from "./components/ResearchPanel";
 import SimulationPanel from "./components/SimulationPanel";
+import TrackerPrefsRail from "./components/TrackerPrefsRail";
 import TrackerPanel from "./components/TrackerPanel";
-import { fetchIntegrations, getApiUrl } from "./lib/api";
+import { getApiUrl, getWatchlist, setWatchlist as setTrackerWatchlist } from "./lib/api";
 import { useSocket } from "./hooks/useSocket";
 import brandLogo from "./images/TickerMaster.png";
 import moonIcon from "./images/moon.png";
@@ -12,28 +12,51 @@ import sunIcon from "./images/sun.png";
 
 type Tab = "research" | "simulation" | "tracker";
 type Theme = "light" | "dark";
+const DEFAULT_WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"];
 
 function tabFromQuery(): Tab {
   const params = new URLSearchParams(window.location.search);
   const value = params.get("tab");
-  if (value === "simulation" || value === "tracker") return value;
-  return "research";
+  if (value === "research" || value === "simulation" || value === "tracker") return value;
+  return "simulation";
+}
+
+function tickerFromQuery() {
+  return (new URLSearchParams(window.location.search).get("ticker") ?? "AAPL").toUpperCase();
+}
+
+function normalizeWatchlist(tickers: string[]) {
+  const cleaned = tickers
+    .map((symbol) => symbol.trim().toUpperCase())
+    .filter(Boolean);
+  return Array.from(new Set(cleaned));
 }
 
 export default function App() {
   const [tab, setTab] = useState<Tab>(tabFromQuery());
-  const [ticker, setTicker] = useState((new URLSearchParams(window.location.search).get("ticker") ?? "AAPL").toUpperCase());
-  const [integrations, setIntegrations] = useState<Record<string, boolean>>({});
+  const [ticker, setTicker] = useState(tickerFromQuery());
+  const [watchlist, setWatchlist] = useState<string[]>(() =>
+    normalizeWatchlist([tickerFromQuery(), ...DEFAULT_WATCHLIST])
+  );
   const [theme, setTheme] = useState<Theme>(() => {
     const stored = window.localStorage.getItem("tickermaster-theme");
     if (stored === "light" || stored === "dark") return stored;
     return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   });
 
-  const { connected, events, lastSimulationTick, lastSimulationLifecycle, lastTrackerSnapshot } = useSocket();
+  const { connected, lastSimulationTick, lastSimulationLifecycle, lastTrackerSnapshot } = useSocket();
 
   useEffect(() => {
-    fetchIntegrations().then(setIntegrations).catch(() => setIntegrations({}));
+    getWatchlist()
+      .then((serverWatchlist) => {
+        const synced = normalizeWatchlist(serverWatchlist);
+        if (synced.length === 0) return;
+        setWatchlist(synced);
+        if (!synced.includes(ticker)) {
+          setTicker(synced[0]);
+        }
+      })
+      .catch(() => null);
   }, []);
 
   useEffect(() => {
@@ -47,6 +70,27 @@ export default function App() {
     if (tab === "simulation") return "Simulation Arena";
     return "Ticker Tracker";
   }, [tab]);
+
+  async function handleWatchlistChange(nextSymbols: string[]) {
+    const normalized = normalizeWatchlist(nextSymbols);
+    if (normalized.length === 0) return watchlist;
+
+    try {
+      const serverUpdated = normalizeWatchlist(await setTrackerWatchlist(normalized));
+      const nextList = serverUpdated.length > 0 ? serverUpdated : normalized;
+      setWatchlist(nextList);
+      if (!nextList.includes(ticker)) {
+        setTicker(nextList[0]);
+      }
+      return nextList;
+    } catch {
+      setWatchlist(normalized);
+      if (!normalized.includes(ticker)) {
+        setTicker(normalized[0]);
+      }
+      return normalized;
+    }
+  }
 
   return (
     <div className="app-shell">
@@ -89,49 +133,77 @@ export default function App() {
         </div>
       </header>
 
-      <IntegrationStatus integrations={integrations} />
-
       <nav className="tab-row">
         <button
           className={tab === "research" ? "tab active" : "tab"}
           onClick={() => setTab("research")}
           aria-current={tab === "research" ? "page" : undefined}
         >
-          Research
+          <span className="tab-inner">
+            <span className="tab-icon" aria-hidden="true">
+              🔎
+            </span>
+            <span>Research</span>
+          </span>
         </button>
         <button
-          className={tab === "simulation" ? "tab active" : "tab"}
+          className={tab === "simulation" ? "tab active core" : "tab core"}
           onClick={() => setTab("simulation")}
           aria-current={tab === "simulation" ? "page" : undefined}
         >
-          Simulation
+          <span className="tab-inner">
+            <span className="tab-icon arena" aria-hidden="true">
+              🛡️⚔️
+            </span>
+            <span>Simulation</span>
+          </span>
         </button>
         <button
           className={tab === "tracker" ? "tab active" : "tab"}
           onClick={() => setTab("tracker")}
           aria-current={tab === "tracker" ? "page" : undefined}
         >
-          Tracker
+          <span className="tab-inner">
+            <span className="tab-icon" aria-hidden="true">
+              📊
+            </span>
+            <span>Tracker</span>
+          </span>
         </button>
       </nav>
 
-      <main className="layout-grid">
+      <main className={tab === "simulation" ? "layout-grid layout-grid-single" : "layout-grid"}>
         <div>
           {tab === "research" ? <ResearchPanel activeTicker={ticker} onTickerChange={setTicker} /> : null}
           {tab === "simulation" ? (
             <SimulationPanel
               activeTicker={ticker}
               onTickerChange={setTicker}
+              connected={connected}
               simulationEvent={lastSimulationTick}
               simulationLifecycleEvent={lastSimulationLifecycle}
             />
           ) : null}
           {tab === "tracker" ? (
-            <TrackerPanel activeTicker={ticker} onTickerChange={setTicker} trackerEvent={lastTrackerSnapshot} />
+            <TrackerPanel
+              activeTicker={ticker}
+              onTickerChange={setTicker}
+              trackerEvent={lastTrackerSnapshot}
+              watchlist={watchlist}
+              onWatchlistChange={handleWatchlistChange}
+            />
           ) : null}
         </div>
 
-        <EventRail events={events} connected={connected} />
+        {tab === "research" ? (
+          <ResearchRail
+            connected={connected}
+            activeTicker={ticker}
+            onTickerSelect={setTicker}
+            trackerEvent={lastTrackerSnapshot}
+          />
+        ) : null}
+        {tab === "tracker" ? <TrackerPrefsRail connected={connected} /> : null}
       </main>
     </div>
   );
