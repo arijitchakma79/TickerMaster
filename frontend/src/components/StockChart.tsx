@@ -21,6 +21,23 @@ function toTs(value: string): UTCTimestamp {
   return Math.floor(new Date(value).getTime() / 1000) as UTCTimestamp;
 }
 
+function normalizePoints(points: CandlePoint[]): CandlePoint[] {
+  const sorted = [...points].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  const out: CandlePoint[] = [];
+  let lastTs = -1;
+  for (const point of sorted) {
+    const ts = new Date(point.timestamp).getTime();
+    if (!Number.isFinite(ts)) continue;
+    const safeTs = ts <= lastTs ? lastTs + 1000 : ts;
+    lastTs = safeTs;
+    out.push({
+      ...point,
+      timestamp: new Date(safeTs).toISOString(),
+    });
+  }
+  return out;
+}
+
 function sma(points: CandlePoint[], period: number): LineData<UTCTimestamp>[] {
   const out: LineData<UTCTimestamp>[] = [];
   for (let i = period - 1; i < points.length; i += 1) {
@@ -47,26 +64,27 @@ function ema(points: CandlePoint[], period: number): LineData<UTCTimestamp>[] {
 
 export default function StockChart({ points, mode, showSma, showEma }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const safePoints = useMemo(() => normalizePoints(points), [points]);
   const candles = useMemo(
     () =>
-      points.map((point) => ({
+      safePoints.map((point) => ({
         time: toTs(point.timestamp),
         open: point.open,
         high: point.high,
         low: point.low,
         close: point.close,
       })),
-    [points]
+    [safePoints]
   );
 
   const volume = useMemo(
     () =>
-      points.map((point) => ({
+      safePoints.map((point) => ({
         time: toTs(point.timestamp),
         value: point.volume,
         color: point.close >= point.open ? "rgba(16, 163, 127, 0.55)" : "rgba(212, 63, 76, 0.55)",
       })),
-    [points]
+    [safePoints]
   );
 
   useEffect(() => {
@@ -125,16 +143,16 @@ export default function StockChart({ points, mode, showSma, showEma }: Props) {
 
     if (showSma) {
       const smaSeries = chart.addSeries(LineSeries, { color: "#63a8ff", lineWidth: 1 });
-      smaSeries.setData(sma(points, 20));
+      smaSeries.setData(sma(safePoints, 20));
     }
     if (showEma) {
       const emaSeries = chart.addSeries(LineSeries, { color: "#e5a24b", lineWidth: 1 });
-      emaSeries.setData(ema(points, 21));
+      emaSeries.setData(ema(safePoints, 21));
     }
 
     chart.timeScale().fitContent();
     return () => chart.remove();
-  }, [candles, mode, points, showEma, showSma, volume]);
+  }, [candles, mode, safePoints, showEma, showSma, volume]);
 
   return <div ref={containerRef} className="advanced-chart" />;
 }

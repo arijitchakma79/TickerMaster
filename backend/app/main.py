@@ -8,7 +8,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import chat, research, simulation, system, tracker
+from app.routers import api, chat, research, simulation, system, tracker
+from app.services.activity_stream import set_ws_manager
 from app.services.simulation import SimulationOrchestrator
 from app.services.tracker import TrackerService
 from app.ws_manager import WSManager
@@ -25,6 +26,7 @@ async def lifespan(app: FastAPI):
     app.state.ws_manager = ws_manager
     app.state.orchestrator = orchestrator
     app.state.tracker = tracker_service
+    set_ws_manager(ws_manager)
 
     await tracker_service.start()
 
@@ -46,6 +48,7 @@ app.add_middleware(
 )
 
 app.include_router(system.router)
+app.include_router(api.router)
 app.include_router(research.router)
 app.include_router(simulation.router)
 app.include_router(tracker.router)

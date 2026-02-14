@@ -35,29 +35,70 @@ TickerMaster/
   .gitignore
 ```
 
-## Quick Start
+## Step-by-Step Startup
 
-### 1) Configure environment
-Copy `.env.example` to `.env` in the project root or into `backend/.env` and set keys.
+### 1) Create `.env` in repo root
+Create `/TickerMaster/.env` and include at minimum:
 
-### 2) Run backend
+```env
+# Supabase
+SUPABASE_URL=https://<your-project>.supabase.co
+SUPABASE_KEY=<your-publishable-key>
+SUPABASE_SERVICE_KEY=<your-secret-service-role-key>
+DATABASE_URL=postgresql://postgres:<password>@db.<project>.supabase.co:5432/postgres
+
+# Backend URL
+BACKEND_URL=http://localhost:8000
+```
+
+Add your API keys for Perplexity / OpenAI / OpenRouter / X / Browserbase / Modal as needed.
+
+### 2) Apply database schema in Supabase
+In Supabase Dashboard:
+1. Open `SQL Editor`.
+2. Paste contents of `supabase/schema.sql`.
+3. Run it once.
+
+This creates tables like `research_cache`, `agent_activity`, `simulations`, `tracker_agents`, and `tracker_alerts`.
+
+### 3) Start backend (Terminal A)
 ```bash
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 3) Run frontend
+Backend URL: `http://localhost:8000`
+
+### 4) Start frontend (Terminal B)
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-Frontend: `http://localhost:5173`  
-Backend: `http://localhost:8000`
+Frontend URL: `http://localhost:5173`
+
+### 5) Verify backend is healthy
+```bash
+curl http://localhost:8000/api/health
+curl http://localhost:8000/api/ticker/NVDA/quote
+curl http://localhost:8000/api/ticker/NVDA/ai-research
+curl http://localhost:8000/api/ticker/NVDA/sentiment
+curl "http://localhost:8000/api/prediction-markets?query=fed"
+curl http://localhost:8000/api/ticker/NVDA/x-sentiment
+```
+
+### 6) Optional: verify Supabase writes
+Use Supabase SQL Editor or REST to confirm rows are being inserted into:
+- `research_cache`
+- `agent_activity`
+- `simulations`
+- `tracker_alerts`
+
+If cache writes appear but activity/alerts do not, confirm backend is using `SUPABASE_SERVICE_KEY` (not only publishable key).
 
 ## API Highlights
 - `POST /research/analyze`

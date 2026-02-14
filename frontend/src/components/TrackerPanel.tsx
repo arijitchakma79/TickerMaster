@@ -23,6 +23,12 @@ interface Props {
   focusAgent?: { agentId: string; requestedAt: number } | null;
 }
 
+function isTrackerAgentDetail(value: unknown): value is TrackerAgentDetail {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  return Boolean(item.agent && typeof item.agent === "object");
+}
+
 export default function TrackerPanel({ activeTicker, onTickerChange, trackerEvent, focusAgent }: Props) {
   const [watchlistInput, setWatchlistInput] = useState("AAPL,MSFT,NVDA,TSLA,SPY");
   const [newSymbol, setNewSymbol] = useState("");
@@ -61,6 +67,7 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
     setAgentLoading(true);
     getTrackerAgentDetail(focusAgent.agentId)
       .then((detail) => {
+        if (!isTrackerAgentDetail(detail)) return;
         setSelectedAgent(detail);
         onTickerChange(detail.agent.symbol);
       })
@@ -72,7 +79,10 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
     if (!selectedAgent) return;
     const timer = window.setInterval(() => {
       getTrackerAgentDetail(selectedAgent.agent.id)
-        .then((detail) => setSelectedAgent(detail))
+        .then((detail) => {
+          if (!isTrackerAgentDetail(detail)) return;
+          setSelectedAgent(detail);
+        })
         .catch(() => null);
     }, 7000);
     return () => window.clearInterval(timer);
@@ -170,6 +180,7 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
     setAgentLoading(true);
     try {
       const detail = await getTrackerAgentDetail(agent.id);
+      if (!isTrackerAgentDetail(detail)) return;
       setSelectedAgent(detail);
       setAgentChat([]);
       setAgentMessage("");
@@ -221,7 +232,7 @@ export default function TrackerPanel({ activeTicker, onTickerChange, trackerEven
       if (response.tool_outputs?.simulation) setAgentSimulation(response.tool_outputs.simulation);
       setAgentMessage("");
       const detail = await getTrackerAgentDetail(selectedAgent.agent.id);
-      setSelectedAgent(detail);
+      if (isTrackerAgentDetail(detail)) setSelectedAgent(detail);
     } finally {
       setAgentLoading(false);
     }

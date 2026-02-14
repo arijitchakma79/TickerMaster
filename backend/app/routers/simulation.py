@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from app.schemas import SimulationStartRequest
 from app.services.modal_integration import modal_cron_health, spin_modal_sandbox
+from app.services.user_context import get_user_id_from_request
 
 router = APIRouter(prefix="/simulation", tags=["simulation"])
 
@@ -17,6 +18,8 @@ class SandboxRequest(BaseModel):
 @router.post("/start")
 async def start_simulation(payload: SimulationStartRequest, request: Request):
     orchestrator = request.app.state.orchestrator
+    if not payload.user_id:
+        payload.user_id = get_user_id_from_request(request)
     return await orchestrator.start(payload)
 
 

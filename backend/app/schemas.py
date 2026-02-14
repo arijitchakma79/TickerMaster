@@ -68,6 +68,7 @@ class AgentConfig(BaseModel):
 
 class SimulationStartRequest(BaseModel):
     ticker: str = "AAPL"
+    user_id: Optional[str] = None
     duration_seconds: int = Field(180, ge=30, le=3600)
     initial_price: float = Field(185.0, gt=0)
     starting_cash: float = Field(100_000, gt=0)

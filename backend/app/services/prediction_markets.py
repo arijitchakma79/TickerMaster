@@ -8,30 +8,42 @@ from app.config import Settings
 
 
 async def fetch_kalshi_markets(ticker: str, settings: Settings) -> List[Dict[str, Any]]:
-    if not settings.kalshi_api_key:
-        return [
-            {
-                "source": "Kalshi",
-                "market": f"Will {ticker.upper()} close higher this week?",
-                "yes_price": 0.57,
-                "no_price": 0.43,
-                "link": "https://kalshi.com/markets",
-                "note": "Demo value because KALSHI_API_KEY is not set.",
-            }
-        ]
-
-    headers = {
-        "Authorization": f"Bearer {settings.kalshi_api_key}",
-        "Content-Type": "application/json",
-    }
-    params = {"search": ticker.upper(), "limit": 5}
+    headers = {"Content-Type": "application/json"}
+    params = {"limit": 20, "status": "open"}
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get("https://trading-api.kalshi.com/trade-api/v2/markets", headers=headers, params=params)
+            # Kalshi migrated reads to api.elections.kalshi.com
+            resp = await client.get("https://api.elections.kalshi.com/trade-api/v2/markets", headers=headers, params=params)
             resp.raise_for_status()
             payload = resp.json()
             items = payload.get("markets", [])
+            filtered = []
+            query = ticker.upper()
+            finance_keywords = [
+                "FED",
+                "RATE",
+                "INFLATION",
+                "RECESSION",
+                "GDP",
+                "UNEMPLOYMENT",
+                "NASDAQ",
+                "S&P",
+                "TREASURY",
+                "CPI",
+                "STOCK",
+            ]
+            for item in items:
+                title = str(item.get("title", ""))
+                upper_title = title.upper()
+                if (
+                    query in upper_title
+                    or query in str(item.get("ticker", "")).upper()
+                    or any(keyword in upper_title for keyword in finance_keywords)
+                ):
+                    filtered.append(item)
+            if not filtered:
+                return []
             return [
                 {
                     "source": "Kalshi",
@@ -40,7 +52,7 @@ async def fetch_kalshi_markets(ticker: str, settings: Settings) -> List[Dict[str
                     "no_price": item.get("no_bid") or item.get("no_ask"),
                     "link": f"https://kalshi.com/markets/{item.get('ticker', '')}",
                 }
-                for item in items[:5]
+                for item in filtered[:5]
             ]
     except Exception as exc:
         return [
@@ -55,18 +67,35 @@ async def fetch_kalshi_markets(ticker: str, settings: Settings) -> List[Dict[str
 
 async def fetch_polymarket_markets(ticker: str, settings: Settings) -> List[Dict[str, Any]]:
     headers = {}
-    if settings.polymarket_api_key:
-        headers["Authorization"] = f"Bearer {settings.polymarket_api_key}"
-
-    params = {"limit": 8, "closed": "false", "search": ticker.upper()}
+    params = {"limit": 20, "closed": "false", "search": ticker.upper()}
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get("https://gamma-api.polymarket.com/markets", headers=headers, params=params)
+            resp = await client.get(f"{settings.polymarket_gamma_url.rstrip('/')}/markets", headers=headers, params=params)
             resp.raise_for_status()
             payload = resp.json()
             results = payload if isinstance(payload, list) else payload.get("data", [])
             if not results:
                 raise ValueError("No matching Polymarket contracts")
+            finance_keywords = [
+                "fed",
+                "rate",
+                "inflation",
+                "recession",
+                "gdp",
+                "s&p",
+                "nasdaq",
+                "bitcoin",
+                "treasury",
+                "unemployment",
+                "stock",
+            ]
+            filtered = []
+            for item in results:
+                question = str(item.get("question", "")).lower()
+                if ticker.lower() in question or any(keyword in question for keyword in finance_keywords):
+                    filtered.append(item)
+            if not filtered:
+                return []
             return [
                 {
                     "source": "Polymarket",
@@ -75,7 +104,7 @@ async def fetch_polymarket_markets(ticker: str, settings: Settings) -> List[Dict
                     "volume": item.get("volumeNum") or item.get("volume"),
                     "link": f"https://polymarket.com/event/{item.get('slug', '')}",
                 }
-                for item in results[:5]
+                for item in filtered[:5]
             ]
     except Exception as exc:
         return [

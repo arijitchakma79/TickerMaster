@@ -6,3 +6,8 @@ numpy==2.2.3
 pandas==2.2.3
 yfinance==0.2.54
 python-dotenv==1.0.1
+supabase==2.15.0
+praw==7.8.1
+nltk==3.9.1
+fredapi==0.5.2
+requests-oauthlib==2.0.0
