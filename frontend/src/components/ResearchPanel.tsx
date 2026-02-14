@@ -164,6 +164,50 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
   }, [tickerInput]);
 
   useEffect(() => {
+    const normalized = activeTicker.trim().toUpperCase();
+    if (!normalized) return;
+    setTickerInput((prev) => (prev === normalized ? prev : normalized));
+  }, [activeTicker]);
+
+  useEffect(() => {
+    const ticker = activeTicker.trim().toUpperCase();
+    if (!ticker) return;
+    let active = true;
+
+    void fetchCandles(ticker, chartPeriod, chartInterval)
+      .then((chartPoints) => {
+        if (!active) return;
+        setCandles(chartPoints);
+      })
+      .catch(() => {
+        if (!active) return;
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [activeTicker, chartPeriod, chartInterval]);
+
+  useEffect(() => {
+    const ticker = activeTicker.trim().toUpperCase();
+    if (!ticker) return;
+    let active = true;
+
+    void fetchAdvancedStockData(ticker)
+      .then((snapshot) => {
+        if (!active) return;
+        setAdvanced(snapshot);
+      })
+      .catch(() => {
+        if (!active) return;
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [activeTicker]);
+
+  useEffect(() => {
     let active = true;
 
     const loadActivity = async () => {
@@ -254,7 +298,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                 void handleAnalyze(topSuggestion ?? tickerInput);
               }}
               maxLength={48}
-              placeholder="Ticker or company name"
+              placeholder={`Ticker or company name (${activeTicker.toUpperCase()})`}
             />
             {tickerInputFocused && tickerInput.trim() ? (
               <div className="ticker-suggestions" role="listbox" aria-label="Ticker suggestions">

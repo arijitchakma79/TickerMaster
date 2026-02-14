@@ -84,6 +84,8 @@ class Settings:
 
     finnhub_api_key: str = ""
     finnhub_api_url: str = "https://finnhub.io/api/v1"
+    twelvedata_api_key: str = ""
+    twelvedata_api_url: str = "https://api.twelvedata.com"
 
     openai_api_key: str = ""
     openrouter_api_key: str = ""
@@ -148,6 +150,8 @@ def get_settings() -> Settings:
         alpaca_data_feed=_env("ALPACA_DATA_FEED", "iex"),
         finnhub_api_key=_env("FINNHUB_API_KEY"),
         finnhub_api_url=_env("FINNHUB_API_URL", "https://finnhub.io/api/v1"),
+        twelvedata_api_key=_env("TWELVEDATA_API_KEY"),
+        twelvedata_api_url=_env("TWELVEDATA_API_URL", "https://api.twelvedata.com"),
         openai_api_key=_env("OPENAI_API_KEY"),
         openrouter_api_key=_env("OPENROUTER_API_KEY"),
         openrouter_model=_env("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct"),

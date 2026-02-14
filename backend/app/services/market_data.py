@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
@@ -132,6 +133,25 @@ def _finnhub_resolution(interval: str) -> str:
     return mapping.get(interval, "D")
 
 
+def _twelvedata_interval(interval: str) -> str:
+    mapping = {
+        "1m": "1min",
+        "2m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "30m": "30min",
+        "60m": "1h",
+        "90m": "1h",
+        "1h": "1h",
+        "1d": "1day",
+        "5d": "1day",
+        "1wk": "1week",
+        "1mo": "1month",
+        "3mo": "1month",
+    }
+    return mapping.get(interval, "1day")
+
+
 def _normalize_market_cap(value: Any) -> float | None:
     cap = _safe_float(value)
     if cap is None:
@@ -188,6 +208,49 @@ def _finnhub_get(path: str, params: dict[str, Any] | None = None) -> Any:
             resp.raise_for_status()
             return resp.json()
     except Exception:
+        return None
+
+
+def _twelvedata_get(path: str, params: dict[str, Any] | None = None) -> Any:
+    settings = _settings()
+    query = dict(params or {})
+    query["apikey"] = settings.twelvedata_api_key or "demo"
+    url = f"{settings.twelvedata_api_url.rstrip('/')}{path}"
+
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            resp = client.get(url, params=query)
+            if resp.status_code in {401, 403, 404, 429}:
+                return None
+            resp.raise_for_status()
+            payload = resp.json()
+            if isinstance(payload, dict) and payload.get("status") == "error":
+                return None
+            return payload
+    except Exception:
+        return None
+
+
+def _parse_twelvedata_datetime(raw: Any) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+            return parsed.isoformat()
+        except ValueError:
+            continue
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+    except ValueError:
         return None
 
 
@@ -427,6 +490,170 @@ def _finnhub_candles(symbol: str, period: str = "1mo", interval: str = "1d") -> 
     return out
 
 
+def _twelvedata_candles(symbol: str, period: str = "1mo", interval: str = "1d") -> List[CandlestickPoint]:
+    days = _period_days(period)
+    if interval == "1wk":
+        outputsize = min(5000, max(30, (days // 7) + 24))
+    elif interval in {"1mo", "3mo"}:
+        outputsize = min(5000, max(24, (days // 30) + 24))
+    else:
+        outputsize = min(5000, max(60, days + 30))
+
+    payload = _twelvedata_get(
+        "/time_series",
+        {
+            "symbol": symbol,
+            "interval": _twelvedata_interval(interval),
+            "outputsize": outputsize,
+            "format": "JSON",
+        },
+    )
+    values = payload.get("values") if isinstance(payload, dict) else None
+    if not isinstance(values, list):
+        return []
+
+    out: List[CandlestickPoint] = []
+    # Twelve Data returns newest-first rows.
+    for row in reversed(values):
+        if not isinstance(row, dict):
+            continue
+
+        close = _safe_float(row.get("close"))
+        if close is None:
+            continue
+        open_ = _safe_float(row.get("open")) or close
+        high = _safe_float(row.get("high")) or close
+        low = _safe_float(row.get("low")) or close
+        volume = _safe_float(row.get("volume")) or 0.0
+        timestamp = _parse_twelvedata_datetime(row.get("datetime"))
+        if timestamp is None:
+            continue
+
+        out.append(
+            CandlestickPoint(
+                timestamp=timestamp,
+                open=round(open_, 2),
+                high=round(high, 2),
+                low=round(low, 2),
+                close=round(close, 2),
+                volume=float(volume),
+            )
+        )
+
+    return out
+
+
+def _stooq_symbol(symbol: str) -> str:
+    return f"{symbol.lower()}.us"
+
+
+def _stooq_group_key(ts: datetime, interval: str) -> tuple[int, int]:
+    if interval == "1mo":
+        return ts.year, ts.month
+    year, week, _ = ts.isocalendar()
+    return year, week
+
+
+def _stooq_candles(symbol: str, period: str = "1mo", interval: str = "1d") -> List[CandlestickPoint]:
+    url = f"https://stooq.com/q/d/l/?s={_stooq_symbol(symbol)}&i=d"
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            resp = client.get(url)
+            if resp.status_code >= 400:
+                return []
+            text = resp.text
+    except Exception:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for row in csv.DictReader(text.splitlines()):
+        if not isinstance(row, dict):
+            continue
+        raw_date = str(row.get("Date") or "").strip()
+        try:
+            date_value = datetime.strptime(raw_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        close = _safe_float(row.get("Close"))
+        if close is None:
+            continue
+
+        open_ = _safe_float(row.get("Open")) or close
+        high = _safe_float(row.get("High")) or close
+        low = _safe_float(row.get("Low")) or close
+        volume = _safe_float(row.get("Volume")) or 0.0
+
+        rows.append(
+            {
+                "dt": date_value,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+            }
+        )
+
+    if not rows:
+        return []
+
+    rows.sort(key=lambda item: item["dt"])
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_period_days(period))
+    filtered = [row for row in rows if row["dt"] >= cutoff]
+    if not filtered:
+        filtered = rows[-max(20, min(400, _period_days(period))):]
+
+    if interval == "1d":
+        return [
+            CandlestickPoint(
+                timestamp=row["dt"].isoformat(),
+                open=round(float(row["open"]), 2),
+                high=round(float(row["high"]), 2),
+                low=round(float(row["low"]), 2),
+                close=round(float(row["close"]), 2),
+                volume=float(row["volume"]),
+            )
+            for row in filtered
+        ]
+
+    grouped: list[list[dict[str, Any]]] = []
+    current_bucket: tuple[int, int] | None = None
+    current_rows: list[dict[str, Any]] = []
+
+    for row in filtered:
+        bucket = _stooq_group_key(row["dt"], interval)
+        if current_bucket is None or bucket == current_bucket:
+            current_bucket = bucket
+            current_rows.append(row)
+            continue
+        grouped.append(current_rows)
+        current_bucket = bucket
+        current_rows = [row]
+
+    if current_rows:
+        grouped.append(current_rows)
+
+    out: list[CandlestickPoint] = []
+    for bucket_rows in grouped:
+        first = bucket_rows[0]
+        last = bucket_rows[-1]
+        high = max(float(item["high"]) for item in bucket_rows)
+        low = min(float(item["low"]) for item in bucket_rows)
+        volume = sum(float(item["volume"]) for item in bucket_rows)
+        out.append(
+            CandlestickPoint(
+                timestamp=last["dt"].isoformat(),
+                open=round(float(first["open"]), 2),
+                high=round(high, 2),
+                low=round(low, 2),
+                close=round(float(last["close"]), 2),
+                volume=volume,
+            )
+        )
+    return out
+
+
 def _alpaca_asset_by_symbol(symbol: str) -> dict[str, Any] | None:
     payload = _alpaca_get(f"/v2/assets/{symbol}", trading=True)
     return payload if isinstance(payload, dict) else None
@@ -599,6 +826,18 @@ def fetch_candles(ticker: str, period: str = "1mo", interval: str = "1d") -> Lis
         _LAST_CANDLES_CACHE[cache_key] = finnhub
         return finnhub
 
+    # Backup provider: Twelve Data candles.
+    twelvedata = _twelvedata_candles(symbol, period=period, interval=interval)
+    if twelvedata:
+        _LAST_CANDLES_CACHE[cache_key] = twelvedata
+        return twelvedata
+
+    # Backup provider: Stooq historical bars (daily feed with local aggregation).
+    stooq = _stooq_candles(symbol, period=period, interval=interval)
+    if stooq:
+        _LAST_CANDLES_CACHE[cache_key] = stooq
+        return stooq
+
     cached = _LAST_CANDLES_CACHE.get(cache_key)
     if cached:
         return cached
@@ -613,6 +852,10 @@ def fetch_sp500_returns_window(period: str = "10y") -> Tuple[np.ndarray, float]:
     bars = _alpaca_bars("SPY", period=period, interval="1d")
     if not bars:
         bars = _finnhub_candles("SPY", period=period, interval="1d")
+    if not bars:
+        bars = _twelvedata_candles("SPY", period=period, interval="1d")
+    if not bars:
+        bars = _stooq_candles("SPY", period=period, interval="1d")
 
     closes = [float(point.close) for point in bars if point.close is not None]
 
