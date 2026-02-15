@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { jsPDF } from "jspdf";
 import {
   CartesianGrid,
@@ -49,6 +49,12 @@ interface Props {
 interface UserAgentEntry {
   config: AgentConfig;
   iconEmoji?: string;
+  editor?: {
+    risk: number;
+    tempo: number;
+    style: number;
+    news: number;
+  };
 }
 
 const SELF_AGENT_NAME = "My Trading Agent";
@@ -141,6 +147,52 @@ const TICKER_PROMPT_STOPWORDS = new Set([
   "WORRY",
   "WHEN",
   "WITH"
+]);
+
+const POSITIVE_NEWS_TERMS = new Set([
+  "beat",
+  "beats",
+  "upgrade",
+  "upgraded",
+  "growth",
+  "surge",
+  "strong",
+  "bullish",
+  "profit",
+  "record",
+  "buyback",
+  "outperform",
+  "raise",
+  "raised",
+  "expansion",
+  "rebound",
+  "rally"
+]);
+
+const NEGATIVE_NEWS_TERMS = new Set([
+  "miss",
+  "missed",
+  "downgrade",
+  "downgraded",
+  "warning",
+  "lawsuit",
+  "probe",
+  "weak",
+  "bearish",
+  "decline",
+  "selloff",
+  "cut",
+  "cuts",
+  "slump",
+  "recession",
+  "layoff",
+  "layoffs",
+  "delay",
+  "delays",
+  "pressure",
+  "crash",
+  "drop",
+  "drops"
 ]);
 
 const INSTITUTIONAL_AGENTS: AgentConfig[] = [
@@ -258,6 +310,19 @@ function buildCustomAgent(input: {
   };
 }
 
+function inferEditorStateFromAgent(agent: AgentConfig) {
+  const tempo = Math.round(clamp(0, ((agent.aggressiveness - 0.22) / 0.7) * 100, 100));
+  const risk = Math.round(clamp(0, ((agent.risk_limit - 0.25) / 0.65) * 100, 100));
+
+  if (agent.personality === "quant_momentum") {
+    return { risk, tempo, style: 76, news: 48 };
+  }
+  if (agent.personality === "retail_reactive") {
+    return { risk, tempo, style: 50, news: 78 };
+  }
+  return { risk, tempo, style: 24, news: 36 };
+}
+
 function buildAgentStatus(
   session: SimulationState | null,
   latestTrade: TradeRecord | undefined,
@@ -319,6 +384,61 @@ function deriveVolatilityFromQuote(changePercent?: number | null) {
 
 function normalizeSymbol(value: string) {
   return value.trim().toUpperCase().replace(/\./g, "-");
+}
+
+function parseSimulationNewsItem(raw: string) {
+  const fallback = raw.replace(/\s\|\s/g, " • ").trim();
+  if (!raw) {
+    return { ticker: "", source: "", headline: fallback };
+  }
+
+  const [metaRaw, ...headlineParts] = raw.split(":");
+  if (headlineParts.length === 0) {
+    return { ticker: "", source: "", headline: fallback };
+  }
+
+  const headline = headlineParts.join(":").trim().replace(/\s\|\s/g, " • ");
+  const metaParts = metaRaw
+    .split("|")
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (metaParts.length >= 2) {
+    return {
+      ticker: metaParts[0],
+      source: metaParts.slice(1).join(" • "),
+      headline
+    };
+  }
+
+  if (metaParts.length === 1) {
+    const token = metaParts[0];
+    if (/^[A-Z][A-Z0-9.-]{0,9}$/.test(token)) {
+      return { ticker: token, source: "", headline };
+    }
+    return { ticker: "", source: token, headline };
+  }
+
+  return { ticker: "", source: "", headline };
+}
+
+function inferNewsTone(headline: string): "positive" | "negative" | "neutral" {
+  const text = headline.toLowerCase();
+  const tokens = text.match(/[a-z]+/g) ?? [];
+  let positive = 0;
+  let negative = 0;
+
+  for (const token of tokens) {
+    if (POSITIVE_NEWS_TERMS.has(token)) positive += 1;
+    if (NEGATIVE_NEWS_TERMS.has(token)) negative += 1;
+  }
+
+  if (text.includes("risk-off")) negative += 1;
+  if (text.includes("risk on")) positive += 1;
+
+  if (positive > negative && positive > 0) return "positive";
+  if (negative > positive && negative > 0) return "negative";
+  return "neutral";
 }
 
 function extractTickerCandidatesFromPrompt(prompt: string, watchlist: string[]): string[] {
@@ -415,8 +535,9 @@ export default function SimulationPanel({
   const [customEmoji, setCustomEmoji] = useState("");
   const [addedCustomAgents, setAddedCustomAgents] = useState<UserAgentEntry[]>([]);
   const [customAgentSequence, setCustomAgentSequence] = useState(2);
+  const [agentDialogOpen, setAgentDialogOpen] = useState(false);
+  const [agentDialogMode, setAgentDialogMode] = useState<"create" | "edit">("create");
   const [editingAgentName, setEditingAgentName] = useState<string | null>(null);
-  const [editingAgentPrompt, setEditingAgentPrompt] = useState("");
 
   const [session, setSession] = useState<SimulationState | null>(null);
   const [sessionAgents, setSessionAgents] = useState<AgentConfig[]>([]);
@@ -436,7 +557,62 @@ export default function SimulationPanel({
   const [modalSandboxError, setModalSandboxError] = useState("");
   const [, setPromptInferredTickers] = useState<string[]>([]);
   const [sessionStartError, setSessionStartError] = useState("");
+  const marketBoardWrapRef = useRef<HTMLDivElement | null>(null);
+  const [syncTelemetryHeight, setSyncTelemetryHeight] = useState(false);
+  const [telemetryCardHeight, setTelemetryCardHeight] = useState<number | null>(null);
   const activeSessionId = session?.session_id ?? null;
+  const telemetryHeightSynced = syncTelemetryHeight && Boolean(telemetryCardHeight);
+
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 981px)");
+    const onChange = () => setSyncTelemetryHeight(media.matches);
+    onChange();
+    if (typeof media.addEventListener === "function") {
+      media.addEventListener("change", onChange);
+      return () => media.removeEventListener("change", onChange);
+    }
+    media.addListener(onChange);
+    return () => media.removeListener(onChange);
+  }, []);
+
+  useEffect(() => {
+    if (!syncTelemetryHeight) {
+      setTelemetryCardHeight(null);
+      return;
+    }
+    const target = marketBoardWrapRef.current;
+    if (!target) return;
+
+    const updateHeight = () => {
+      const next = Math.round(target.getBoundingClientRect().height);
+      setTelemetryCardHeight((prev) => (prev === next ? prev : next > 0 ? next : null));
+    };
+
+    updateHeight();
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [syncTelemetryHeight]);
+
+  useEffect(() => {
+    if (!agentDialogOpen) return;
+    const handleKeydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAgentDialogOpen(false);
+        setAgentDialogMode("create");
+        setEditingAgentName(null);
+      }
+    };
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", handleKeydown);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeydown);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [agentDialogOpen]);
 
   useEffect(() => {
     const symbol = activeTicker.trim().toUpperCase();
@@ -598,29 +774,44 @@ export default function SimulationPanel({
     () => new Set([SELF_AGENT_NAME, ...addedCustomAgents.map((entry) => entry.config.name)]),
     [addedCustomAgents]
   );
+  const editableAgentNames = useMemo(
+    () => new Set(addedCustomAgents.map((entry) => entry.config.name)),
+    [addedCustomAgents]
+  );
   const institutionalAgentNames = useMemo(
     () => new Set(INSTITUTIONAL_AGENTS.map((agent) => agent.name)),
     []
   );
 
-  function handleAddNewAgent() {
+  function openCreateAgentDialog() {
     if (customEditorDisabled) return;
-    const takenNames = new Set([
-      ...INSTITUTIONAL_AGENTS.map((agent) => agent.name),
-      ...addedCustomAgents.map((entry) => entry.config.name)
-    ]);
-    const uniqueName = makeUniqueName(customAgentConfig.name, takenNames);
-
-    setAddedCustomAgents((previous) => [
-      ...previous,
-      {
-        config: { ...customAgentConfig, name: uniqueName },
-        iconEmoji: normalizeEmoji(customEmoji)
-      }
-    ]);
-    setCustomName(`${SELF_AGENT_NAME} ${customAgentSequence}`);
+    setAgentDialogMode("create");
+    setEditingAgentName(null);
+    setCustomName("");
+    setCustomPrompt("");
+    setCustomRisk(DEFAULT_CUSTOM.risk);
+    setCustomTempo(DEFAULT_CUSTOM.tempo);
+    setCustomStyle(DEFAULT_CUSTOM.style);
+    setCustomNews(DEFAULT_CUSTOM.news);
     setCustomEmoji("");
-    setCustomAgentSequence((value) => value + 1);
+    setAgentDialogOpen(true);
+  }
+
+  function openEditAgentDialog(agent: AgentConfig) {
+    if (customEditorDisabled) return;
+    const entry = addedCustomAgents.find((candidate) => candidate.config.name === agent.name);
+    const editor = entry?.editor ?? inferEditorStateFromAgent(agent);
+
+    setCustomName(agent.name);
+    setCustomPrompt(agent.strategy_prompt ?? "");
+    setCustomRisk(editor.risk);
+    setCustomTempo(editor.tempo);
+    setCustomStyle(editor.style);
+    setCustomNews(editor.news);
+    setCustomEmoji(entry?.iconEmoji ?? "");
+    setAgentDialogMode("edit");
+    setEditingAgentName(agent.name);
+    setAgentDialogOpen(true);
   }
 
   function handleRemoveAddedAgent(name: string) {
@@ -628,35 +819,88 @@ export default function SimulationPanel({
     setAddedCustomAgents((previous) => previous.filter((entry) => entry.config.name !== name));
     if (editingAgentName === name) {
       setEditingAgentName(null);
-      setEditingAgentPrompt("");
+      setAgentDialogMode("create");
     }
   }
 
-  function handleEditAddedAgent(entry: UserAgentEntry) {
-    if (customEditorDisabled) return;
-    setEditingAgentName(entry.config.name);
-    setEditingAgentPrompt(entry.config.strategy_prompt ?? "");
-  }
-
-  function handleCancelEditAgent() {
+  function handleCloseAgentDialog() {
+    setAgentDialogOpen(false);
+    setAgentDialogMode("create");
     setEditingAgentName(null);
-    setEditingAgentPrompt("");
   }
 
-  function handleSaveEditedAgent(name: string) {
+  function handleSaveAgentDialog() {
     if (customEditorDisabled) return;
-    const prompt = editingAgentPrompt.trim();
+    const prompt = customPrompt.trim();
     if (!prompt) return;
 
-    setAddedCustomAgents((previous) =>
-      previous.map((entry) =>
-        entry.config.name === name
-          ? { ...entry, config: { ...entry.config, strategy_prompt: prompt } }
-          : entry
-      )
-    );
-    setEditingAgentName(null);
-    setEditingAgentPrompt("");
+    if (agentDialogMode === "edit" && editingAgentName) {
+      setAddedCustomAgents((previous) => {
+        const takenNames = new Set([
+          ...INSTITUTIONAL_AGENTS.map((agent) => agent.name),
+          ...previous.map((entry) => entry.config.name).filter((name) => name !== editingAgentName)
+        ]);
+        const uniqueName = makeUniqueName(customName, takenNames);
+        const nextConfig = buildCustomAgent({
+          name: uniqueName,
+          prompt: customPrompt,
+          risk: customRisk,
+          tempo: customTempo,
+          style: customStyle,
+          news: customNews
+        });
+
+        return previous.map((entry) =>
+          entry.config.name === editingAgentName
+            ? {
+                ...entry,
+                config: nextConfig,
+                iconEmoji: normalizeEmoji(customEmoji),
+                editor: {
+                  risk: customRisk,
+                  tempo: customTempo,
+                  style: customStyle,
+                  news: customNews
+                }
+              }
+            : entry
+        );
+      });
+      handleCloseAgentDialog();
+      return;
+    }
+
+    const takenNames = new Set([
+      ...INSTITUTIONAL_AGENTS.map((agent) => agent.name),
+      ...addedCustomAgents.map((entry) => entry.config.name)
+    ]);
+    const uniqueName = makeUniqueName(customName, takenNames);
+    const nextConfig = buildCustomAgent({
+      name: uniqueName,
+      prompt: customPrompt,
+      risk: customRisk,
+      tempo: customTempo,
+      style: customStyle,
+      news: customNews
+    });
+
+    setAddedCustomAgents((previous) => [
+      ...previous,
+      {
+        config: nextConfig,
+        iconEmoji: normalizeEmoji(customEmoji),
+        editor: {
+          risk: customRisk,
+          tempo: customTempo,
+          style: customStyle,
+          news: customNews
+        }
+      }
+    ]);
+    setCustomName(`${SELF_AGENT_NAME} ${customAgentSequence}`);
+    setCustomEmoji("");
+    setCustomAgentSequence((value) => value + 1);
+    handleCloseAgentDialog();
   }
 
   function buildSandboxPrompt(ticker: string, configuredAgents: AgentConfig[], targetTickers: string[]): string {
@@ -801,8 +1045,9 @@ export default function SimulationPanel({
       setAddedCustomAgents([]);
       setCustomEmoji("");
       setCustomAgentSequence(2);
+      setAgentDialogOpen(false);
+      setAgentDialogMode("create");
       setEditingAgentName(null);
-      setEditingAgentPrompt("");
       setStartingCapital(DEFAULT_SETTINGS.startingCash);
       setCustomName(DEFAULT_CUSTOM.name);
       setCustomPrompt(DEFAULT_CUSTOM.prompt);
@@ -936,269 +1181,309 @@ export default function SimulationPanel({
     return map;
   }, [session?.trades]);
 
+  const portfolioLeaderboard = useMemo(() => {
+    if (!session) return [];
+    return Object.entries(session.portfolios)
+      .map(([agent, portfolio]) => {
+        const totalPnl =
+          portfolio.total_pnl ??
+          ((portfolio.realized_pnl ?? 0) + (portfolio.unrealized_pnl ?? 0));
+        return {
+          agent,
+          equity: portfolio.equity ?? 0,
+          totalPnl
+        };
+      })
+      .sort((a, b) => b.equity - a.equity);
+  }, [session]);
+
+  const topPerformer = portfolioLeaderboard[0] ?? null;
+  const sessionFinished = Boolean(session && !session.running);
+
   const customEditorDisabled = Boolean(session?.running);
   const customEmojiPreview = normalizeEmoji(customEmoji);
   const sandboxRunning = Boolean(session?.running) && modalSandboxResult?.status === "started";
   const normalizedStartingCapital = Math.max(1000, Number(startingCapital) || DEFAULT_SETTINGS.startingCash);
+  const myAgents = displayedAgents.filter((agent) => userAgentNames.has(agent.name));
+  const arenaAgents = displayedAgents.filter((agent) => !userAgentNames.has(agent.name));
+
+  useEffect(() => {
+    if (!customEditorDisabled || !agentDialogOpen) return;
+    setAgentDialogOpen(false);
+    setAgentDialogMode("create");
+    setEditingAgentName(null);
+  }, [customEditorDisabled, agentDialogOpen]);
+
+  const renderRoundtableCard = (agent: AgentConfig) => {
+    const latestTrade = latestTradeByAgent.get(agent.name);
+    const portfolio = session?.portfolios[agent.name];
+    const positionRows = positionRowsForCard(portfolio);
+    const totalPnl =
+      portfolio?.total_pnl ??
+      ((portfolio?.realized_pnl ?? 0) + (portfolio?.unrealized_pnl ?? 0));
+    const isPreset = institutionalAgentNames.has(agent.name);
+    const status = buildAgentStatus(session, latestTrade, isPreset);
+    const tone = statusTone(status);
+    const isSelf = userAgentNames.has(agent.name);
+    const isEditableSelf = editableAgentNames.has(agent.name);
+    const logo = AGENT_LOGOS[agent.name];
+    const emoji = customAgentEmojis[agent.name];
+
+    return (
+      <article
+        key={agent.name}
+        className={`roundtable-card${isPreset ? " preset" : ""}${isSelf ? " self" : ""}`}
+      >
+        <div className="roundtable-top">
+          <span className="character-avatar" aria-hidden="true">
+            {logo ? <img className="character-avatar-logo" src={logo} alt={`${agent.name} logo`} /> : emoji ?? (isSelf ? "🧠" : "🤖")}
+          </span>
+          {isEditableSelf ? (
+            <div className="character-card-actions">
+              <button
+                type="button"
+                className="card-icon-button"
+                onClick={() => openEditAgentDialog(agent)}
+                disabled={customEditorDisabled}
+                aria-label={`Edit ${agent.name}`}
+                title={`Edit ${agent.name}`}
+              >
+                ✎
+              </button>
+              <button
+                type="button"
+                className="card-icon-button danger"
+                onClick={() => handleRemoveAddedAgent(agent.name)}
+                disabled={customEditorDisabled}
+                aria-label={`Delete ${agent.name}`}
+                title={`Delete ${agent.name}`}
+              >
+                🗑
+              </button>
+            </div>
+          ) : (
+            <span className={`character-status-chip ${tone}`}>{status}</span>
+          )}
+        </div>
+        <h4 className="character-name">{agent.name}</h4>
+        <p className="character-role">{personalityLabel(agent.personality)}</p>
+        <p className="character-equity">{portfolio ? formatCurrency(portfolio.equity ?? 0) : "-"}</p>
+        <p className={`character-total-pnl ${totalPnl >= 0 ? "text-green" : "text-red"}`}>
+          {totalPnl >= 0 ? "+" : ""}
+          {formatCurrency(totalPnl)}
+        </p>
+        {positionRows.length > 0 ? (
+          <ul className="character-positions">
+            {positionRows.map((row) => (
+              <li key={`${agent.name}-${row.ticker}`}>
+                <span>{row.ticker} · {Math.round(row.holdings)} sh</span>
+                <span className={row.netGain >= 0 ? "text-green" : "text-red"}>
+                  {row.netGain >= 0 ? "+" : ""}
+                  {formatCurrency(row.netGain)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="muted character-positions-empty">No active positions</p>
+        )}
+      </article>
+    );
+  };
 
   return (
     <section className="panel stack stagger">
-      <div id="sim-agent" className="glass-card stack sim-card sim-card-agent">
-        <div className="panel-header sim-panel-header">
-          <div className="sim-header-copy">
-            <h3>Build Your Agent</h3>
-          </div>
-          <span className="muted">Prompt-based strategy builder</span>
-        </div>
-
-        <div className="custom-agent-grid">
-          <label>
-            Agent Name
-            <input
-              value={customName}
-              onChange={(event) => setCustomName(event.target.value)}
-              maxLength={40}
-              disabled={customEditorDisabled}
-            />
-          </label>
-          <label>
-            Agent Emoji
-            <div className="custom-agent-icon-row">
-              <input
-                className="custom-agent-emoji-input"
-                type="text"
-                maxLength={4}
-                value={customEmoji}
-                onChange={(event) => setCustomEmoji(event.target.value)}
-                disabled={customEditorDisabled}
-              />
-              <span className="custom-agent-icon-preview" aria-hidden="true">
-                {customEmojiPreview}
-              </span>
-              <span className="muted">Default with 🧠</span>
-            </div>
-          </label>
-        </div>
-
-        <label className="custom-agent-prompt-row">
-          Strategy Prompt
-          <textarea
-            value={customPrompt}
-            onChange={(event) => setCustomPrompt(event.target.value)}
-            rows={6}
-            disabled={customEditorDisabled}
-          />
-        </label>
-
-        <div className="strategy-template-row">
-          <span className="muted">Quick Templates</span>
-          <div className="strategy-template-chips">
-            {STRATEGY_TEMPLATES.map((template) => (
+      {agentDialogOpen ? (
+        <div className="agent-dialog-backdrop" role="presentation" onClick={handleCloseAgentDialog}>
+          <div
+            className="glass-card stack sim-card sim-card-agent agent-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="agent-dialog-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="panel-header sim-panel-header agent-dialog-header">
+              <div className="sim-header-copy">
+                <h3 id="agent-dialog-title">{agentDialogMode === "edit" ? "Edit Agent" : "Build Your Agent"}</h3>
+              </div>
               <button
-                key={template.label}
                 type="button"
-                className="secondary strategy-template-chip"
-                onClick={() => setCustomPrompt(template.prompt)}
-                disabled={customEditorDisabled}
+                className="secondary agent-dialog-close"
+                onClick={handleCloseAgentDialog}
+                aria-label="Close agent builder"
               >
-                {template.label}
+                ✕
               </button>
-            ))}
-          </div>
-        </div>
+            </div>
 
-        <div className="custom-slider-grid">
-          <label>
-            Risk Level ({customRisk})
-            <input
-              type="range"
-              min={0}
-              max={100}
-              value={customRisk}
-              style={{ "--range-progress": `${customRisk}%` } as CSSProperties}
-              onChange={(event) => setCustomRisk(Number(event.target.value))}
-              disabled={customEditorDisabled}
-            />
-          </label>
-          <label>
-            Trade Frequency ({customTempo})
-            <input
-              type="range"
-              min={0}
-              max={100}
-              value={customTempo}
-              style={{ "--range-progress": `${customTempo}%` } as CSSProperties}
-              onChange={(event) => setCustomTempo(Number(event.target.value))}
-              disabled={customEditorDisabled}
-            />
-          </label>
-          <label>
-            Style ({styleLabel(customStyle)})
-            <input
-              type="range"
-              min={0}
-              max={100}
-              value={customStyle}
-              style={{ "--range-progress": `${customStyle}%` } as CSSProperties}
-              onChange={(event) => setCustomStyle(Number(event.target.value))}
-              disabled={customEditorDisabled}
-            />
-          </label>
-          <label>
-            News Reactivity ({customNews})
-            <input
-              type="range"
-              min={0}
-              max={100}
-              value={customNews}
-              style={{ "--range-progress": `${customNews}%` } as CSSProperties}
-              onChange={(event) => setCustomNews(Number(event.target.value))}
-              disabled={customEditorDisabled}
-            />
-          </label>
-        </div>
-
-        <div className="custom-agent-meta">
-          <span className="pill neutral">{personalityLabel(customAgentConfig.personality)}</span>
-          <span className="muted">
-            Trade Size {customAgentConfig.trade_size} · Risk Limit {customAgentConfig.risk_limit.toFixed(2)} · Aggression {customAgentConfig.aggressiveness.toFixed(2)}
-          </span>
-        </div>
-
-        <button
-          type="button"
-          className="add-agent-button"
-          onClick={handleAddNewAgent}
-          disabled={customEditorDisabled}
-        >
-          + Add New Agent To Roundtable
-        </button>
-
-        {addedCustomAgents.length > 0 ? (
-          <div className="custom-agent-roster">
-            {addedCustomAgents.map((entry) => (
-              <div key={entry.config.name} className="custom-agent-roster-item">
-                <div className="custom-agent-roster-head">
-                  <span className="custom-agent-roster-name">
-                    {entry.iconEmoji ?? DEFAULT_CUSTOM.emoji} {entry.config.name}
-                  </span>
-                  <span className="pill neutral">{personalityLabel(entry.config.personality)}</span>
-                </div>
-
-                {editingAgentName === entry.config.name ? (
-                  <textarea
-                    className="custom-agent-roster-edit"
-                    value={editingAgentPrompt}
-                    onChange={(event) => setEditingAgentPrompt(event.target.value)}
-                    rows={4}
+            <div className="custom-agent-grid">
+              <label>
+                Agent Name
+                <input
+                  value={customName}
+                  onChange={(event) => setCustomName(event.target.value)}
+                  maxLength={40}
+                  placeholder=""
+                  disabled={customEditorDisabled}
+                />
+              </label>
+              <label>
+                Agent Emoji
+                <div className="custom-agent-icon-row">
+                  <input
+                    className="custom-agent-emoji-input"
+                    type="text"
+                    maxLength={4}
+                    value={customEmoji}
+                    onChange={(event) => setCustomEmoji(event.target.value)}
+                    placeholder=""
                     disabled={customEditorDisabled}
                   />
-                ) : (
-                  <p className="custom-agent-roster-prompt">{entry.config.strategy_prompt || "No prompt set yet."}</p>
-                )}
+                  <span className="custom-agent-icon-preview" aria-hidden="true">
+                    {customEmojiPreview}
+                  </span>
+                  <span className="muted">Default with 🧠</span>
+                </div>
+              </label>
+            </div>
 
-                <div className="custom-agent-roster-actions">
-                  {editingAgentName === entry.config.name ? (
-                    <>
-                      <button
-                        type="button"
-                        className="secondary"
-                        onClick={handleCancelEditAgent}
-                        disabled={customEditorDisabled}
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleSaveEditedAgent(entry.config.name)}
-                        disabled={customEditorDisabled || editingAgentPrompt.trim().length === 0}
-                      >
-                        Save Prompt
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      type="button"
-                      className="secondary"
-                      onClick={() => handleEditAddedAgent(entry)}
-                      disabled={customEditorDisabled}
-                    >
-                      Edit Prompt
-                    </button>
-                  )}
+            <label className="custom-agent-prompt-row">
+              Strategy Prompt
+              <textarea
+                value={customPrompt}
+                onChange={(event) => setCustomPrompt(event.target.value)}
+                rows={6}
+                placeholder=""
+                disabled={customEditorDisabled}
+              />
+            </label>
+
+            <div className="strategy-template-row">
+              <span className="muted">Quick Templates</span>
+              <div className="strategy-template-chips">
+                {STRATEGY_TEMPLATES.map((template) => (
                   <button
+                    key={template.label}
                     type="button"
-                    className="secondary"
-                    onClick={() => handleRemoveAddedAgent(entry.config.name)}
+                    className="secondary strategy-template-chip"
+                    onClick={() => setCustomPrompt(template.prompt)}
                     disabled={customEditorDisabled}
                   >
-                    Remove
+                    {template.label}
                   </button>
-                </div>
+                ))}
               </div>
-            ))}
+            </div>
+
+            <div className="custom-slider-grid">
+              <label>
+                Risk Level ({customRisk})
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={customRisk}
+                  style={{ "--range-progress": `${customRisk}%` } as CSSProperties}
+                  onChange={(event) => setCustomRisk(Number(event.target.value))}
+                  disabled={customEditorDisabled}
+                />
+              </label>
+              <label>
+                Trade Frequency ({customTempo})
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={customTempo}
+                  style={{ "--range-progress": `${customTempo}%` } as CSSProperties}
+                  onChange={(event) => setCustomTempo(Number(event.target.value))}
+                  disabled={customEditorDisabled}
+                />
+              </label>
+              <label>
+                Style ({styleLabel(customStyle)})
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={customStyle}
+                  style={{ "--range-progress": `${customStyle}%` } as CSSProperties}
+                  onChange={(event) => setCustomStyle(Number(event.target.value))}
+                  disabled={customEditorDisabled}
+                />
+              </label>
+              <label>
+                News Reactivity ({customNews})
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={customNews}
+                  style={{ "--range-progress": `${customNews}%` } as CSSProperties}
+                  onChange={(event) => setCustomNews(Number(event.target.value))}
+                  disabled={customEditorDisabled}
+                />
+              </label>
+            </div>
+
+            <div className="custom-agent-meta">
+              <span className="pill neutral">{personalityLabel(customAgentConfig.personality)}</span>
+              <span className="muted">
+                Trade Size {customAgentConfig.trade_size} · Risk Limit {customAgentConfig.risk_limit.toFixed(2)} · Aggression {customAgentConfig.aggressiveness.toFixed(2)}
+              </span>
+            </div>
+
+            <button
+              type="button"
+              className="add-agent-button"
+              onClick={handleSaveAgentDialog}
+              disabled={customEditorDisabled || customPrompt.trim().length === 0}
+            >
+              {agentDialogMode === "edit" ? "Save Agent" : "+ Add New Agent To Roundtable"}
+            </button>
           </div>
-        ) : null}
-      </div>
+        </div>
+      ) : null}
 
       <div id="sim-roundtable" className="glass-card stack sim-card sim-card-roundtable">
         <div className="panel-header sim-panel-header">
           <div className="sim-header-copy">
             <h3>AI Roundtable</h3>
           </div>
-          <span className="muted">Preview each trader before launch</span>
+          <div className="roundtable-header-actions">
+            <button
+              type="button"
+              className="add-agent-button roundtable-add-button"
+              onClick={openCreateAgentDialog}
+              disabled={customEditorDisabled}
+              aria-label="Add agent"
+            >
+              + Add Agent
+            </button>
+          </div>
         </div>
-        <div className="roundtable-grid">
-          {displayedAgents.map((agent) => {
-            const latestTrade = latestTradeByAgent.get(agent.name);
-            const portfolio = session?.portfolios[agent.name];
-            const positionRows = positionRowsForCard(portfolio);
-            const totalPnl =
-              portfolio?.total_pnl ??
-              ((portfolio?.realized_pnl ?? 0) + (portfolio?.unrealized_pnl ?? 0));
-            const isPreset = institutionalAgentNames.has(agent.name);
-            const status = buildAgentStatus(session, latestTrade, isPreset);
-            const tone = statusTone(status);
-            const isSelf = userAgentNames.has(agent.name);
-            const logo = AGENT_LOGOS[agent.name];
-            const emoji = customAgentEmojis[agent.name];
+        <div className="roundtable-section roundtable-section-self">
+          <div className="roundtable-section-header">
+            <h4>My Agents</h4>
+            <span className="pill amber">{myAgents.length}</span>
+          </div>
+          {myAgents.length > 0 ? (
+            <div className="roundtable-grid">
+              {myAgents.map((agent) => renderRoundtableCard(agent))}
+            </div>
+          ) : (
+            <p className="muted roundtable-empty">No custom agents yet. Click Add Agent to build one.</p>
+          )}
+        </div>
 
-            return (
-              <article
-                key={agent.name}
-                className={`roundtable-card${isPreset ? " preset" : ""}${isSelf ? " self" : ""}`}
-              >
-                <div className="roundtable-top">
-                  <span className="character-avatar" aria-hidden="true">
-                    {logo ? <img className="character-avatar-logo" src={logo} alt={`${agent.name} logo`} /> : emoji ?? (isSelf ? "🧠" : "🤖")}
-                  </span>
-                  <span className={`character-status-chip ${tone}`}>{status}</span>
-                </div>
-                <h4 className="character-name">{agent.name}</h4>
-                <p className="character-role">{personalityLabel(agent.personality)}</p>
-                <p className="character-equity">{portfolio ? formatCurrency(portfolio.equity ?? 0) : "-"}</p>
-                <p className={`character-total-pnl ${totalPnl >= 0 ? "text-green" : "text-red"}`}>
-                  {totalPnl >= 0 ? "+" : ""}
-                  {formatCurrency(totalPnl)}
-                </p>
-                {positionRows.length > 0 ? (
-                  <ul className="character-positions">
-                    {positionRows.map((row) => (
-                      <li key={`${agent.name}-${row.ticker}`}>
-                        <span>{row.ticker} · {Math.round(row.holdings)} sh</span>
-                        <span className={row.netGain >= 0 ? "text-green" : "text-red"}>
-                          {row.netGain >= 0 ? "+" : ""}
-                          {formatCurrency(row.netGain)}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="muted character-positions-empty">No active positions</p>
-                )}
-              </article>
-            );
-          })}
+        <div className="roundtable-section roundtable-section-arena">
+          <div className="roundtable-section-header">
+            <h4>Arena Agents</h4>
+            <span className="pill arena">{arenaAgents.length}</span>
+          </div>
+          <div className="roundtable-grid">
+            {arenaAgents.map((agent) => renderRoundtableCard(agent))}
+          </div>
         </div>
       </div>
 
@@ -1227,7 +1512,6 @@ export default function SimulationPanel({
           <p className="session-capital-preview">{formatCurrency(normalizedStartingCapital)}</p>
         </div>
         <p className="sim-tip">Tip: keep starting capital near 100,000 for easier strategy comparisons.</p>
-        <p className="muted">Uses live quote + dynamic volatility.</p>
         {modalSandboxLoading ? <p className="muted">Launching Modal sandbox…</p> : null}
         {modalHealth?.status === "missing_dependency" && modalHealth.install_hint ? (
           <p className="error">{modalHealth.install_hint}</p>
@@ -1243,7 +1527,7 @@ export default function SimulationPanel({
         ) : session.running ? (
           <div className="simulation-control-row">
             <button
-              className="secondary"
+              className={session.paused ? "" : "secondary"}
               onClick={session.paused ? handlePlay : handlePause}
               disabled={loading || !session.running}
             >
@@ -1273,7 +1557,10 @@ export default function SimulationPanel({
       </div>
 
       <div id="sim-market" className="telemetry-board-row sim-market-row">
-        <div className="glass-card sim-card sim-card-telemetry">
+        <div
+          className={`glass-card sim-card sim-card-telemetry${telemetryHeightSynced ? " sim-card-telemetry-synced" : ""}`}
+          style={telemetryHeightSynced && telemetryCardHeight ? { height: `${telemetryCardHeight}px` } : undefined}
+        >
           <div className="panel-header sim-panel-header">
             <div className="sim-header-copy">
               <h3>Session Telemetry</h3>
@@ -1296,7 +1583,7 @@ export default function SimulationPanel({
               <h3>{formatCurrency(totalEquity)}</h3>
             </div>
           </div>
-          <div className="chart-box">
+          <div className="chart-box telemetry-chart-box">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={priceSeries}>
                 <CartesianGrid stroke="var(--line)" strokeDasharray="3 3" />
@@ -1309,13 +1596,15 @@ export default function SimulationPanel({
           </div>
         </div>
 
-        <EventRail
-          connected={connected}
-          simulationEvent={simulationEvent}
-          activeSessionId={session?.session_id ?? null}
-          simulationActive={Boolean(session?.running)}
-          className="event-rail-inline"
-        />
+        <div ref={marketBoardWrapRef} className="sim-market-board-wrap">
+          <EventRail
+            connected={connected}
+            simulationEvent={simulationEvent}
+            activeSessionId={session?.session_id ?? null}
+            simulationActive={Boolean(session?.running)}
+            className="event-rail-inline"
+          />
+        </div>
       </div>
 
       <div className="card-row-split sim-review-grid">
@@ -1327,7 +1616,21 @@ export default function SimulationPanel({
             <span className="muted">Catalysts that move behavior</span>
           </div>
           <ul className="news-feed">
-            {(session?.recent_news ?? []).slice(0, 8).map((news, idx) => <li key={`news-${idx}`}>{news}</li>)}
+            {(session?.recent_news ?? []).slice(0, 8).map((news, idx) => {
+              const parsed = parseSimulationNewsItem(news);
+              const tone = inferNewsTone(parsed.headline);
+              return (
+                <li key={`news-${idx}`} className={`news-feed-item news-${tone}`}>
+                  {parsed.ticker || parsed.source ? (
+                    <div className="news-feed-meta">
+                      {parsed.ticker ? <span className="news-feed-ticker">{parsed.ticker}</span> : null}
+                      {parsed.source ? <span className="news-feed-source">{parsed.source}</span> : null}
+                    </div>
+                  ) : null}
+                  <p className="news-feed-headline">{parsed.headline}</p>
+                </li>
+              );
+            })}
             {(session?.recent_news ?? []).length === 0 ? <li className="muted">No headlines yet.</li> : null}
           </ul>
         </div>
@@ -1373,16 +1676,40 @@ export default function SimulationPanel({
           </div>
           <span className="muted">Auto-generated when simulation ends</span>
         </div>
-        {autoCommentaryLoading ? <p className="muted">Generating commentary…</p> : null}
-        {autoCommentary ? (
-          <article className="chat-output">
-            <p>{autoCommentary}</p>
-            <span className="muted">model: {autoCommentaryModel}</span>
-          </article>
-        ) : null}
-        {!autoCommentary && !autoCommentaryLoading ? (
-          <p className="muted">Run a simulation to receive automatic commentary.</p>
-        ) : null}
+        {sessionFinished ? (
+          <div className="postrun-structured">
+            <section className="postrun-row">
+              <h4>Session Outcome:</h4>
+              <p>
+                {session?.ticker} closed at {formatCurrency(session?.current_price ?? 0)} after {session?.tick ?? 0} ticks with{" "}
+                {session?.trades.length ?? 0} trades executed.
+              </p>
+            </section>
+
+            <section className="postrun-row">
+              <h4>🏆 Top Performer:</h4>
+              <p>
+                {topPerformer
+                  ? `${topPerformer.agent} at ${formatCurrency(topPerformer.equity)} (${topPerformer.totalPnl >= 0 ? "+" : ""}${formatCurrency(topPerformer.totalPnl)} net PnL).`
+                  : "No portfolio winner available for this run."}
+              </p>
+            </section>
+
+            <section className="postrun-row">
+              <h4>📘 Educational Takeaway:</h4>
+              <p>
+                {autoCommentaryLoading
+                  ? "Generating commentary…"
+                  : autoCommentary || "No automatic commentary was generated."}
+              </p>
+              {autoCommentaryModel ? <span className="postrun-meta">Model: {autoCommentaryModel}</span> : null}
+            </section>
+          </div>
+        ) : (
+          <p className="muted">
+            Finish or stop a simulation to view a structured post-run breakdown.
+          </p>
+        )}
       </div>
     </section>
   );

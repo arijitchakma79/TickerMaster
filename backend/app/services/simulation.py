@@ -60,6 +60,22 @@ NEWS_SENTIMENT_NEGATIVE = {
 }
 
 
+_MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
+_MARKDOWN_CITATION_PATTERN = re.compile(r"\s*\[(?:\d+(?:\s*,\s*\d+)*)\]")
+
+
+def _sanitize_external_news_text(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+
+    cleaned = _MARKDOWN_LINK_PATTERN.sub(r"\1", cleaned)
+    cleaned = cleaned.replace("**", "").replace("__", "").replace("`", "")
+    cleaned = _MARKDOWN_CITATION_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
 @dataclass
 class Position:
     holdings: int = 0
@@ -670,7 +686,7 @@ class SimulationOrchestrator:
                     "role": "user",
                     "content": (
                         f"Give 3 latest market-moving headlines or catalysts for {symbol} in the last 24 hours. "
-                        "Return short bullet lines only, no intro."
+                        "Return short bullet lines only, no intro. No markdown. No citation markers like [1]."
                     ),
                 },
             ],
@@ -699,11 +715,17 @@ class SimulationOrchestrator:
         lines: List[str] = []
         for raw_line in content.splitlines():
             clean = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", raw_line).strip()
+            clean = _sanitize_external_news_text(clean)
             if clean:
                 lines.append(clean)
 
         if not lines:
-            lines = [part.strip() for part in re.split(r"(?<=[.!?])\s+", content) if part.strip()]
+            lines = [
+                _sanitize_external_news_text(part.strip())
+                for part in re.split(r"(?<=[.!?])\s+", content)
+                if part.strip()
+            ]
+            lines = [line for line in lines if line]
 
         now = datetime.now(timezone.utc)
         return [
@@ -1130,8 +1152,8 @@ class SimulationOrchestrator:
                 self._record_news_event(
                     runtime,
                     ticker=runtime.ticker,
-                    headline="Crash regime detected: liquidity thinned and spreads widened.",
-                    source="Regime",
+                    headline="Crash alert: liquidity thinned and spreads widened.",
+                    source="Market Update",
                     published_at=datetime.now(timezone.utc),
                     sentiment_override=-0.9,
                 )
