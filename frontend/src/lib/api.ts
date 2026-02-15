@@ -12,6 +12,8 @@ import type {
   TrackerAgentDetail,
   TrackerAgentInteractResponse,
   SimulationState,
+  VoiceHistoryMessage,
+  VoiceTurnResponse,
   TickerLookup,
   TrackerSnapshot
 } from "./types";
@@ -155,6 +157,17 @@ export async function spinModalSandbox(prompt: string, session_id: string) {
 
 export async function runDeepResearch(ticker: string): Promise<DeepResearchResponse> {
   const { data } = await client.post<DeepResearchResponse>(`/research/deep/${ticker}`);
+  return data;
+}
+
+export async function runVoiceTurn(audio: Blob, history: VoiceHistoryMessage[]): Promise<VoiceTurnResponse> {
+  const payload = new FormData();
+  payload.append("audio", audio, "utterance.webm");
+  payload.append("history", JSON.stringify(history));
+
+  const { data } = await client.post<VoiceTurnResponse>("/api/voice/turn", payload, {
+    timeout: 120000,
+  });
   return data;
 }
 

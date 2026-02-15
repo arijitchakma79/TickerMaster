@@ -4,6 +4,7 @@ import ResearchPanel from "./components/ResearchPanel";
 import SimulationPanel from "./components/SimulationPanel";
 import TrackerPrefsRail from "./components/TrackerPrefsRail";
 import TrackerPanel from "./components/TrackerPanel";
+import VoiceBrokerPanel from "./components/VoiceBrokerPanel";
 import { getApiUrl, getWatchlist, setWatchlist as setTrackerWatchlist } from "./lib/api";
 import { useSocket } from "./hooks/useSocket";
 import brandLogo from "./images/TickerMaster.png";
@@ -207,6 +208,8 @@ export default function App() {
         ) : null}
         {tab === "tracker" ? <TrackerPrefsRail connected={connected} /> : null}
       </main>
+
+      <VoiceBrokerPanel activeTicker={ticker} />
     </div>
   );
 }

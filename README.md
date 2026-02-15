@@ -117,6 +117,30 @@ If cache writes appear but activity/alerts do not, confirm backend is using `SUP
 - `GET /integrations`
 - `WS /ws/stream?channels=global,simulation,tracker`
 
+## Twilio Phone Voice (Turn-Based)
+You can call the agent from a phone number using Twilio webhooks. This flow records caller audio, runs the same ElevenLabs STT -> OpenAI tools -> ElevenLabs TTS pipeline, then plays the generated audio back on the call.
+
+### Required env
+```env
+TWILIO_ACCOUNT_SID=...
+TWILIO_AUTH_TOKEN=...
+TWILIO_PHONE_NUMBER=+1...
+TWILIO_PHONE_NUMBER_SID=... # optional
+ELEVEN_LABS_API_KEY=...
+OPENAI_API_KEY=...
+BACKEND_BASE_URL=https://<your-public-backend>
+```
+
+### Twilio webhook URLs
+Set your Twilio incoming voice webhook to:
+- `POST https://<your-public-backend>/api/twilio/voice/incoming`
+
+The backend will automatically chain to:
+- `POST /api/twilio/voice/recording` (Twilio recording callback)
+- `GET /api/twilio/voice/audio/{audio_id}` (temporary audio playback URL)
+
+For local dev, expose backend publicly with ngrok/cloudflared and use that public URL in Twilio.
+
 ## How the MVP Maps to Sponsor Tool Requirements
 
 ### Research

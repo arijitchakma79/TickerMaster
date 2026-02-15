@@ -86,8 +86,24 @@ class Settings:
     finnhub_api_url: str = "https://finnhub.io/api/v1"
 
     openai_api_key: str = ""
+    openai_voice_model: str = "gpt-4o-mini"
     openrouter_api_key: str = ""
     openrouter_model: str = "meta-llama/llama-3.1-8b-instruct"
+
+    eleven_labs_api_key: str = ""
+    eleven_labs_voice_id: str = "JBFqnCBsd6RMkjVDRZzb"
+    eleven_labs_stt_model: str = "scribe_v2"
+    eleven_labs_stt_language_code: str = ""
+    eleven_labs_tts_model: str = "eleven_multilingual_v2"
+    eleven_labs_tts_output_format: str = "mp3_44100_128"
+
+    backend_base_url: str = "http://localhost:8000"
+    x_user_id: str = ""
+
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_phone_number: str = ""
+    twilio_phone_number_sid: str = ""
 
     perplexity_api_key: str = ""
     perplexity_model: str = "sonar"
@@ -149,8 +165,21 @@ def get_settings() -> Settings:
         finnhub_api_key=_env("FINNHUB_API_KEY"),
         finnhub_api_url=_env("FINNHUB_API_URL", "https://finnhub.io/api/v1"),
         openai_api_key=_env("OPENAI_API_KEY"),
+        openai_voice_model=_env("OPENAI_VOICE_MODEL", "gpt-4o-mini"),
         openrouter_api_key=_env("OPENROUTER_API_KEY"),
         openrouter_model=_env("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct"),
+        eleven_labs_api_key=_env("ELEVEN_LABS_API_KEY"),
+        eleven_labs_voice_id=_env("ELEVEN_LABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb"),
+        eleven_labs_stt_model=_env("ELEVEN_LABS_STT_MODEL", "scribe_v2"),
+        eleven_labs_stt_language_code=_env("ELEVEN_LABS_STT_LANGUAGE_CODE"),
+        eleven_labs_tts_model=_env("ELEVEN_LABS_TTS_MODEL", "eleven_multilingual_v2"),
+        eleven_labs_tts_output_format=_env("ELEVEN_LABS_TTS_OUTPUT_FORMAT", "mp3_44100_128"),
+        backend_base_url=_env("BACKEND_BASE_URL", _env("BACKEND_URL", "http://localhost:8000")),
+        x_user_id=_env("X_USER_ID"),
+        twilio_account_sid=_env("TWILIO_ACCOUNT_SID"),
+        twilio_auth_token=_env("TWILIO_AUTH_TOKEN"),
+        twilio_phone_number=_env("TWILIO_PHONE_NUMBER"),
+        twilio_phone_number_sid=_env("TWILIO_PHONE_NUMBER_SID"),
         perplexity_api_key=_env("PERPLEXITY_API_KEY"),
         perplexity_model=_env("PERPLEXITY_MODEL", "sonar"),
         x_api_bearer_token=_env("X_API_BEARER_TOKEN") or _env("X_BEARER_TOKEN"),
