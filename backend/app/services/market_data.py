@@ -17,6 +17,8 @@ _LAST_METRIC_CACHE: dict[str, MarketMetric] = {}
 _LAST_CANDLES_CACHE: dict[str, List[CandlestickPoint]] = {}
 _LAST_ADVANCED_CACHE: dict[str, tuple[float, Dict[str, Any]]] = {}
 _ADVANCED_CACHE_TTL_SECONDS = 15 * 60
+_SEC_TICKER_CACHE: tuple[datetime, list[tuple[str, str]]] | None = None
+_SEC_TICKER_CACHE_TTL = timedelta(hours=24)
 
 
 def _safe_float(value: Any) -> float | None:
@@ -87,14 +89,151 @@ def _is_symbol_candidate(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Z][A-Z0-9-]{0,9}", value))
 
 
+_US_LOOKUP_EXCHANGES = {
+    "US",
+    "NASDAQ",
+    "NYSE",
+    "NYSEARCA",
+    "AMEX",
+    "BATS",
+    "IEX",
+    "NMS",
+    "NYQ",
+    "PCX",
+    "ASE",
+}
+
+_COMMON_COMPANY_ALIASES = {
+    "APPLE": "AAPL",
+    "MICROSOFT": "MSFT",
+    "NVIDIA": "NVDA",
+    "NVIDA": "NVDA",
+    "TESLA": "TSLA",
+    "AMAZON": "AMZN",
+    "META": "META",
+    "GOOGLE": "GOOGL",
+    "ALPHABET": "GOOGL",
+    "NETFLIX": "NFLX",
+    "PALANTIR": "PLTR",
+    "SP500": "SPY",
+    "S&P 500": "SPY",
+    "S P 500": "SPY",
+}
+
+
+def _normalize_lookup_symbol(raw: Any) -> str:
+    token = str(raw or "").upper().strip()
+    if not token:
+        return ""
+    token = token.split(":")[-1].strip()
+    token = token.replace(".", "-")
+    token = re.sub(r"\s+", "", token)
+    token = re.sub(r"[-.]US$", "", token)
+    token = token.strip("-")
+    return token
+
+
+def _normalize_lookup_text(raw: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(raw or "").lower())
+
+
+def _lookup_score(query: str, item: TickerLookup) -> int:
+    clean_query = str(query or "").strip()
+    if not clean_query:
+        return 0
+    query_norm = _normalize_lookup_text(clean_query)
+    symbol = _normalize_lookup_symbol(item.ticker)
+    symbol_norm = _normalize_lookup_text(symbol)
+    name = str(item.name or symbol).strip()
+    name_norm = _normalize_lookup_text(name)
+
+    score = 0
+    if clean_query.upper() == symbol:
+        score = 100
+    elif symbol.startswith(clean_query.upper()):
+        score = 92
+    elif symbol_norm == query_norm:
+        score = 88
+    elif symbol_norm.startswith(query_norm):
+        score = 84
+    elif name_norm == query_norm:
+        score = 82
+    elif name_norm.startswith(query_norm):
+        score = 76
+    elif query_norm and name_norm and query_norm in name_norm:
+        score = 68
+
+    exchange = str(item.exchange or "").upper()
+    if exchange in _US_LOOKUP_EXCHANGES:
+        score += 4
+    elif exchange:
+        score -= 4
+    instrument_type = str(item.instrument_type or "").upper()
+    if any(token in instrument_type for token in {"EQUITY", "COMMON"}):
+        score += 3
+    elif "ETF" in instrument_type:
+        score += 2
+    if any(token in instrument_type for token in {"WARRANT", "RIGHT", "PREFERRED", "PFD", "UNIT", "NOTE", "BOND"}):
+        score -= 18
+
+    if re.search(r"\d", symbol):
+        score -= 10
+    if len(symbol) > 5:
+        score -= 6
+    if "-" in symbol and not re.fullmatch(r"[A-Z]{1,5}-[A-Z]{1,2}", symbol):
+        score -= 6
+    name_upper = name.upper()
+    if any(token in name_upper for token in {"PREFERRED", "PFD", "WARRANT", "RIGHT", "UNIT", "NOTE"}):
+        score -= 10
+    return score
+
+
+def _rank_lookup_results(query: str, rows: List[TickerLookup], limit: int = 8) -> List[TickerLookup]:
+    scored: dict[str, tuple[int, TickerLookup]] = {}
+    for row in rows:
+        symbol = _normalize_lookup_symbol(row.ticker)
+        if not symbol or not _is_symbol_candidate(symbol):
+            continue
+        normalized = TickerLookup(
+            ticker=symbol,
+            name=str(row.name or symbol).strip() or symbol,
+            exchange=str(row.exchange or "").strip() or None,
+            instrument_type=str(row.instrument_type or "").strip() or None,
+        )
+        score = _lookup_score(query, normalized)
+        if score <= 0:
+            continue
+        prev = scored.get(symbol)
+        if prev is None or score > prev[0]:
+            scored[symbol] = (score, normalized)
+
+    ranked = sorted(
+        scored.values(),
+        key=lambda pair: (
+            -pair[0],
+            0 if str(pair[1].exchange or "").upper() in _US_LOOKUP_EXCHANGES else 1,
+            len(pair[1].ticker),
+            pair[1].ticker,
+        ),
+    )
+    return [item for _, item in ranked[: max(1, limit)]]
+
+
 def resolve_symbol_input(raw: str) -> str:
     clean = raw.strip()
     if not clean:
         raise ValueError("Ticker input is empty.")
 
+    alias_key = re.sub(r"[^A-Za-z0-9&]+", " ", clean).strip().upper()
+    if alias_key in _COMMON_COMPANY_ALIASES:
+        return _COMMON_COMPANY_ALIASES[alias_key]
+
     direct = clean.upper().replace(".", "-")
     if _is_symbol_candidate(direct):
-        return direct
+        # Plain alphabetic tokens longer than 5 characters are usually company names
+        # ("NVIDIA"), not tradable symbols. Resolve them via provider search.
+        if not re.fullmatch(r"[A-Z]{6,}", direct):
+            return direct
 
     # Support formats like "Alaska Airlines (ALK)".
     grouped = re.search(r"\(([A-Za-z][A-Za-z0-9.-]{0,9})\)", clean)
@@ -104,7 +243,7 @@ def resolve_symbol_input(raw: str) -> str:
             return grouped_symbol
 
     # Natural-language fallback: resolve via provider search.
-    hits = _finnhub_search(clean, limit=8)
+    hits = _search_symbol_providers(clean, limit=8)
     if hits:
         return hits[0].ticker.upper().strip()
 
@@ -742,7 +881,9 @@ def _finnhub_search(query: str, limit: int = 8) -> List[TickerLookup]:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        symbol = str(row.get("symbol") or "").upper().strip()
+        symbol = _normalize_lookup_symbol(row.get("symbol"))
+        if not _is_symbol_candidate(symbol):
+            continue
         if not symbol or symbol in seen:
             continue
 
@@ -763,6 +904,183 @@ def _finnhub_search(query: str, limit: int = 8) -> List[TickerLookup]:
             break
 
     return out
+
+
+def _load_sec_company_directory() -> list[tuple[str, str]]:
+    global _SEC_TICKER_CACHE
+    now = datetime.now(timezone.utc)
+    if _SEC_TICKER_CACHE and (now - _SEC_TICKER_CACHE[0]) < _SEC_TICKER_CACHE_TTL:
+        return _SEC_TICKER_CACHE[1]
+
+    url = "https://www.sec.gov/files/company_tickers.json"
+    headers = {
+        "User-Agent": "TickerMaster/1.0 (research@treehacks.dev)",
+        "Accept": "application/json",
+    }
+    rows: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    try:
+        with httpx.Client(timeout=15.0, headers=headers) as client:
+            response = client.get(url)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return _SEC_TICKER_CACHE[1] if _SEC_TICKER_CACHE else []
+
+    source_rows = list(payload.values()) if isinstance(payload, dict) else payload
+    if not isinstance(source_rows, list):
+        return _SEC_TICKER_CACHE[1] if _SEC_TICKER_CACHE else []
+    for row in source_rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = _normalize_lookup_symbol(row.get("ticker"))
+        if not _is_symbol_candidate(symbol) or symbol in seen:
+            continue
+        title = str(row.get("title") or symbol).strip() or symbol
+        rows.append((symbol, title))
+        seen.add(symbol)
+    _SEC_TICKER_CACHE = (now, rows)
+    return rows
+
+
+def _sec_company_search(query: str, limit: int = 8) -> List[TickerLookup]:
+    clean_query = str(query or "").strip()
+    if not clean_query:
+        return []
+    directory = _load_sec_company_directory()
+    if not directory:
+        return []
+
+    ranked: list[tuple[int, TickerLookup]] = []
+    for symbol, title in directory:
+        item = TickerLookup(
+            ticker=symbol,
+            name=title,
+            exchange="US",
+            instrument_type="Common Stock",
+        )
+        score = _lookup_score(clean_query, item)
+        if score <= 0:
+            continue
+        ranked.append((score, item))
+
+    ranked.sort(key=lambda pair: (-pair[0], len(pair[1].ticker), pair[1].ticker))
+    out: list[TickerLookup] = []
+    seen: set[str] = set()
+    for _, item in ranked:
+        if item.ticker in seen:
+            continue
+        out.append(item)
+        seen.add(item.ticker)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _twelvedata_search(query: str, limit: int = 8) -> List[TickerLookup]:
+    payload = _twelvedata_get(
+        "/symbol_search",
+        {"symbol": query, "outputsize": min(max(limit * 4, 12), 80)},
+    )
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+
+    out: List[TickerLookup] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = _normalize_lookup_symbol(row.get("symbol"))
+        if not _is_symbol_candidate(symbol) or symbol in seen:
+            continue
+        name = str(row.get("instrument_name") or row.get("name") or symbol).strip() or symbol
+        exchange = str(row.get("exchange") or "").strip() or None
+        instrument_type = str(row.get("instrument_type") or "").strip() or None
+        out.append(
+            TickerLookup(
+                ticker=symbol,
+                name=name,
+                exchange=exchange,
+                instrument_type=instrument_type,
+            )
+        )
+        seen.add(symbol)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _yahoo_search(query: str, limit: int = 8) -> List[TickerLookup]:
+    url = "https://query2.finance.yahoo.com/v1/finance/search"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_0) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/121.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        with httpx.Client(timeout=12.0, headers=headers) as client:
+            resp = client.get(
+                url,
+                params={
+                    "q": query,
+                    "quotesCount": min(max(limit * 6, 20), 100),
+                    "newsCount": 0,
+                    "enableFuzzyQuery": "true",
+                    "lang": "en-US",
+                    "region": "US",
+                },
+            )
+            if resp.status_code in {401, 403, 404, 429}:
+                return []
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception:
+        return []
+
+    rows = payload.get("quotes") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+
+    out: List[TickerLookup] = []
+    seen: set[str] = set()
+    allowed_types = {"EQUITY", "ETF", "MUTUALFUND", "INDEX"}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        quote_type = str(row.get("quoteType") or "").upper()
+        if quote_type and quote_type not in allowed_types:
+            continue
+        symbol = _normalize_lookup_symbol(row.get("symbol"))
+        if not _is_symbol_candidate(symbol) or symbol in seen:
+            continue
+        name = str(row.get("shortname") or row.get("longname") or symbol).strip() or symbol
+        exchange = str(row.get("exchange") or row.get("exchDisp") or "").strip() or None
+        out.append(
+            TickerLookup(
+                ticker=symbol,
+                name=name,
+                exchange=exchange,
+                instrument_type=(quote_type or None),
+            )
+        )
+        seen.add(symbol)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _search_symbol_providers(query: str, limit: int = 8) -> List[TickerLookup]:
+    raw: List[TickerLookup] = []
+    raw.extend(_sec_company_search(query, max(limit * 2, 16)))
+    raw.extend(_finnhub_search(query, max(limit * 2, 8)))
+    raw.extend(_twelvedata_search(query, max(limit * 2, 8)))
+    raw.extend(_yahoo_search(query, max(limit * 2, 8)))
+    return _rank_lookup_results(query, raw, limit=limit)
 
 
 def _metric_from_finnhub(symbol: str) -> MarketMetric | None:
@@ -864,9 +1182,9 @@ async def search_tickers(query: str, limit: int = 8) -> List[TickerLookup]:
                 )
                 seen.add(asset_symbol)
 
-    # Backup: Finnhub search API.
+    # Backup: provider search API chain with ranking.
     if len(out) < limit:
-        backup = await asyncio.to_thread(_finnhub_search, clean_query, max(limit * 2, 8))
+        backup = await asyncio.to_thread(_search_symbol_providers, clean_query, max(limit * 2, 8))
         for item in backup:
             if item.ticker in seen:
                 continue

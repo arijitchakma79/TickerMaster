@@ -46,27 +46,42 @@ async def send_poke_message(settings: Settings, message: str) -> bool:
         return False
 
 
-async def send_twilio_message(settings: Settings, to_number: str, message: str) -> Dict[str, Any]:
+async def send_twilio_message(
+    settings: Settings,
+    to_number: str,
+    message: str,
+    *,
+    prefer_whatsapp: bool | None = None,
+) -> Dict[str, Any]:
     account_sid = settings.twilio_account_sid.strip()
     auth_token = settings.twilio_auth_token.strip()
-    from_number = _normalize_phone(settings.twilio_from_number)
+    use_whatsapp = settings.twilio_use_whatsapp if prefer_whatsapp is None else bool(prefer_whatsapp)
+    from_raw = (
+        settings.twilio_whatsapp_from_number.strip() or settings.twilio_from_number
+        if use_whatsapp
+        else settings.twilio_from_number
+    )
+    from_number = _normalize_phone(from_raw)
     target = _normalize_phone(to_number)
 
     if not (account_sid and auth_token and from_number and target):
         return {
             "attempted": False,
             "delivered": False,
+            "channel": "whatsapp" if use_whatsapp else "sms",
             "error": "Twilio configuration or recipient phone is missing.",
         }
 
+    from_value = f"whatsapp:{from_number}" if use_whatsapp else from_number
+    to_value = f"whatsapp:{target}" if use_whatsapp else target
     endpoint = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
     try:
         async with httpx.AsyncClient(timeout=12.0, auth=(account_sid, auth_token)) as client:
             response = await client.post(
                 endpoint,
                 data={
-                    "From": from_number,
-                    "To": target,
+                    "From": from_value,
+                    "To": to_value,
                     "Body": message[:1500],
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -76,21 +91,24 @@ async def send_twilio_message(settings: Settings, to_number: str, message: str) 
                 return {
                     "attempted": True,
                     "delivered": False,
+                    "channel": "whatsapp" if use_whatsapp else "sms",
                     "status_code": response.status_code,
                     "error": str(payload.get("message") or response.text or "Twilio request failed."),
                 }
             return {
                 "attempted": True,
                 "delivered": True,
+                "channel": "whatsapp" if use_whatsapp else "sms",
                 "sid": payload.get("sid"),
                 "status": payload.get("status"),
-                "to": payload.get("to") or target,
-                "from": payload.get("from") or from_number,
+                "to": payload.get("to") or to_value,
+                "from": payload.get("from") or from_value,
             }
     except Exception as exc:
         return {
             "attempted": True,
             "delivered": False,
+            "channel": "whatsapp" if use_whatsapp else "sms",
             "error": str(exc),
         }
 

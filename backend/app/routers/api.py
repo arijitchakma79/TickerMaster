@@ -18,6 +18,7 @@ from app.services.browserbase_scraper import run_deep_research
 from app.services.llm import parse_tracker_instruction, tracker_agent_chat_response, tracker_context_query_response
 from app.services.macro import get_macro_indicators
 from app.services.market_data import fetch_candles, fetch_metric, resolve_symbol_input
+from app.services.notifications import dispatch_alert_notification
 from app.services.prediction_markets import fetch_kalshi_markets, fetch_polymarket_markets
 from app.services.research_cache import get_cached_research, set_cached_research
 from app.services.sentiment import get_x_sentiment, run_research
@@ -108,6 +109,55 @@ def normalize_timeframe(value: str | None) -> str:
     return canonical if canonical in allowed else "7d"
 
 
+def _normalize_timezone_input(value: Any) -> str:
+    token = str(value or "").strip()
+    if not token:
+        return "America/New_York"
+    token = token.replace("\\", "/")
+    try:
+        ZoneInfo(token)
+        return token
+    except Exception:
+        pass
+
+    lower = token.lower()
+    compact = re.sub(r"[^a-z]+", " ", lower).strip()
+
+    alias_map = {
+        "est": "America/New_York",
+        "edt": "America/New_York",
+        "eastern": "America/New_York",
+        "pst": "America/Los_Angeles",
+        "pdt": "America/Los_Angeles",
+        "pacific": "America/Los_Angeles",
+        "cst": "America/Chicago",
+        "cdt": "America/Chicago",
+        "central": "America/Chicago",
+        "mst": "America/Denver",
+        "mdt": "America/Denver",
+        "mountain": "America/Denver",
+        "utc": "UTC",
+        "gmt": "UTC",
+        "sf": "America/Los_Angeles",
+        "san francisco": "America/Los_Angeles",
+        "san franscisco": "America/Los_Angeles",
+        "bay area": "America/Los_Angeles",
+        "los angeles": "America/Los_Angeles",
+        "new york": "America/New_York",
+        "chicago": "America/Chicago",
+        "denver": "America/Denver",
+    }
+    if compact in alias_map:
+        return alias_map[compact]
+    if "san franc" in compact:
+        return "America/Los_Angeles"
+    if "los angeles" in compact:
+        return "America/Los_Angeles"
+    if "new york" in compact:
+        return "America/New_York"
+    return "America/New_York"
+
+
 def sanitize_tracker_triggers(raw: dict[str, Any] | None) -> dict[str, Any]:
     raw = raw or {}
     out: dict[str, Any] = {}
@@ -152,12 +202,8 @@ def sanitize_tracker_triggers(raw: dict[str, Any] | None) -> dict[str, Any]:
         else:
             out["daily_run_time"] = "09:30"
 
-    timezone_raw = str(raw.get("timezone") or "America/New_York").strip()
-    try:
-        ZoneInfo(timezone_raw)
-        out["timezone"] = timezone_raw
-    except Exception:
-        out["timezone"] = "America/New_York"
+    timezone_raw = raw.get("timezone")
+    out["timezone"] = _normalize_timezone_input(timezone_raw)
 
     start_at_raw = raw.get("start_at")
     if start_at_raw:
@@ -352,6 +398,9 @@ def _extract_timezone_hint(text: str) -> str | None:
         " mountain ": "America/Denver",
         " utc ": "UTC",
         " gmt ": "UTC",
+        " san francisco ": "America/Los_Angeles",
+        " san franscisco ": "America/Los_Angeles",
+        " los angeles ": "America/Los_Angeles",
     }
     padded = f" {lower} "
     for needle, zone in aliases.items():
@@ -469,7 +518,20 @@ def _apply_prompt_overrides(prompt: str, raw_triggers: dict[str, Any] | None) ->
         if daily_run_time:
             merged["daily_run_time"] = daily_run_time
 
-    wants_report = any(token in lower for token in {"report every", "summary every", "update every", "send report", "periodic report"})
+    wants_report = any(
+        token in lower
+        for token in {
+            "report every",
+            "summary every",
+            "update every",
+            "send report",
+            "periodic report",
+            "notification every",
+            "notify every",
+            "send me notification",
+            "send me notifications",
+        }
+    )
     wants_alert = any(token in lower for token in {"alert", "trigger", "notify me when", "if price", "if it moves"})
     if wants_report and wants_alert:
         merged["report_mode"] = "hybrid"
@@ -777,6 +839,7 @@ _COMPANY_ALIAS_TO_SYMBOL = {
     "APPLE": "AAPL",
     "MICROSOFT": "MSFT",
     "NVIDIA": "NVDA",
+    "NVIDA": "NVDA",
     "TESLA": "TSLA",
     "AMAZON": "AMZN",
     "META": "META",
@@ -895,6 +958,116 @@ def _resolve_tracker_symbol(
     )
 
 
+async def _resolve_agent_create_notification_phone(
+    *,
+    user_id: str,
+    triggers: dict[str, Any],
+    request: Request,
+) -> str | None:
+    trigger_phone = str(triggers.get("notify_phone") or "").strip()
+    if trigger_phone:
+        return trigger_phone
+
+    from app.services.database import get_supabase
+
+    settings = request.app.state.settings
+    client = get_supabase()
+    if client is None:
+        return settings.twilio_default_to_number or None
+
+    try:
+        pref_row = (
+            client.table("notification_preferences")
+            .select("phone_number")
+            .eq("user_id", user_id)
+            .single()
+            .execute()
+            .data
+        ) or {}
+        pref_phone = str(pref_row.get("phone_number") or "").strip()
+        if pref_phone:
+            return pref_phone
+    except Exception:
+        pass
+
+    try:
+        profile_row = (
+            client.table("profiles")
+            .select("phone_number,phone,sms_number")
+            .eq("id", user_id)
+            .single()
+            .execute()
+            .data
+        ) or {}
+        for key in ("phone_number", "phone", "sms_number"):
+            value = str(profile_row.get(key) or "").strip()
+            if value:
+                return value
+    except Exception:
+        pass
+
+    return settings.twilio_default_to_number or None
+
+
+async def _notify_agent_created_twilio(
+    *,
+    request: Request,
+    user_id: str,
+    agent: dict[str, Any],
+) -> dict[str, Any]:
+    triggers = agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {}
+    triggers = triggers or {}
+    symbol = str(agent.get("symbol") or "").upper() or "UNKNOWN"
+    agent_name = str(agent.get("name") or f"{symbol} Tracker Agent")
+    schedule_mode = str(triggers.get("schedule_mode") or "realtime")
+    report_mode = str(triggers.get("report_mode") or "triggers_only")
+    timezone = _normalize_timezone_input(triggers.get("timezone"))
+    start_at = str(triggers.get("start_at") or "").strip()
+    start_line = start_at if start_at else "immediately"
+    to_number = await _resolve_agent_create_notification_phone(
+        user_id=user_id,
+        triggers=triggers,
+        request=request,
+    )
+    title = f"TickerMaster Agent Created: {symbol}"
+    body = (
+        f"{agent_name} is now active. "
+        f"Schedule={schedule_mode}, mode={report_mode}, start={start_line}, timezone={timezone}."
+    )
+    notification = await dispatch_alert_notification(
+        settings=request.app.state.settings,
+        title=title,
+        body=body[:480],
+        link=f"https://localhost:5173?tab=tracker&ticker={symbol}",
+        preferred_channels=["twilio"],
+        to_number=to_number,
+        metadata={
+            "event_type": "agent_created",
+            "agent_id": agent.get("id"),
+            "symbol": symbol,
+            "schedule_mode": schedule_mode,
+            "report_mode": report_mode,
+            "timezone": timezone,
+        },
+    )
+    delivered = bool((notification.get("twilio") or {}).get("delivered"))
+    await log_agent_activity(
+        module="tracker",
+        agent_name=agent_name,
+        action=f"Sent creation notification for {symbol}",
+        status="success" if delivered else "error",
+        user_id=user_id,
+        details={
+            "agent_id": agent.get("id"),
+            "symbol": symbol,
+            "description": "Twilio creation notification attempted after agent deployment.",
+            "delivered": delivered,
+            "notification": notification,
+        },
+    )
+    return notification
+
+
 @router.post("/tracker/agents")
 async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Request, user_id: str | None = None) -> dict[str, Any]:
     resolved_user_id = _require_tracker_user_id(request, user_id)
@@ -979,7 +1152,33 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
             "parsed_prompt": parsed_prompt or None,
         },
     )
-    return agent
+    creation_notification: dict[str, Any] | None = None
+    try:
+        creation_notification = await _notify_agent_created_twilio(
+            request=request,
+            user_id=resolved_user_id,
+            agent=agent,
+        )
+    except Exception as exc:
+        creation_notification = {
+            "channels": ["twilio"],
+            "delivered": False,
+            "twilio": {"attempted": False, "delivered": False, "error": str(exc)},
+        }
+        await log_agent_activity(
+            module="tracker",
+            agent_name=str(agent.get("name") or f"{symbol} Tracker"),
+            action=f"Sent creation notification for {str(agent.get('symbol') or symbol).upper()}",
+            status="error",
+            user_id=resolved_user_id,
+            details={
+                "agent_id": agent.get("id"),
+                "symbol": str(agent.get("symbol") or symbol).upper(),
+                "description": "Twilio creation notification failed with exception.",
+                "notification": creation_notification,
+            },
+        )
+    return {**agent, "_creation_notification": creation_notification}
 
 
 @router.get("/tracker/agents")
@@ -1303,7 +1502,33 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
             "parsed": parsed,
         },
     )
-    return {"ok": True, "agent": agent, "parsed": parsed}
+    creation_notification: dict[str, Any] | None = None
+    try:
+        creation_notification = await _notify_agent_created_twilio(
+            request=request,
+            user_id=resolved_user_id,
+            agent=agent,
+        )
+    except Exception as exc:
+        creation_notification = {
+            "channels": ["twilio"],
+            "delivered": False,
+            "twilio": {"attempted": False, "delivered": False, "error": str(exc)},
+        }
+        await log_agent_activity(
+            module="tracker",
+            agent_name=name,
+            action=f"Sent creation notification for {symbol}",
+            status="error",
+            user_id=resolved_user_id,
+            details={
+                "agent_id": agent.get("id"),
+                "symbol": symbol,
+                "description": "Twilio creation notification failed with exception.",
+                "notification": creation_notification,
+            },
+        )
+    return {"ok": True, "agent": {**agent, "_creation_notification": creation_notification}, "parsed": parsed}
 
 
 @router.post("/tracker/agents/{agent_id}/interact")

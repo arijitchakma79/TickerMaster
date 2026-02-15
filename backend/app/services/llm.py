@@ -308,7 +308,20 @@ def _fallback_tracker_intent(prompt: str) -> Dict[str, Any]:
     phone_match = re.search(r"(\+?\d[\d\-\s\(\)]{8,}\d)", text)
     notify_phone = phone_match.group(1).strip() if phone_match else ""
 
-    wants_reports = any(token in lower for token in {"report every", "summary every", "update every", "send report", "scheduled report"})
+    wants_reports = any(
+        token in lower
+        for token in {
+            "report every",
+            "summary every",
+            "update every",
+            "send report",
+            "scheduled report",
+            "notification every",
+            "notify every",
+            "send me notification",
+            "send me notifications",
+        }
+    )
     wants_alerts = any(token in lower for token in {"alert", "trigger", "notify me when", "if it", "if price"})
     if wants_reports and wants_alerts:
         report_mode = "hybrid"

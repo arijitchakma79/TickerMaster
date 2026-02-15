@@ -136,6 +136,8 @@ class Settings:
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_from_number: str = ""
+    twilio_whatsapp_from_number: str = ""
+    twilio_use_whatsapp: bool = False
     twilio_default_to_number: str = ""
 
     cerebras_api_key: str = ""
@@ -205,6 +207,8 @@ def get_settings() -> Settings:
         twilio_account_sid=_env("TWILIO_ACCOUNT_SID"),
         twilio_auth_token=_env("TWILIO_AUTH_TOKEN"),
         twilio_from_number=_env("TWILIO_FROM_NUMBER"),
+        twilio_whatsapp_from_number=_env("TWILIO_WHATSAPP_FROM_NUMBER") or _env("TWILIO_WHATSAPP_FROM"),
+        twilio_use_whatsapp=_env_bool("TWILIO_USE_WHATSAPP", False),
         twilio_default_to_number=_env("TWILIO_DEFAULT_TO_NUMBER"),
         cerebras_api_key=_env("CEREBRAS_API_KEY"),
         nvidia_nim_api_key=_env("NVIDIA_NIM_API_KEY"),
