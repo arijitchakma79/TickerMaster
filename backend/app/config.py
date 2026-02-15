@@ -6,14 +6,15 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import List
+from urllib.parse import urlparse
 
 
 def _load_dotenv(path: str = ".env") -> None:
-    candidates = [
-        Path(path),
-        Path(__file__).resolve().parents[2] / ".env",
-        Path(__file__).resolve().parents[3] / ".env",
-    ]
+    candidates = [Path(path)]
+    resolved = Path(__file__).resolve()
+    # Probe parent directories safely without assuming a fixed depth.
+    for parent in resolved.parents:
+        candidates.append(parent / ".env")
     seen: set[Path] = set()
     for env_path in candidates:
         if env_path in seen or not env_path.exists():
@@ -102,6 +103,14 @@ class Settings:
     x_consumer_secret: str = ""
     x_access_token: str = ""
     x_access_token_secret: str = ""
+    x_api_enabled: bool = True
+    x_api_max_results: int = 10
+    x_api_timeout_seconds: int = 10
+    x_api_cache_ttl_seconds: int = 300
+    x_api_max_calls_per_window: int = 20
+    x_api_window_seconds: int = 900
+    x_api_min_seconds_between_calls: int = 2
+    x_api_allow_oauth1_fallback: bool = False
 
     reddit_client_id: str = ""
     reddit_client_secret: str = ""
@@ -151,10 +160,31 @@ class Settings:
     mcp_tracker_timeout_seconds: int = 6
 
 
+def _is_http_url(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _validate_settings(settings: Settings) -> None:
+    if settings.environment.lower() == "production":
+        required = {
+            "SUPABASE_URL": settings.supabase_url,
+            "SUPABASE_KEY": settings.supabase_key,
+            "SUPABASE_SERVICE_KEY": settings.supabase_service_key,
+        }
+        missing = [key for key, value in required.items() if not str(value or "").strip()]
+        if missing:
+            raise RuntimeError(f"Missing required production environment variables: {', '.join(sorted(missing))}")
+
+    invalid_origins = [origin for origin in settings.frontend_origins if not _is_http_url(origin)]
+    if invalid_origins:
+        raise RuntimeError(f"Invalid FRONTEND_ORIGINS entries: {', '.join(invalid_origins)}")
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     _load_dotenv()
-    return Settings(
+    settings = Settings(
         app_name=_env("APP_NAME", "TickerMaster API"),
         environment=_env("ENVIRONMENT", "development"),
         log_level=_env("LOG_LEVEL", "INFO"),
@@ -185,6 +215,14 @@ def get_settings() -> Settings:
         x_consumer_secret=_env("X_CONSUMER_SECRET"),
         x_access_token=_env("X_ACCESS_TOKEN"),
         x_access_token_secret=_env("X_ACCESS_TOKEN_SECRET"),
+        x_api_enabled=_env_bool("X_API_ENABLED", True),
+        x_api_max_results=_env_int("X_API_MAX_RESULTS", 10),
+        x_api_timeout_seconds=_env_int("X_API_TIMEOUT_SECONDS", 10),
+        x_api_cache_ttl_seconds=_env_int("X_API_CACHE_TTL_SECONDS", 300),
+        x_api_max_calls_per_window=_env_int("X_API_MAX_CALLS_PER_WINDOW", 20),
+        x_api_window_seconds=_env_int("X_API_WINDOW_SECONDS", 900),
+        x_api_min_seconds_between_calls=_env_int("X_API_MIN_SECONDS_BETWEEN_CALLS", 2),
+        x_api_allow_oauth1_fallback=_env_bool("X_API_ALLOW_OAUTH1_FALLBACK", False),
         reddit_client_id=_env("REDDIT_CLIENT_ID"),
         reddit_client_secret=_env("REDDIT_CLIENT_SECRET"),
         reddit_user_agent=_env("REDDIT_USER_AGENT", "TickerMaster/1.0"),
@@ -223,3 +261,5 @@ def get_settings() -> Settings:
         mcp_tracker_server_command=_env("MCP_TRACKER_SERVER_COMMAND"),
         mcp_tracker_timeout_seconds=_env_int("MCP_TRACKER_TIMEOUT_SECONDS", 6),
     )
+    _validate_settings(settings)
+    return settings

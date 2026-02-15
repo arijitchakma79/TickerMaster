@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, List
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 try:
@@ -17,7 +19,8 @@ from app.config import Settings
 from app.schemas import ResearchRequest, ResearchResponse, SentimentBreakdown, SourceLink
 from app.services.agent_logger import log_agent_activity
 from app.services.market_data import search_tickers
-from app.services.prediction_markets import fetch_kalshi_markets, fetch_polymarket_markets
+from app.services.prediction_markets import fetch_kalshi_markets, fetch_polymarket_markets, fetch_macro_fallback_markets
+from app.services.reddit_client import reddit_search_posts
 from app.services.research_cache import get_cached_research, set_cached_research
 
 
@@ -184,6 +187,19 @@ _SOURCE_WEIGHTS = {
     "reddit": 0.30,
     "x": 0.25,
 }
+_MACRO_FALLBACK_TICKERS = {
+    "SPY",
+    "QQQ",
+    "DIA",
+    "IWM",
+    "VTI",
+    "VOO",
+    "IVV",
+}
+
+_X_RESULT_CACHE: dict[str, tuple[float, Dict[str, Any]]] = {}
+_X_CALL_TIMESTAMPS: deque[float] = deque()
+_X_GUARD_LOCK = asyncio.Lock()
 
 
 def _site_name_from_url(url: str) -> str:
@@ -225,6 +241,51 @@ def _recommendation(score: float) -> str:
     if score < -0.25:
         return "sell"
     return "hold"
+
+
+def _x_cache_key(ticker: str) -> str:
+    return ticker.upper().strip()
+
+
+def _x_cached_result(ticker: str) -> Dict[str, Any] | None:
+    key = _x_cache_key(ticker)
+    row = _X_RESULT_CACHE.get(key)
+    if not row:
+        return None
+    expires_at, payload = row
+    if expires_at <= time.time():
+        _X_RESULT_CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def _x_store_cached_result(ticker: str, payload: Dict[str, Any], ttl_seconds: int) -> None:
+    ttl = max(30, int(ttl_seconds))
+    _X_RESULT_CACHE[_x_cache_key(ticker)] = (time.time() + ttl, payload)
+
+
+async def _x_allow_live_fetch(settings: Settings) -> tuple[bool, str]:
+    if not settings.x_api_enabled:
+        return False, "X live fetch disabled by X_API_ENABLED."
+
+    window_seconds = max(60, int(settings.x_api_window_seconds))
+    max_calls = max(1, int(settings.x_api_max_calls_per_window))
+    min_spacing = max(0, int(settings.x_api_min_seconds_between_calls))
+    now = time.time()
+    cutoff = now - window_seconds
+
+    async with _X_GUARD_LOCK:
+        while _X_CALL_TIMESTAMPS and _X_CALL_TIMESTAMPS[0] < cutoff:
+            _X_CALL_TIMESTAMPS.popleft()
+
+        if len(_X_CALL_TIMESTAMPS) >= max_calls:
+            return False, f"X call budget reached ({max_calls} calls/{window_seconds}s)."
+
+        if min_spacing > 0 and _X_CALL_TIMESTAMPS and (now - _X_CALL_TIMESTAMPS[-1]) < min_spacing:
+            return False, f"X call spacing guard active ({min_spacing}s minimum between calls)."
+
+        _X_CALL_TIMESTAMPS.append(now)
+    return True, ""
 
 
 def _sentiment_score_from_text(text: str) -> float:
@@ -341,48 +402,6 @@ def _macro_queries_for_context(ticker: str, company_name: str | None = None) -> 
     return out
 
 
-def _synthetic_prediction_fallback(ticker: str, company_name: str | None = None) -> List[Dict[str, Any]]:
-    name = (company_name or ticker).strip() or ticker
-    return [
-        {
-            "source": "Kalshi",
-            "market": f"Will the Fed cut rates at the next FOMC meeting? ({name} macro beta)",
-            "yes_price": "See market",
-            "link": "https://kalshi.com/markets/kxfeddecision",
-            "relevance_score": 0.42,
-            "context": "macro-adjacent",
-            "query": "fed rates",
-        },
-        {
-            "source": "Polymarket",
-            "market": f"Will U.S. CPI cool in the next release window? ({name} demand/multiple sensitivity)",
-            "probability": "See market",
-            "link": "https://polymarket.com/",
-            "relevance_score": 0.39,
-            "context": "macro-adjacent",
-            "query": "cpi inflation",
-        },
-        {
-            "source": "Polymarket",
-            "market": f"Will U.S. unemployment rise by next quarter? ({name} earnings risk proxy)",
-            "probability": "See market",
-            "link": "https://polymarket.com/",
-            "relevance_score": 0.36,
-            "context": "macro-adjacent",
-            "query": "jobs report unemployment",
-        },
-        {
-            "source": "Kalshi",
-            "market": f"Will real GDP growth beat consensus this quarter? ({name} top-line sensitivity)",
-            "yes_price": "See market",
-            "link": "https://kalshi.com/markets",
-            "relevance_score": 0.34,
-            "context": "macro-adjacent",
-            "query": "gdp growth",
-        },
-    ]
-
-
 async def _perplexity_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
     if not settings.perplexity_api_key:
         summary = (
@@ -470,7 +489,11 @@ async def _perplexity_summary(ticker: str, settings: Settings) -> Dict[str, Any]
 
 
 async def _x_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
-    bearer = settings.x_api_bearer_token.strip()
+    cached = _x_cached_result(ticker)
+    if cached is not None:
+        return cached
+
+    bearer = unquote(settings.x_api_bearer_token or "").strip()
     # Ignore clearly invalid placeholders accidentally copied from other providers.
     if bearer.startswith("sk-or-"):
         bearer = ""
@@ -488,27 +511,146 @@ async def _x_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
             "score": _sentiment_score_from_text(text),
         }
 
+    allow_live_fetch, guard_reason = await _x_allow_live_fetch(settings)
+    if not allow_live_fetch:
+        summary = guard_reason + f" Reusing cached or synthetic X summary for {ticker}."
+        result = {
+            "summary": summary,
+            "links": [SourceLink(source="X", title=f"{ticker} search", url=f"https://x.com/search?q=%24{ticker}")],
+            "score": 0.0,
+            "posts": [],
+        }
+        await log_agent_activity(
+            module="research",
+            agent_name="X Sentiment",
+            action=f"Skipped X API call for {ticker}",
+            status="pending",
+            details={"reason": guard_reason},
+        )
+        return result
+
     headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
-    params = {
-        "query": f"${ticker} lang:en -is:retweet",
-        "max_results": 25,
-        "tweet.fields": "created_at,text,public_metrics",
-    }
+    max_results = max(1, min(int(settings.x_api_max_results), 100))
+    timeout_seconds = float(max(3, int(settings.x_api_timeout_seconds)))
+    company_aliases: List[str] = []
+    try:
+        lookup = await search_tickers(ticker, limit=1)
+        if lookup:
+            company_aliases = _company_alias_tokens(str(lookup[0].name or ""))
+    except Exception:
+        company_aliases = []
+    alias_terms = [token for token in company_aliases[:2] if token and len(token) >= 3]
+    x_queries = [
+        f"${ticker}",
+        f"{ticker} stock",
+        f"${ticker} -is:retweet",
+    ]
+    if alias_terms:
+        alias_clause = " OR ".join(alias_terms)
+        x_queries.append(f"({alias_clause}) stock")
 
     tweets: List[Dict[str, Any]] = []
     error_msg = ""
 
+    def tweet_engagement(tweet: Dict[str, Any]) -> float:
+        metrics = tweet.get("public_metrics")
+        if isinstance(metrics, dict):
+            likes = float(metrics.get("like_count") or 0.0)
+            reposts = float(metrics.get("retweet_count") or 0.0)
+            replies = float(metrics.get("reply_count") or 0.0)
+            quotes = float(metrics.get("quote_count") or 0.0)
+            return likes + (1.5 * reposts) + (1.2 * replies) + (1.3 * quotes)
+        likes = float(tweet.get("favorite_count") or 0.0)
+        reposts = float(tweet.get("retweet_count") or 0.0)
+        return likes + (1.5 * reposts)
+
+    def dedupe_tweets(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("id") or row.get("id_str") or row.get("text") or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+        return out
+
     if headers:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get("https://api.twitter.com/2/tweets/search/recent", headers=headers, params=params)
-                resp.raise_for_status()
-                tweets = resp.json().get("data", [])
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                fetched_limit = max(max_results, 10)
+                collected: List[Dict[str, Any]] = []
+                for query in x_queries:
+                    params = {
+                        "query": query,
+                        "max_results": fetched_limit,
+                        "tweet.fields": "created_at,text,public_metrics",
+                    }
+                    resp = await client.get("https://api.twitter.com/2/tweets/search/recent", headers=headers, params=params)
+                    resp.raise_for_status()
+                    batch = resp.json().get("data", [])
+                    if batch:
+                        collected.extend([row for row in batch if isinstance(row, dict)])
+                    if len(collected) >= max(5, max_results):
+                        break
+                tweets = dedupe_tweets(collected)
         except Exception as exc:
             error_msg = f"X v2 bearer fetch failed: {exc}"
 
-    # Fallback: OAuth1 v1.1 search for free-tier/user-token scenarios.
-    if not tweets and OAuth1Session is not None and settings.x_consumer_key and settings.x_consumer_secret and settings.x_access_token and settings.x_access_token_secret:
+    # Fallback: OAuth1 user-context call against v2 recent search.
+    if (
+        not tweets
+        and OAuth1Session is not None
+        and settings.x_consumer_key
+        and settings.x_consumer_secret
+        and settings.x_access_token
+        and settings.x_access_token_secret
+    ):
+        try:
+            oauth = OAuth1Session(
+                client_key=settings.x_consumer_key,
+                client_secret=settings.x_consumer_secret,
+                resource_owner_key=settings.x_access_token,
+                resource_owner_secret=settings.x_access_token_secret,
+            )
+            fetched_limit = max(max_results, 10)
+            collected: List[Dict[str, Any]] = []
+            for query in x_queries:
+                resp = oauth.get(
+                    "https://api.twitter.com/2/tweets/search/recent",
+                    params={
+                        "query": query,
+                        "max_results": fetched_limit,
+                        "tweet.fields": "created_at,text,public_metrics",
+                    },
+                    timeout=timeout_seconds,
+                )
+                resp.raise_for_status()
+                batch = resp.json().get("data", [])
+                if batch:
+                    collected.extend([row for row in batch if isinstance(row, dict)])
+                if len(collected) >= max(5, max_results):
+                    break
+            tweets = dedupe_tweets(collected)
+            error_msg = ""
+        except Exception as exc:
+            if error_msg:
+                error_msg = f"{error_msg}; OAuth user-context v2 fallback failed: {exc}"
+            else:
+                error_msg = f"X OAuth user-context v2 fallback failed: {exc}"
+
+    # Optional legacy fallback: OAuth1 v1.1 search endpoint (many plans block this).
+    if (
+        not tweets
+        and settings.x_api_allow_oauth1_fallback
+        and OAuth1Session is not None
+        and settings.x_consumer_key
+        and settings.x_consumer_secret
+        and settings.x_access_token
+        and settings.x_access_token_secret
+    ):
         try:
             oauth = OAuth1Session(
                 client_key=settings.x_consumer_key,
@@ -518,33 +660,65 @@ async def _x_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
             )
             resp = oauth.get(
                 "https://api.twitter.com/1.1/search/tweets.json",
-                params={"q": f"${ticker} -filter:retweets", "lang": "en", "count": 25, "result_type": "recent"},
-                timeout=15,
+                params={"q": f"${ticker} -filter:retweets", "lang": "en", "count": max_results, "result_type": "recent"},
+                timeout=timeout_seconds,
             )
             resp.raise_for_status()
             statuses = resp.json().get("statuses", [])
-            tweets = [{"text": status.get("text", ""), "created_at": status.get("created_at")} for status in statuses]
-            error_msg = ""
-        except Exception as exc:
-            if error_msg:
-                error_msg = f"{error_msg}; OAuth1 fallback failed: {exc}"
-            else:
-                error_msg = f"X OAuth1 fallback failed: {exc}"
+            tweets = [
+                {
+                    "id_str": status.get("id_str"),
+                    "text": status.get("text", ""),
+                    "created_at": status.get("created_at"),
+                    "retweet_count": status.get("retweet_count"),
+                    "favorite_count": status.get("favorite_count"),
+                    "user_screen_name": (status.get("user") or {}).get("screen_name"),
+                }
+                for status in statuses
+                if isinstance(status, dict)
+            ]
+        except Exception:
+            pass
 
     if not tweets:
-        summary = error_msg or f"No high-signal X posts found for {ticker}."
+        summary = (
+            error_msg
+            or f"X conversation for {ticker} was sparse on this fetch window; using a neutral low-confidence read."
+        )
         score = 0.0
     else:
-        joined = " ".join(tweet.get("text", "") for tweet in tweets)
+        tweets = sorted(tweets, key=tweet_engagement, reverse=True)
+        top_tweets = tweets[: max(3, min(max_results, 5))]
+        joined = " ".join(str(tweet.get("text", "") or "") for tweet in top_tweets)
         score = _sentiment_score_from_text(joined)
-        summary = f"Parsed {len(tweets)} recent X posts for {ticker}. Crowd tone is {_label(score)}."
+        summary = f"Aggregated {len(top_tweets)} popular X posts about {ticker}. Crowd tone is {_label(score)}."
+        tweets = top_tweets
+
+    links: List[SourceLink] = []
+    if tweets:
+        for tweet in tweets[: max(3, min(max_results, 5))]:
+            tweet_id = str(tweet.get("id") or tweet.get("id_str") or "").strip()
+            if tweet_id:
+                url = f"https://x.com/i/web/status/{tweet_id}"
+            else:
+                screen_name = str(tweet.get("user_screen_name") or "").strip()
+                if screen_name:
+                    url = f"https://x.com/{screen_name}"
+                else:
+                    url = f"https://x.com/search?q=%24{ticker}"
+            text = re.sub(r"\s+", " ", str(tweet.get("text") or "")).strip()
+            title = (text[:176] + "...") if len(text) > 180 else (text or f"{ticker} on X")
+            links.append(SourceLink(source="X", title=title, url=url))
+    if not links:
+        links = [SourceLink(source="X", title=f"{ticker} search", url=f"https://x.com/search?q=%24{ticker}")]
 
     result = {
         "summary": summary,
-        "links": [SourceLink(source="X", title=f"{ticker} search", url=f"https://x.com/search?q=%24{ticker}")],
+        "links": links,
         "score": score,
-        "posts": tweets[:25],
+        "posts": tweets[:max_results],
     }
+    _x_store_cached_result(ticker, result, settings.x_api_cache_ttl_seconds)
     await log_agent_activity(
         module="research",
         agent_name="X Sentiment",
@@ -556,7 +730,6 @@ async def _x_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
 
 
 async def _reddit_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
-    headers = {"User-Agent": settings.reddit_user_agent or "TickerMaster/1.0"}
     company_aliases: List[str] = []
     try:
         lookup = await search_tickers(ticker, limit=1)
@@ -564,20 +737,9 @@ async def _reddit_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
             company_aliases = _company_alias_tokens(str(lookup[0].name or ""))
     except Exception:
         company_aliases = []
-    base_params = {
-        "q": f'"{ticker}" OR ${ticker} stock',
-        "sort": "top",
-        "t": "week",
-        "limit": 15,
-    }
+    base_query = f'"{ticker}" OR ${ticker} stock'
     posts: List[Dict[str, Any]] = []
     error_msg = ""
-
-    async def fetch_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        children = resp.json().get("data", {}).get("children", [])
-        return [child.get("data", {}) for child in children if isinstance(child, dict)]
 
     def normalize_permalink(post: Dict[str, Any]) -> str:
         permalink = str(post.get("permalink") or "").strip()
@@ -617,11 +779,16 @@ async def _reddit_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
             for match in re.findall(r"\$([A-Za-z]{1,5})\b", text)
             if match.upper() != ticker
         }
-        if not text_has_ticker and alias_match_count < 2:
+        if not text_has_ticker and alias_match_count < 1:
             return False
-        if other_cashtags and not text_has_ticker and alias_match_count < 3:
+        if other_cashtags and not text_has_ticker and alias_match_count < 2:
             return False
         return True
+
+    def post_engagement(post: Dict[str, Any]) -> float:
+        score = float(post.get("score") or 0.0)
+        comments = float(post.get("num_comments") or 0.0)
+        return (score * 0.02) + (comments * 0.06)
 
     def post_relevance(post: Dict[str, Any]) -> float:
         if not is_ticker_relevant(post):
@@ -715,53 +882,64 @@ async def _reddit_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
         )
 
     try:
-        async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
-            scoped_calls = [
-                fetch_json(
-                    client,
-                    f"https://www.reddit.com/r/{subreddit}/search.json",
-                    {**base_params, "restrict_sr": "on"},
-                )
-                for subreddit in REDDIT_FOCUS_SUBREDDITS
-            ]
-            scoped_results = await asyncio.gather(*scoped_calls)
-
-            merged: Dict[str, Dict[str, Any]] = {}
-            for batch in scoped_results:
-                for post in batch:
-                    if not isinstance(post, dict):
-                        continue
-                    if not is_allowed_subreddit(post):
-                        continue
-                    key = str(post.get("name") or post.get("id") or "")
-                    if not key:
-                        continue
-                    existing = merged.get(key)
-                    if not existing:
-                        merged[key] = post
-                        continue
-                    # Keep the richer record if one has longer body text.
-                    if len(str(post.get("selftext") or "")) > len(str(existing.get("selftext") or "")):
-                        merged[key] = post
-            posts = list(merged.values())
+        fetched_posts = await reddit_search_posts(
+            settings,
+            query=base_query,
+            sort="top",
+            timeframe="week",
+            limit=15,
+            timeout_seconds=15.0,
+        )
+        if not fetched_posts and company_aliases:
+            alias_query = " OR ".join(company_aliases[:2])
+            fetched_posts = await reddit_search_posts(
+                settings,
+                query=f'"{alias_query}" stock',
+                sort="top",
+                timeframe="week",
+                limit=15,
+                timeout_seconds=15.0,
+            )
+        merged: Dict[str, Dict[str, Any]] = {}
+        for post in fetched_posts:
+            if not isinstance(post, dict):
+                continue
+            key = str(post.get("name") or post.get("id") or "")
+            if not key:
+                continue
+            existing = merged.get(key)
+            if not existing:
+                merged[key] = post
+                continue
+            # Keep the richer record if one has longer body text.
+            if len(str(post.get("selftext") or "")) > len(str(existing.get("selftext") or "")):
+                merged[key] = post
+        posts = [row for row in merged.values() if is_allowed_subreddit(row)] or list(merged.values())
     except Exception as exc:
         error_msg = f"Reddit fetch failed: {exc}"
 
     if not posts:
-        summary = error_msg or f"No notable Reddit discussions captured for {ticker}."
+        summary = error_msg or f"Reddit discussion volume for {ticker} is limited right now; treating social read as neutral."
         score = 0.0
     else:
         relevant = [post for post in posts if is_ticker_relevant(post)]
         ranked = sorted(relevant, key=post_relevance, reverse=True)[:20] if relevant else []
         if not ranked:
-            summary = f"No sufficiently ticker-relevant Reddit threads found for {ticker} in core stock subreddits."
-            score = 0.0
-            posts = []
+            soft_ranked = sorted(posts, key=post_engagement, reverse=True)[:8]
+            posts = soft_ranked
+            joined = " ".join(post_blob(post) for post in soft_ranked)
+            score = _sentiment_score_from_text(joined) if joined else 0.0
+            summary = (
+                f"Captured {len(soft_ranked)} Reddit threads for {ticker}; direct ticker mentions were light, "
+                f"so this is a lower-confidence {_label(score)} read."
+            )
         else:
             posts = ranked
             joined = " ".join(post_blob(post) for post in ranked)
             score = _sentiment_score_from_text(joined)
             summary = build_reddit_summary(ranked, score)
+
+    link_ranker = post_relevance if any(is_ticker_relevant(post) for post in posts) else post_engagement
 
     result = {
         "summary": summary,
@@ -776,7 +954,7 @@ async def _reddit_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
                     title=re.sub(r"\s+", " ", str(post.get("title") or "")).strip()[:72] or f"{ticker} thread",
                     url=normalize_permalink(post),
                 )
-                for post in sorted(posts, key=post_relevance, reverse=True)[:6]
+                for post in sorted(posts, key=link_ranker, reverse=True)[:6]
             ]
         ),
         "score": score,
@@ -998,7 +1176,7 @@ async def run_research_with_source_selection(
 
 async def run_research(request: ResearchRequest, settings: Settings) -> ResearchResponse:
     ticker = request.ticker.upper().strip()
-    cache_key = f"research:v5:{request.timeframe}:{int(request.include_prediction_markets)}"
+    cache_key = f"research:v12:{request.timeframe}:{int(request.include_prediction_markets)}"
     cached = get_cached_research(ticker, cache_key)
     if cached:
         return ResearchResponse(**cached)
@@ -1035,6 +1213,12 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
 
     prediction_markets = []
     if request.include_prediction_markets:
+        await log_agent_activity(
+            module="research",
+            agent_name="Prediction Markets",
+            action=f"Fetching prediction markets for {ticker}",
+            status="running",
+        )
         company_name = ""
         try:
             lookup = await search_tickers(ticker, limit=1)
@@ -1052,46 +1236,44 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
             reverse=True,
         )
 
-        # Fallback: if no direct ticker markets exist, return macro/company-adjacent lines
-        # (Fed rates, CPI, jobs, etc.) so prediction panel is still actionable.
-        if len(prediction_markets) == 0:
-            fallback_queries = _macro_queries_for_context(ticker, company_name=company_name)
-            fallback_batches = await asyncio.gather(
-                *[
-                    asyncio.gather(
-                        fetch_kalshi_markets(query, settings, company_name=company_name),
-                        fetch_polymarket_markets(query, settings, company_name=company_name),
+        # Macro fallback should only apply to market-wide ETFs/indices.
+        # For single stocks, returning unrelated macro contracts is worse than returning none.
+        if not prediction_markets:
+            if ticker in _MACRO_FALLBACK_TICKERS:
+                macro_markets = await fetch_macro_fallback_markets(settings, limit=5)
+                if macro_markets:
+                    prediction_markets = macro_markets
+                    await log_agent_activity(
+                        module="research",
+                        agent_name="Prediction Markets",
+                        action=f"Using {len(macro_markets)} macro/economic markets as fallback for {ticker}",
+                        status="success",
+                        details={"fallback": True, "macro_count": len(macro_markets)},
                     )
-                    for query in fallback_queries
-                ]
+                else:
+                    await log_agent_activity(
+                        module="research",
+                        agent_name="Prediction Markets",
+                        action=f"No prediction markets found for {ticker}",
+                        status="pending",
+                        details={"kalshi_count": 0, "polymarket_count": 0, "macro_count": 0},
+                    )
+            else:
+                await log_agent_activity(
+                    module="research",
+                    agent_name="Prediction Markets",
+                    action=f"No prediction markets found for {ticker}",
+                    status="pending",
+                    details={"kalshi_count": 0, "polymarket_count": 0, "macro_count": 0},
+                )
+        else:
+            await log_agent_activity(
+                module="research",
+                agent_name="Prediction Markets",
+                action=f"Found {len(prediction_markets)} relevant prediction markets for {ticker}",
+                status="success",
+                details={"kalshi_count": len(kalshi_markets), "polymarket_count": len(polymarket_markets)},
             )
-            merged: Dict[str, Dict[str, Any]] = {}
-            for query, (kalshi_batch, poly_batch) in zip(fallback_queries, fallback_batches):
-                for item in [*(kalshi_batch or []), *(poly_batch or [])]:
-                    if not isinstance(item, dict):
-                        continue
-                    link = str(item.get("link") or "")
-                    market = str(item.get("market") or "")
-                    if not link and not market:
-                        continue
-                    key = f"{item.get('source','')}|{link}|{market}".lower()
-                    existing = merged.get(key)
-                    candidate = dict(item)
-                    # Keep macro fallback visible but below direct ticker contracts.
-                    base_score = float(candidate.get("relevance_score", 0.0) or 0.0)
-                    candidate["relevance_score"] = round(max(0.15, base_score * 0.55), 3)
-                    candidate["context"] = "macro-adjacent"
-                    candidate["query"] = query
-                    if existing is None or float(candidate.get("relevance_score", 0.0) or 0.0) > float(existing.get("relevance_score", 0.0) or 0.0):
-                        merged[key] = candidate
-            prediction_markets = sorted(
-                merged.values(),
-                key=lambda item: float(item.get("relevance_score", 0.0) or 0.0),
-                reverse=True,
-            )[:6]
-
-        if len(prediction_markets) == 0:
-            prediction_markets = _synthetic_prediction_fallback(ticker, company_name=company_name)
 
     # Composite weighting from spec: Perplexity 45%, Reddit 30%, X 25%
     aggregate = float((breakdown[0].score * 0.45) + (breakdown[2].score * 0.30) + (breakdown[1].score * 0.25))
@@ -1119,7 +1301,8 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
         prediction_markets=prediction_markets,
         tool_links=links,
     )
-    set_cached_research(ticker, cache_key, response.model_dump(), ttl_minutes=15)
+    # Keep research payload stable for a full day so repeated checks don't drift.
+    set_cached_research(ticker, cache_key, response.model_dump(), ttl_minutes=24 * 60)
     await log_agent_activity(
         module="research",
         agent_name="Composite Sentiment",

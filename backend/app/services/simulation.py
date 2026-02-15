@@ -17,6 +17,8 @@ from app.schemas import AgentConfig, SimulationStartRequest, SimulationState, Tr
 from app.services.agent_logger import log_agent_activity
 from app.services.llm import generate_agent_decision
 from app.services.market_data import fetch_sp500_returns_window
+from app.services.modal_engine import calibrate_personas
+from app.services.reddit_client import reddit_search_posts
 from app.services.simulation_store import complete_simulation_record, create_simulation_record
 from app.ws_manager import WSManager
 
@@ -311,6 +313,10 @@ class SimulationOrchestrator:
         self.sessions[session_id] = runtime
         self.tasks[session_id] = asyncio.create_task(self._run_loop(runtime), name=f"simulation-{session_id}")
 
+        # Calibrate known personas from public profiles (SEC 13F summaries) without blocking session start.
+        if request.inference_runtime == "modal" and runtime_agents:
+            asyncio.create_task(self._calibrate_runtime_personas(runtime), name=f"persona-calibration-{session_id}")
+
         await self.ws_manager.broadcast(
             {
                 "channel": "simulation",
@@ -335,6 +341,35 @@ class SimulationOrchestrator:
         )
 
         return self._to_state(runtime)
+
+    async def _calibrate_runtime_personas(self, runtime: SessionRuntime) -> None:
+        try:
+            configs = [entry.config for entry in runtime.agents.values()]
+            calibrated = await calibrate_personas(self.settings, configs, prefer_modal=True, max_concurrency=2)
+            updated = 0
+            for config in calibrated:
+                slot = runtime.agents.get(config.name)
+                if not slot:
+                    continue
+                slot.config = config
+                updated += 1
+
+            if updated:
+                await log_agent_activity(
+                    module="simulation",
+                    agent_name="Persona Calibrator",
+                    action=f"Updated {updated} persona configs from public profiles",
+                    status="success",
+                    details={"session_id": runtime.session_id, "updated": updated},
+                )
+        except Exception as exc:
+            await log_agent_activity(
+                module="simulation",
+                agent_name="Persona Calibrator",
+                action="Persona calibration failed",
+                status="error",
+                details={"session_id": runtime.session_id, "error": str(exc)},
+            )
 
     async def stop(self, session_id: str) -> bool:
         runtime = self.sessions.get(session_id)
@@ -581,28 +616,16 @@ class SimulationOrchestrator:
         if not symbol:
             return []
 
-        headers = {"User-Agent": self.settings.reddit_user_agent or "TickerMaster/1.0"}
-        params = {
-            "q": f"${symbol} OR {symbol} stock",
-            "restrict_sr": "false",
-            "sort": "new",
-            "t": "day",
-            "limit": 8,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=6.0, headers=headers) as client:
-                response = await client.get("https://www.reddit.com/search.json", params=params)
-                if response.status_code in {403, 429}:
-                    return []
-                response.raise_for_status()
-                payload = response.json()
-        except Exception:
-            return []
-
-        children = payload.get("data", {}).get("children", []) if isinstance(payload, dict) else []
+        children = await reddit_search_posts(
+            self.settings,
+            query=f"${symbol} OR {symbol} stock",
+            sort="new",
+            timeframe="day",
+            limit=8,
+            timeout_seconds=6.0,
+        )
         out: List[Dict[str, Any]] = []
-        for child in children[:6]:
-            post = child.get("data", {}) if isinstance(child, dict) else {}
+        for post in children[:6]:
             if not isinstance(post, dict):
                 continue
             title = str(post.get("title") or "").strip()

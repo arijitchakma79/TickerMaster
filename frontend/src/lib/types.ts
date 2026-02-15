@@ -319,6 +319,17 @@ export interface AgentConfig {
   active: boolean;
 }
 
+export interface SimulationAgentEntry {
+  config: AgentConfig;
+  iconEmoji?: string;
+  editor?: {
+    risk: number;
+    tempo: number;
+    style: number;
+    news: number;
+  };
+}
+
 export interface TradeRecord {
   timestamp: string;
   session_id: string;
@@ -387,6 +398,9 @@ export interface ModalSandboxResponse {
   app_dashboard_url?: string;
   sandbox_dashboard_url?: string;
   prompt_preview?: string;
+  generated_code_preview?: string;
+  codegen_source?: string;
+  codegen_model?: string;
   stdout_preview?: string[];
   metadata?: Record<string, unknown>;
   link?: string;
