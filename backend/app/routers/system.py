@@ -45,7 +45,16 @@ async def integrations(request: Request):
         "kalshi": bool(settings.kalshi_api_key),
         "polymarket": True,
         "modal": bool(settings.modal_token_id),
-        "poke_recipe": bool(settings.poke_recipe_enabled),
+        "poke_api": bool(settings.poke_api_key),
+        "poke_recipe": bool(settings.poke_recipe_enabled and settings.poke_api_key),
+        "twilio": bool(settings.twilio_account_sid and settings.twilio_auth_token and settings.twilio_from_number),
+        "twilio_whatsapp": bool(
+            settings.twilio_account_sid
+            and settings.twilio_auth_token
+            and (settings.twilio_whatsapp_from_number or settings.twilio_from_number)
+        ),
+        "twilio_mode": "whatsapp" if settings.twilio_use_whatsapp else "sms",
         "cerebras": bool(settings.cerebras_api_key),
         "nvidia_nim": bool(settings.nvidia_nim_api_key),
+        "tracker_mcp_router": bool(settings.mcp_tracker_router_enabled),
     }

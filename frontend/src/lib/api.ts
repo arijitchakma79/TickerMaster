@@ -15,8 +15,11 @@ import type {
   ResearchChatResponse,
   ResearchResponse,
   TrackerAgent,
+  TrackerAgentContext,
+  TrackerAgentHistoryItem,
   TrackerAgentDetail,
   TrackerAgentInteractResponse,
+  TrackerSymbolResolution,
   SimulationState,
   TickerLookup,
   TrackerSnapshot
@@ -94,6 +97,22 @@ function networkErrorMessage(feature: string): Error {
   return new Error(
     `${feature} could not reach backend at ${API_URL}. Ensure backend is running and FRONTEND_ORIGINS includes your frontend URL.`
   );
+}
+
+function extractBackendError(error: unknown): string | null {
+  if (!axios.isAxiosError(error)) return null;
+  const payload = error.response?.data as
+    | {
+        detail?: unknown;
+        error?: unknown;
+        message?: unknown;
+      }
+    | undefined;
+  const detail = payload?.detail ?? payload?.error ?? payload?.message;
+  if (typeof detail === "string" && detail.trim()) {
+    return detail.trim();
+  }
+  return null;
 }
 
 function parseJwtUserId(token?: string): string | null {
@@ -394,8 +413,9 @@ export async function triggerTrackerPoll(): Promise<TrackerSnapshot> {
   return data;
 }
 
-export async function getTrackerSnapshot(): Promise<TrackerSnapshot> {
-  const { data } = await client.get<TrackerSnapshot>("/tracker/snapshot");
+export async function getTrackerSnapshot(tickers?: string[]): Promise<TrackerSnapshot> {
+  const params = Array.isArray(tickers) && tickers.length > 0 ? { tickers: tickers.join(",") } : undefined;
+  const { data } = await client.get<TrackerSnapshot>("/tracker/snapshot", { params });
   return data;
 }
 
@@ -424,8 +444,21 @@ export type UserProfilePayload = {
   email?: string;
   display_name?: string;
   avatar_url?: string;
+  phone_number?: string;
   poke_enabled?: boolean;
   tutorial_completed?: boolean;
+};
+
+export type NotificationPreferencesPayload = {
+  phone_number?: string | null;
+  email?: string | null;
+  preferred_channel: "sms" | "email" | "push";
+  alert_frequency: "realtime" | "hourly" | "daily";
+  price_alerts: boolean;
+  volume_alerts: boolean;
+  simulation_summary: boolean;
+  quiet_start: string;
+  quiet_end: string;
 };
 
 export async function getUserProfile(): Promise<{
@@ -446,6 +479,7 @@ export async function getUserProfile(): Promise<{
 export async function updateUserPreferences(payload: {
   display_name?: string;
   avatar_data_url?: string;
+  phone_number?: string;
   poke_enabled?: boolean;
   tutorial_completed?: boolean;
   watchlist?: string[];
@@ -454,6 +488,39 @@ export async function updateUserPreferences(payload: {
   try {
     const { data } = await client.patch<{ ok: boolean; profile?: UserProfilePayload | null; require_username_setup?: boolean }>(
       "/api/user/preferences",
+      payload,
+    );
+    return data;
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      const detail =
+        (error.response?.data as { detail?: unknown; error?: unknown } | undefined)?.detail ??
+        (error.response?.data as { detail?: unknown; error?: unknown } | undefined)?.error;
+      if (typeof detail === "string" && detail.trim()) {
+        throw new Error(detail.trim());
+      }
+    }
+    throw error;
+  }
+}
+
+export async function getNotificationPreferences(): Promise<{
+  user_id: string | null;
+  preferences: NotificationPreferencesPayload | null;
+}> {
+  const { data } = await client.get<{
+    user_id: string | null;
+    preferences: NotificationPreferencesPayload | null;
+  }>("/api/user/notification-preferences");
+  return data;
+}
+
+export async function updateNotificationPreferences(
+  payload: Partial<NotificationPreferencesPayload>,
+): Promise<{ ok: boolean; preferences?: NotificationPreferencesPayload | null }> {
+  try {
+    const { data } = await client.put<{ ok: boolean; preferences?: NotificationPreferencesPayload | null }>(
+      "/api/user/notification-preferences",
       payload,
     );
     return data;
@@ -660,13 +727,43 @@ export async function askResearchQuery(payload: {
 }
 
 export async function createTrackerAgent(payload: {
-  symbol: string;
-  name: string;
+  symbol?: string;
+  name?: string;
   triggers: Record<string, unknown>;
   auto_simulate?: boolean;
+  create_prompt?: string;
 }): Promise<TrackerAgent> {
-  const { data } = await client.post<TrackerAgent>("/api/tracker/agents", payload);
-  return data;
+  try {
+    const { data } = await client.post<TrackerAgent>("/api/tracker/agents", payload);
+    return data;
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      const payloadData = error.response?.data as
+        | {
+            detail?: unknown;
+            message?: unknown;
+            symbol_resolution?: TrackerSymbolResolution;
+          }
+        | undefined;
+      const detail = typeof payloadData?.detail === "string" ? payloadData.detail : extractBackendError(error);
+      const message =
+        (typeof payloadData?.message === "string" && payloadData.message.trim()) ||
+        detail ||
+        "Could not create tracker agent.";
+      const wrapped = new Error(message) as Error & {
+        status?: number;
+        detail?: string;
+        symbol_resolution?: TrackerSymbolResolution;
+      };
+      wrapped.status = error.response?.status;
+      if (typeof payloadData?.detail === "string") wrapped.detail = payloadData.detail;
+      if (payloadData?.symbol_resolution && typeof payloadData.symbol_resolution === "object") {
+        wrapped.symbol_resolution = payloadData.symbol_resolution;
+      }
+      throw wrapped;
+    }
+    throw error;
+  }
 }
 
 export async function listTrackerAgents(): Promise<TrackerAgent[]> {
@@ -684,18 +781,91 @@ export async function getTrackerAgentDetail(agentId: string): Promise<TrackerAge
   return data;
 }
 
+export async function getTrackerAgentHistory(agentId: string, limit = 20): Promise<TrackerAgentHistoryItem[]> {
+  try {
+    const { data } = await client.get<{ items?: TrackerAgentHistoryItem[] }>(`/api/tracker/agents/${agentId}/history`, {
+      params: { limit }
+    });
+    return Array.isArray(data.items) ? data.items : [];
+  } catch (error) {
+    const detail = extractBackendError(error);
+    if (detail) throw new Error(detail);
+    throw error;
+  }
+}
+
 export async function createTrackerAgentByPrompt(prompt: string, userId?: string) {
-  const { data } = await client.post<{ ok: boolean; agent: TrackerAgent; parsed: Record<string, unknown> }>(
-    "/api/tracker/agents/nl-create",
-    { prompt, user_id: userId }
-  );
-  return data;
+  const resolvedUserId = userId ?? authSession?.user?.id;
+  try {
+    const { data } = await client.post<{ ok: boolean; agent: TrackerAgent; parsed: Record<string, unknown> }>(
+      "/api/tracker/agents/nl-create",
+      { prompt, user_id: resolvedUserId }
+    );
+    return data;
+  } catch (error) {
+    const detail = extractBackendError(error);
+    if (detail) throw new Error(detail);
+    throw error;
+  }
 }
 
 export async function interactWithTrackerAgent(agentId: string, message: string, userId?: string): Promise<TrackerAgentInteractResponse> {
-  const { data } = await client.post<TrackerAgentInteractResponse>(`/api/tracker/agents/${agentId}/interact`, {
-    message,
-    user_id: userId
-  });
-  return data;
+  const resolvedUserId = userId ?? authSession?.user?.id;
+  try {
+    const { data } = await client.post<TrackerAgentInteractResponse>(`/api/tracker/agents/${agentId}/interact`, {
+      message,
+      user_id: resolvedUserId
+    });
+    return data;
+  } catch (error) {
+    const detail = extractBackendError(error);
+    if (detail) throw new Error(detail);
+    throw error;
+  }
+}
+
+export async function getTrackerAgentContext(
+  agentId: string,
+  options?: { run_limit?: number; history_limit?: number; csv_limit?: number },
+): Promise<TrackerAgentContext> {
+  try {
+    const { data } = await client.get<TrackerAgentContext>(`/api/tracker/agents/${agentId}/context`, {
+      params: options
+    });
+    return data;
+  } catch (error) {
+    const detail = extractBackendError(error);
+    if (detail) throw new Error(detail);
+    throw error;
+  }
+}
+
+export async function queryTrackerAgentContext(
+  agentId: string,
+  question: string,
+  options?: { run_limit?: number; history_limit?: number; csv_limit?: number; user_id?: string },
+): Promise<{
+  ok: boolean;
+  answer: { response: string; model: string; generated_at: string };
+  context_meta?: Record<string, unknown>;
+}> {
+  const resolvedUserId = options?.user_id ?? authSession?.user?.id;
+  try {
+    const { data } = await client.post<{
+      ok: boolean;
+      answer: { response: string; model: string; generated_at: string };
+      context_meta?: Record<string, unknown>;
+    }>(`/api/tracker/agents/${agentId}/context-query`, {
+      question,
+      user_id: resolvedUserId,
+      run_limit: options?.run_limit,
+      history_limit: options?.history_limit,
+      csv_limit: options?.csv_limit
+    });
+    return data;
+  } catch (error) {
+    const detail = extractBackendError(error);
+    if (detail) throw new Error(detail);
+    throw error;
+  }
 }

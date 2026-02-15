@@ -784,9 +784,7 @@ export default function App() {
                   onTickerChange={setTicker}
                   trackerEvent={lastTrackerSnapshot}
                   watchlist={watchlist}
-                  favorites={favoriteStocks}
                   onWatchlistChange={handleWatchlistChange}
-                  onToggleFavorite={handleToggleFavorite}
                 />
               ) : null}
             </div>
@@ -800,7 +798,7 @@ export default function App() {
               />
             ) : null}
             {tab === "tracker" ? (
-              <TrackerPrefsRail connected={connected} />
+              <TrackerPrefsRail connected={connected} userId={authSession?.user?.id ?? null} />
             ) : null}
           </main>
         </>

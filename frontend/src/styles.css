@@ -3079,6 +3079,113 @@ pre {
   overflow: visible;
 }
 
+.tracker-create-open {
+  align-self: flex-start;
+}
+
+.tracker-agent-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+}
+
+.tracker-agent-meta {
+  margin-bottom: 0;
+}
+
+.tracker-agent-settings {
+  line-height: 1.45;
+}
+
+.tracker-agent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tracker-context-block {
+  display: grid;
+  gap: 8px;
+}
+
+.tracker-context-input {
+  min-height: 132px;
+  line-height: 1.5;
+  font-size: 0.94rem;
+}
+
+.tracker-context-answer {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 11px 12px;
+  background: var(--card-soft-bg-3);
+  white-space: pre-wrap;
+  line-height: 1.52;
+}
+
+.tracker-create-modal {
+  width: min(880px, 96vw);
+  max-height: min(92vh, 980px);
+  overflow: auto;
+}
+
+.tracker-create-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.tracker-create-grid .full-span {
+  grid-column: 1 / -1;
+}
+
+.tracker-fieldset {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  background: var(--card-soft-bg-3);
+}
+
+.tracker-fieldset-title {
+  margin: 0 0 8px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.tracker-check-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.tracker-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: "Manrope", "SF Pro Display", "Helvetica Neue", sans-serif;
+  color: var(--ink-soft);
+}
+
+.tracker-check input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+}
+
+.tracker-check-inline {
+  justify-content: space-between;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--field-bg);
+}
+
+.tracker-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .watchlist-add-field {
   min-width: min(460px, 100%);
 }
@@ -3326,7 +3433,9 @@ pre {
 
 .tracker-pref-check {
   display: flex;
+  flex-direction: row;
   align-items: center;
+  justify-content: flex-start;
   gap: 8px;
   font-family: "Manrope", "SF Pro Display", "Helvetica Neue", sans-serif;
   color: var(--ink-soft);
@@ -3341,6 +3450,11 @@ pre {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
+}
+
+.tracker-quiet-hours-actions {
+  display: grid;
+  gap: 6px;
 }
 
 .board-meta {
@@ -3667,6 +3781,14 @@ time {
   .kpi-grid {
     grid-template-columns: 1fr;
   }
+
+  .tracker-create-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .tracker-check-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 640px) {
@@ -3787,5 +3909,9 @@ time {
 
   .top-nav-left .top-nav-link + .top-nav-link {
     margin-left: 8px;
+  }
+
+  .tracker-check-grid {
+    grid-template-columns: 1fr;
   }
 }

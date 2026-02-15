@@ -98,8 +98,27 @@ def _sanitize_tracker_triggers(raw: dict[str, Any] | None) -> dict[str, Any]:
 
 
 @router.get("/snapshot")
-async def snapshot(request: Request):
+async def snapshot(request: Request, tickers: str | None = None):
+    explicit: list[str] = []
+    if isinstance(tickers, str) and tickers.strip():
+        seen: set[str] = set()
+        for raw in tickers.split(","):
+            symbol = raw.strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            explicit.append(symbol)
+        explicit = explicit[:120]
+
     user_id = get_user_id_from_request(request)
+    if explicit:
+        metrics = await asyncio.to_thread(fetch_watchlist_metrics, explicit)
+        alerts = tracker_repo.list_alerts(user_id=user_id, limit=8) if user_id else []
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "tickers": [item.model_dump() for item in metrics],
+            "alerts_triggered": alerts,
+        }
     if user_id:
         watchlist = get_persisted_watchlist(user_id)
         metrics = await asyncio.to_thread(fetch_watchlist_metrics, watchlist) if watchlist else []
@@ -171,10 +190,15 @@ async def list_tracker_agents(request: Request, user_id: str | None = None):
 
 @router.patch("/agents/{agent_id}")
 async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, request: Request, user_id: str | None = None):
-    resolved_user_id = user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
+    existing = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
+    if existing is None:
+        return {"error": "not_found"}
     updates = payload.model_dump(exclude_none=True)
     if "triggers" in updates and isinstance(updates.get("triggers"), dict):
-        updates["triggers"] = _sanitize_tracker_triggers(updates["triggers"])
+        base_triggers = existing.get("triggers") if isinstance(existing.get("triggers"), dict) else {}
+        merged_triggers = {**base_triggers, **updates["triggers"]}
+        updates["triggers"] = _sanitize_tracker_triggers(merged_triggers)
     item = tracker_repo.update_agent(user_id=resolved_user_id, agent_id=agent_id, updates=updates)
     return item or {"error": "not_found"}
 

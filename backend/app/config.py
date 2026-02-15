@@ -76,6 +76,8 @@ class Settings:
     supabase_key: str = ""
     supabase_service_key: str = ""
     supabase_avatar_bucket: str = "avatars"
+    supabase_tracker_exports_bucket: str = "tracker-exports"
+    supabase_tracker_memory_bucket: str = "tracker-memory"
     database_url: str = ""
 
     alpaca_api_key: str = ""
@@ -138,13 +140,24 @@ class Settings:
     poke_recipe_enabled: bool = True
     poke_api_key: str = ""
     poke_recipe_slug: str = ""
+    poke_api_url: str = "https://poke.com/api/v1"
     poke_kitchen_url: str = "https://poke.com/kitchen"
+
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_from_number: str = ""
+    twilio_whatsapp_from_number: str = ""
+    twilio_use_whatsapp: bool = False
+    twilio_default_to_number: str = ""
 
     cerebras_api_key: str = ""
     nvidia_nim_api_key: str = ""
 
-    tracker_poll_interval_seconds: int = 60
+    tracker_poll_interval_seconds: int = 120
     default_watchlist: List[str] = field(default_factory=lambda: ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"])
+    mcp_tracker_router_enabled: bool = True
+    mcp_tracker_server_command: str = ""
+    mcp_tracker_timeout_seconds: int = 6
 
 
 def _is_http_url(value: str) -> bool:
@@ -180,6 +193,8 @@ def get_settings() -> Settings:
         supabase_key=_env("SUPABASE_KEY"),
         supabase_service_key=_env("SUPABASE_SERVICE_KEY"),
         supabase_avatar_bucket=_env("SUPABASE_AVATAR_BUCKET", "avatars"),
+        supabase_tracker_exports_bucket=_env("SUPABASE_TRACKER_EXPORTS_BUCKET", "tracker-exports"),
+        supabase_tracker_memory_bucket=_env("SUPABASE_TRACKER_MEMORY_BUCKET", "tracker-memory"),
         database_url=_env("DATABASE_URL"),
         alpaca_api_key=_env("ALPACA_API_KEY") or _env("APCA_API_KEY_ID"),
         alpaca_api_secret=_env("ALPACA_API_SECRET") or _env("APCA_API_SECRET_KEY"),
@@ -230,11 +245,21 @@ def get_settings() -> Settings:
         poke_recipe_enabled=_env_bool("POKE_RECIPE_ENABLED", True),
         poke_api_key=_env("POKE_API_KEY"),
         poke_recipe_slug=_env("POKE_RECIPE_SLUG"),
+        poke_api_url=_env("POKE_API", "https://poke.com/api/v1"),
         poke_kitchen_url=_env("POKE_KITCHEN_URL", "https://poke.com/kitchen"),
+        twilio_account_sid=_env("TWILIO_ACCOUNT_SID"),
+        twilio_auth_token=_env("TWILIO_AUTH_TOKEN"),
+        twilio_from_number=_env("TWILIO_FROM_NUMBER"),
+        twilio_whatsapp_from_number=_env("TWILIO_WHATSAPP_FROM_NUMBER") or _env("TWILIO_WHATSAPP_FROM"),
+        twilio_use_whatsapp=_env_bool("TWILIO_USE_WHATSAPP", False),
+        twilio_default_to_number=_env("TWILIO_DEFAULT_TO_NUMBER"),
         cerebras_api_key=_env("CEREBRAS_API_KEY"),
         nvidia_nim_api_key=_env("NVIDIA_NIM_API_KEY"),
-        tracker_poll_interval_seconds=_env_int("TRACKER_POLL_INTERVAL_SECONDS", 60),
+        tracker_poll_interval_seconds=_env_int("TRACKER_POLL_INTERVAL_SECONDS", 120),
         default_watchlist=_env_list("DEFAULT_WATCHLIST", ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"]),
+        mcp_tracker_router_enabled=_env_bool("MCP_TRACKER_ROUTER_ENABLED", True),
+        mcp_tracker_server_command=_env("MCP_TRACKER_SERVER_COMMAND"),
+        mcp_tracker_timeout_seconds=_env_int("MCP_TRACKER_TIMEOUT_SECONDS", 6),
     )
     _validate_settings(settings)
     return settings

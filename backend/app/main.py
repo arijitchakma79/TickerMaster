@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,25 +13,40 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.routers import api, chat, research, simulation, system, tracker
 from app.services.activity_stream import set_ws_manager
+from app.services.mcp_tool_router import shutdown_tracker_mcp_router
 from app.services.simulation import SimulationOrchestrator
 from app.services.tracker import TrackerService
+from app.services.tracker_csv import ensure_tracker_storage_buckets
 from app.ws_manager import WSManager
 
 logger = logging.getLogger(__name__)
 
+# Avoid noisy WinError 10054 callback traces from Proactor transport shutdown
+# when local clients disconnect abruptly after successful responses.
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     ws_manager = WSManager()
     orchestrator = SimulationOrchestrator(settings, ws_manager)
-    tracker_service = TrackerService(settings, ws_manager)
+    tracker_service = TrackerService(settings, ws_manager, orchestrator=orchestrator)
 
     app.state.settings = settings
     app.state.ws_manager = ws_manager
     app.state.orchestrator = orchestrator
     app.state.tracker = tracker_service
     set_ws_manager(ws_manager)
+    try:
+        buckets_ready = await asyncio.to_thread(ensure_tracker_storage_buckets)
+        if not buckets_ready:
+            logger.warning("One or more tracker storage buckets are not ready on startup.")
+    except Exception:
+        logger.exception("Failed to ensure Supabase tracker storage buckets on startup.")
 
     try:
         await tracker_service.start()
@@ -39,11 +56,27 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for session_id in list(orchestrator.sessions.keys()):
+        try:
+            await tracker_service.stop()
+        except Exception:
+            logger.exception("Failed to stop tracker service")
+
+        session_ids: list[Any]
+        try:
+            session_ids = list(orchestrator.sessions.keys())  # type: ignore[union-attr]
+        except Exception:
+            session_ids = list(orchestrator.sessions)  # type: ignore[arg-type]
+
+        for session_id in session_ids:
             try:
                 await orchestrator.stop(session_id)
             except Exception:
                 logger.exception("Failed to stop simulation session %s", session_id)
+
+        try:
+            await shutdown_tracker_mcp_router()
+        except Exception:
+            logger.exception("Failed to shutdown tracker MCP router")
 
 
 settings = get_settings()
