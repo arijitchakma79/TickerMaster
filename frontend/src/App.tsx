@@ -614,7 +614,7 @@ export default function App() {
             >
               <span className="tab-inner">
                 <span className="tab-icon arena" aria-hidden="true">
-                  🛡️⚔️
+                  🤖⚔️
                 </span>
                 <span>Simulation</span>
               </span>

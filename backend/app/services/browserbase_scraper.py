@@ -297,6 +297,17 @@ async def run_deep_research(symbol: str, settings: Settings) -> Dict[str, Any]:
     recent_news = news_res if isinstance(news_res, list) else []
     reddit_highlights, reddit_dd_summary = reddit_res if isinstance(reddit_res, tuple) else ([], f"Reddit data unavailable for {ticker}.")
 
+    if _safe_float(price_target.get("target_mean")) is None:
+        advanced_target_mean = _safe_float(advanced.get("target_mean_price"))
+        if advanced_target_mean is not None:
+            price_target = {
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "target_high": _safe_float(price_target.get("target_high")),
+                "target_low": _safe_float(price_target.get("target_low")),
+                "target_mean": advanced_target_mean,
+                "target_median": _safe_float(price_target.get("target_median")),
+            }
+
     insider_highlights = _insider_highlights(list(advanced.get("insider_transactions") or []))
     insider_trading = _build_insider_summary(ticker, insider_highlights)
     analyst_ratings = _build_analyst_summary(ticker, recommendation_timeline, price_target)

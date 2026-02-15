@@ -1142,7 +1142,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
         </div>
 
         <div className="glass-card">
-          <h3>Other Resources</h3>
+          <h3>Public Voices</h3>
           <div className="stack small-gap">
             {[xEntry, redditEntry].filter((item): item is NonNullable<typeof item> => Boolean(item)).map((entry) => (
               <article key={entry.source} className="source-item">
