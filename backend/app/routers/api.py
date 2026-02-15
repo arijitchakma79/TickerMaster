@@ -59,6 +59,12 @@ def _require_user_id(request: Request, explicit_user_id: str | None = None) -> s
     return user_id
 
 
+def _strict_tracker_persistence(request: Request) -> bool:
+    settings = getattr(request.app.state, "settings", None)
+    environment = str(getattr(settings, "environment", "development")).strip().lower()
+    return environment == "production"
+
+
 class PokeInboundRequest(BaseModel):
     message: str
 
@@ -1426,6 +1432,7 @@ async def _notify_agent_created_twilio(
 @router.post("/tracker/agents")
 async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Request, user_id: str | None = None) -> dict[str, Any]:
     resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
+    strict_persistence = _strict_tracker_persistence(request)
     create_prompt = str(payload.create_prompt or "").strip()
     parsed_prompt: dict[str, Any] = {}
     if create_prompt:
@@ -1474,7 +1481,7 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
             name=name,
             triggers=clean_triggers,
             auto_simulate=auto_simulate,
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1491,7 +1498,7 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
                 if not create_prompt
                 else "Agent created via structured tracker create endpoint with initial manager prompt."
             ),
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
         if bool(symbol_resolution.get("auto_corrected")):
             tracker_repo.create_history(
@@ -1504,7 +1511,7 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
                     f"Symbol auto-corrected from {symbol_resolution.get('input_symbol')} "
                     f"to {symbol_resolution.get('resolved_symbol')} (confidence={symbol_resolution.get('confidence')})."
                 ),
-                strict_persistence=True,
+                strict_persistence=strict_persistence,
             )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1843,6 +1850,7 @@ async def delete_tracker_agent(agent_id: str, request: Request, user_id: str | N
 @router.post("/tracker/agents/nl-create")
 async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Request) -> dict[str, Any]:
     resolved_user_id = _require_user_id(request, explicit_user_id=payload.user_id)
+    strict_persistence = _strict_tracker_persistence(request)
     settings = request.app.state.settings
     parsed = await parse_tracker_instruction(settings, payload.prompt)
 
@@ -1870,7 +1878,7 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
             name=name,
             triggers=triggers,
             auto_simulate=auto_simulate,
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1884,7 +1892,7 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
             parsed_intent=parsed if isinstance(parsed, dict) else {},
             trigger_snapshot=agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {},
             note="Agent created from prompt.",
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
         if bool(symbol_resolution.get("auto_corrected")):
             tracker_repo.create_history(
@@ -1897,7 +1905,7 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
                     f"Symbol auto-corrected from {symbol_resolution.get('input_symbol')} "
                     f"to {symbol_resolution.get('resolved_symbol')} (confidence={symbol_resolution.get('confidence')})."
                 ),
-                strict_persistence=True,
+                strict_persistence=strict_persistence,
             )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1952,6 +1960,7 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
 @router.post("/tracker/agents/{agent_id}/interact")
 async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractRequest, request: Request) -> dict[str, Any]:
     resolved_user_id = _require_user_id(request, explicit_user_id=payload.user_id)
+    strict_persistence = _strict_tracker_persistence(request)
     agent = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if agent is None:
         return {"ok": False, "error": "not_found"}
@@ -2098,7 +2107,7 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
             trigger_snapshot=agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {},
             tool_outputs=tool_outputs,
             note=f"Manager instruction processed with intent {intent or 'conversation'}.",
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
         tracker_repo.create_history(
             user_id=resolved_user_id,
@@ -2109,7 +2118,7 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
             trigger_snapshot=agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {},
             tool_outputs=tool_outputs,
             note=str(reply.get("response") or ""),
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
