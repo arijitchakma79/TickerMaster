@@ -263,6 +263,18 @@ def _fallback_tracker_intent(prompt: str) -> Dict[str, Any]:
     symbol = symbol_match.group(0) if symbol_match else "AAPL"
     threshold_match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
     threshold = float(threshold_match.group(1)) if threshold_match else 2.0
+    interval_match = re.search(r"every\s+(\d+)\s*(second|sec|minute|min|hour|hr)s?\b", text, flags=re.IGNORECASE)
+    poll_interval_seconds = 120
+    if interval_match:
+        magnitude = int(interval_match.group(1))
+        unit = interval_match.group(2).lower()
+        if unit.startswith("sec"):
+            poll_interval_seconds = max(30, magnitude)
+        elif unit.startswith("hour") or unit == "hr":
+            poll_interval_seconds = max(30, magnitude * 3600)
+        else:
+            poll_interval_seconds = max(30, magnitude * 60)
+
     lower = text.lower()
     intent = "create_agent"
     if "pause" in lower or "stop" in lower:
@@ -271,18 +283,84 @@ def _fallback_tracker_intent(prompt: str) -> Dict[str, Any]:
         intent = "delete_agent"
     elif "status" in lower or "what are you seeing" in lower:
         intent = "status"
+
+    tools = ["price", "volume", "sentiment", "news"]
+    if "prediction" in lower or "kalshi" in lower or "polymarket" in lower:
+        tools.append("prediction_markets")
+    if "deep research" in lower or "browserbase" in lower:
+        tools.append("deep_research")
+    if "simulate" in lower or "sandbox" in lower or "scenario" in lower or "backtest" in lower:
+        tools.append("simulation")
+
+    research_sources = []
+    if "perplexity" in lower:
+        research_sources.append("perplexity")
+    if "reddit" in lower:
+        research_sources.append("reddit")
+    if " x " in f" {lower} " or "twitter" in lower:
+        research_sources.append("x")
+    if "prediction" in lower:
+        research_sources.append("prediction_markets")
+    if not research_sources:
+        research_sources = ["perplexity", "x", "reddit"]
+
+    notify_channels = ["twilio"] if any(token in lower for token in {"sms", "text", "twilio"}) else ["twilio", "poke"]
+    phone_match = re.search(r"(\+?\d[\d\-\s\(\)]{8,}\d)", text)
+    notify_phone = phone_match.group(1).strip() if phone_match else ""
+
+    wants_reports = any(token in lower for token in {"report every", "summary every", "update every", "send report", "scheduled report"})
+    wants_alerts = any(token in lower for token in {"alert", "trigger", "notify me when", "if it", "if price"})
+    if wants_reports and wants_alerts:
+        report_mode = "hybrid"
+    elif wants_reports:
+        report_mode = "periodic"
+    else:
+        report_mode = "triggers_only"
+
+    schedule_mode = "custom" if interval_match else "realtime"
+    if "hourly" in lower:
+        schedule_mode = "hourly"
+        poll_interval_seconds = 3600
+    if "daily" in lower:
+        schedule_mode = "daily"
+        poll_interval_seconds = 86400
+
+    baseline_mode = "prev_close"
+    if "from open" in lower or "session open" in lower:
+        baseline_mode = "session_open"
+    elif "from last check" in lower:
+        baseline_mode = "last_check"
+    elif "from last alert" in lower:
+        baseline_mode = "last_alert"
+
     return {
         "intent": intent,
         "symbol": symbol,
         "name": f"{symbol} Associate",
-        "auto_simulate": "simulate" in lower,
+        "auto_simulate": "simulate" in lower or "sandbox" in lower or "backtest" in lower,
         "triggers": {
             "price_change_pct": threshold,
             "volume_spike_ratio": 1.8,
             "sentiment_bearish_threshold": -0.25,
             "sentiment_bullish_threshold": 0.25,
+            "tools": list(dict.fromkeys(tools)),
+            "research_sources": list(dict.fromkeys(research_sources)),
+            "poll_interval_seconds": poll_interval_seconds,
+            "report_interval_seconds": poll_interval_seconds,
+            "report_mode": report_mode,
+            "schedule_mode": schedule_mode,
+            "daily_run_time": "09:30",
+            "timezone": "America/New_York",
+            "baseline_mode": baseline_mode,
+            "tool_mode": "manual" if tools else "auto",
+            "notify_channels": notify_channels,
+            "notify_phone": notify_phone[:40] if notify_phone else "",
+            "simulate_on_alert": "simulate" in lower or "sandbox" in lower,
         },
-        "response": f"Prepared {intent} plan for {symbol} with {threshold:.2f}% price trigger and sentiment checks.",
+        "response": (
+            f"Prepared {intent} plan for {symbol} with {threshold:.2f}% price trigger, "
+            f"{poll_interval_seconds}s cadence, report_mode={report_mode}, and tools: {', '.join(dict.fromkeys(tools))}."
+        ),
     }
 
 
@@ -295,7 +373,15 @@ async def parse_tracker_instruction(settings: Settings, prompt: str) -> Dict[str
         "intent(create_agent|update_agent|delete_agent|pause_agent|resume_agent|status|research_note), "
         "symbol, name, auto_simulate(boolean), triggers(object), response(string). "
         "triggers should include any of: price_change_pct, volume_spike_ratio, sentiment_bearish_threshold, "
-        "sentiment_bullish_threshold, x_bearish_threshold, rsi_low, rsi_high. "
+        "sentiment_bullish_threshold, x_bearish_threshold, rsi_low, rsi_high, "
+        "poll_interval_seconds, report_interval_seconds, report_mode(triggers_only|periodic|hybrid), "
+        "schedule_mode(realtime|hourly|daily|custom), daily_run_time(HH:MM), timezone(IANA), "
+        "start_at(ISO8601 datetime in UTC), "
+        "baseline_mode(prev_close|last_check|last_alert|session_open), tool_mode(auto|manual), "
+        "simulate_on_alert, notify_channels(array), notify_phone, tools(array), research_sources(array). "
+        "tools values: price, volume, sentiment, news, prediction_markets, deep_research, simulation. "
+        "research_sources values: perplexity, x, reddit, prediction_markets, deep. "
+        "notify_channels values: twilio, poke. "
         "No markdown."
     )
     payload = {
@@ -320,6 +406,19 @@ async def parse_tracker_instruction(settings: Settings, prompt: str) -> Dict[str
                 return _fallback_tracker_intent(prompt)
             parsed.setdefault("triggers", {})
             parsed.setdefault("auto_simulate", False)
+            if isinstance(parsed.get("triggers"), dict):
+                parsed["triggers"].setdefault("poll_interval_seconds", 120)
+                parsed["triggers"].setdefault("report_interval_seconds", parsed["triggers"].get("poll_interval_seconds", 120))
+                parsed["triggers"].setdefault("report_mode", "triggers_only")
+                parsed["triggers"].setdefault("schedule_mode", "realtime")
+                parsed["triggers"].setdefault("daily_run_time", "09:30")
+                parsed["triggers"].setdefault("timezone", "America/New_York")
+                parsed["triggers"].setdefault("baseline_mode", "prev_close")
+                parsed["triggers"].setdefault("tool_mode", "auto")
+                parsed["triggers"].setdefault("tools", ["price", "volume", "sentiment", "news"])
+                parsed["triggers"].setdefault("research_sources", ["perplexity", "x", "reddit"])
+                parsed["triggers"].setdefault("notify_channels", ["twilio", "poke"])
+                parsed["triggers"].setdefault("simulate_on_alert", bool(parsed.get("auto_simulate")))
             parsed.setdefault("response", "Instruction parsed.")
             return parsed
     except Exception:
@@ -332,23 +431,29 @@ async def tracker_agent_chat_response(
     market_state: Dict[str, Any],
     research_state: Dict[str, Any],
     user_message: str,
+    memory_context: Dict[str, Any] | None = None,
 ) -> Dict[str, str]:
+    memory_context = memory_context or {}
     if not settings.openai_api_key:
         symbol = str(agent.get("symbol", ""))
         sentiment = float(research_state.get("aggregate_sentiment", 0.0))
+        latest_instruction = str(memory_context.get("latest_instruction") or "").strip()
+        latest_instruction_line = f" Last instruction: {latest_instruction[:160]}." if latest_instruction else ""
         return {
             "response": (
                 f"{agent.get('name', 'Agent')} update for {symbol}: price {market_state.get('price')} and sentiment {sentiment:.2f}. "
                 "I am monitoring catalyst risk, social tone, and volume regime for trigger changes."
+                f"{latest_instruction_line}"
             ),
             "model": "fallback-template",
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 
     system = (
-        "You are a buy-side research associate agent briefing a hedge fund manager. "
-        "Be concise, specific, and action-oriented. Mention current market state, social sentiment, and next steps. "
-        "No investment guarantee language."
+        "You are a beginner-friendly hedge-fund assistant. "
+        "You help configure and operate stock tracker agents. "
+        "Use only the provided context. Be clear, concrete, and action-oriented. "
+        "If data is missing, say exactly what is missing."
     )
     payload = {
         "model": "gpt-4o-mini",
@@ -362,6 +467,7 @@ async def tracker_agent_chat_response(
                         "market_state": market_state,
                         "research_state": research_state,
                         "manager_message": user_message,
+                        "memory_context": memory_context,
                     },
                     ensure_ascii=True,
                 ),
@@ -377,15 +483,92 @@ async def tracker_agent_chat_response(
         async with httpx.AsyncClient(timeout=25.0) as client:
             resp = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
             resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip()
+            data = resp.json()
+            content = str(data["choices"][0]["message"]["content"]).strip()
             return {
                 "response": content,
-                "model": "gpt-4o-mini",
+                "model": str(data.get("model") or "gpt-4o-mini"),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
     except Exception:
         return {
             "response": "Briefing unavailable due to model request failure. Continue monitoring price, flow, and sentiment drift.",
             "model": "fallback-template",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+async def tracker_context_query_response(
+    settings: Settings,
+    *,
+    question: str,
+    context: Dict[str, Any],
+) -> Dict[str, str]:
+    question = question.strip()
+    if not question:
+        return {
+            "response": "No question provided.",
+            "model": "context-fallback",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    if not settings.openai_api_key:
+        runs = context.get("runs") if isinstance(context.get("runs"), list) else []
+        history = context.get("history") if isinstance(context.get("history"), list) else []
+        thesis = context.get("thesis") if isinstance(context.get("thesis"), dict) else {}
+        latest_run = runs[0] if runs else {}
+        latest_hist = history[0] if history else {}
+        return {
+            "response": (
+                f"Context fallback answer for: {question}\n"
+                f"Latest run type: {latest_run.get('run_type', 'n/a')} at {latest_run.get('created_at', 'n/a')}.\n"
+                f"Latest instruction: {latest_hist.get('raw_prompt', 'n/a')}.\n"
+                f"Current thesis stance_score: {thesis.get('stance_score', 'n/a')} confidence: {thesis.get('confidence', 'n/a')}."
+            ),
+            "model": "context-fallback",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    system = (
+        "You are a hedge-fund analyst copilot. Answer strictly from provided tracker context "
+        "(agent runs, thesis memory, history, CSV logs). Be factual and time-aware. "
+        "If evidence is missing, say what is missing."
+    )
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "question": question,
+                        "context": context,
+                    },
+                    ensure_ascii=True,
+                ),
+            },
+        ],
+        "temperature": 0.2,
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.openai_api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            text = str(data["choices"][0]["message"]["content"]).strip()
+            return {
+                "response": text,
+                "model": str(data.get("model") or "gpt-4o-mini"),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+    except Exception:
+        return {
+            "response": "Context query failed at model layer. Use recent runs/history tables for manual inspection.",
+            "model": "context-fallback",
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }

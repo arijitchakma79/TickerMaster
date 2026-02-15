@@ -1,32 +1,48 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
+from zoneinfo import ZoneInfo
 
 import httpx
+import numpy as np
 
 from app.config import Settings
 from app.schemas import AlertConfig, ResearchRequest, TrackerSnapshot
 from app.services.agent_logger import log_agent_activity
 from app.services.market_data import fetch_watchlist_metrics
-from app.services.notifications import prepare_poke_recipe_handoff
-from app.services.sentiment import run_research
+from app.services.notifications import dispatch_alert_notification
+from app.services.sentiment import run_research_with_source_selection
+from app.services.tracker_csv import append_alert_context_csv
 from app.services.tracker_repository import tracker_repo
+from app.services.database import get_supabase
 from app.ws_manager import WSManager
+
+if TYPE_CHECKING:
+    from app.services.simulation import SimulationOrchestrator
 
 
 class TrackerService:
-    def __init__(self, settings: Settings, ws_manager: WSManager) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        ws_manager: WSManager,
+        orchestrator: "SimulationOrchestrator | None" = None,
+    ) -> None:
         self.settings = settings
         self.ws_manager = ws_manager
+        self.orchestrator = orchestrator
         self.watchlist = {ticker.upper() for ticker in settings.default_watchlist}
         self.alerts: List[AlertConfig] = []
         self._previous: Dict[str, Dict[str, float]] = {}
         self._latest_snapshot: TrackerSnapshot | None = None
         self._task: asyncio.Task | None = None
         self._research_cache: Dict[str, Dict[str, Any]] = {}
+        self._notification_pref_cache: Dict[str, Dict[str, Any]] = {}
+        self._rng = np.random.default_rng()
 
     def set_watchlist(self, tickers: List[str]) -> List[str]:
         clean = {t.strip().upper() for t in tickers if t.strip()}
@@ -63,6 +79,20 @@ class TrackerService:
         if self._task and not self._task.done():
             return
         self._task = asyncio.create_task(self.run_forever(), name="tracker-poller")
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        if self._task.done():
+            self._task = None
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._task = None
 
     async def snapshot(self) -> TrackerSnapshot:
         if self._latest_snapshot is None:
@@ -159,44 +189,562 @@ class TrackerService:
             stamp = stamp.replace(tzinfo=timezone.utc)
         return now - stamp < timedelta(minutes=minutes)
 
-    async def _get_research_snapshot(self, ticker: str, timeframe: str = "7d") -> dict[str, Any]:
-        key = f"{ticker.upper()}:{timeframe}"
+    def _parse_timestamp(self, raw: Any) -> datetime | None:
+        if not raw:
+            return None
+        try:
+            stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            return stamp
+        except Exception:
+            return None
+
+    async def _get_notification_preferences(self, user_id: str | None) -> dict[str, Any]:
+        if not user_id:
+            return {}
+
+        cached = self._notification_pref_cache.get(user_id)
+        if cached:
+            cached_at = cached.get("cached_at")
+            if isinstance(cached_at, datetime) and (datetime.now(timezone.utc) - cached_at) < timedelta(minutes=2):
+                return dict(cached.get("data") or {})
+
+        client = get_supabase()
+        if client is None:
+            return {}
+
+        try:
+            row = (
+                client.table("notification_preferences")
+                .select("*")
+                .eq("user_id", user_id)
+                .single()
+                .execute()
+                .data
+            ) or {}
+            data = {
+                "phone_number": str(row.get("phone_number") or "").strip() or None,
+                "email": str(row.get("email") or "").strip() or None,
+                "preferred_channel": str(row.get("preferred_channel") or "push").strip().lower() or "push",
+                "alert_frequency": str(row.get("alert_frequency") or "realtime").strip().lower() or "realtime",
+                "price_alerts": bool(row.get("price_alerts", True)),
+                "volume_alerts": bool(row.get("volume_alerts", True)),
+                "simulation_summary": bool(row.get("simulation_summary", True)),
+                "quiet_start": str(row.get("quiet_start") or "22:00:00"),
+                "quiet_end": str(row.get("quiet_end") or "07:00:00"),
+            }
+            self._notification_pref_cache[user_id] = {"cached_at": datetime.now(timezone.utc), "data": data}
+            return data
+        except Exception:
+            return {}
+
+    def _clock_minutes(self, value: Any, default: str) -> int:
+        token = str(value or default).strip()
+        parts = token.split(":")
+        if len(parts) < 2:
+            parts = default.split(":")
+        try:
+            hour = int(parts[0])
+            minute = int(parts[1])
+        except Exception:
+            hour, minute = 0, 0
+        hour = max(0, min(23, hour))
+        minute = max(0, min(59, minute))
+        return (hour * 60) + minute
+
+    def _is_quiet_hours(self, notification_prefs: dict[str, Any], now: datetime) -> bool:
+        if not notification_prefs:
+            return False
+        start = self._clock_minutes(notification_prefs.get("quiet_start"), "22:00:00")
+        end = self._clock_minutes(notification_prefs.get("quiet_end"), "07:00:00")
+        current = (now.hour * 60) + now.minute
+        if start == end:
+            return False
+        if start < end:
+            return start <= current < end
+        return current >= start or current < end
+
+    def _notification_allowed(self, agent: dict[str, Any], notification_prefs: dict[str, Any], now: datetime) -> tuple[bool, str | None]:
+        if not notification_prefs:
+            return True, None
+
+        if self._is_quiet_hours(notification_prefs, now):
+            return False, "quiet_hours"
+
+        frequency = str(notification_prefs.get("alert_frequency") or "realtime").strip().lower()
+        min_interval_seconds = {
+            "realtime": 0,
+            "hourly": 3600,
+            "daily": 86400,
+        }.get(frequency, 0)
+        if min_interval_seconds <= 0:
+            return True, None
+
+        last_notified = self._parse_timestamp(agent.get("last_alert_at"))
+        if last_notified and (now - last_notified) < timedelta(seconds=min_interval_seconds):
+            return False, f"frequency_{frequency}"
+        return True, None
+
+    def _resolve_channels(self, tooling: dict[str, Any], notification_prefs: dict[str, Any]) -> list[str]:
+        channels = [str(item).strip().lower() for item in (tooling.get("notify_channels") or []) if str(item).strip()]
+        if bool(tooling.get("notify_channels_from_trigger")) and channels:
+            return channels
+
+        preferred = str(notification_prefs.get("preferred_channel") or "").strip().lower()
+        if preferred == "sms":
+            return ["twilio"]
+        if preferred in {"push", "email"}:
+            # Email delivery is not wired yet, so "email" falls back to push integration.
+            return ["poke"]
+        return channels or ["twilio", "poke"]
+
+    def _agent_tooling_config(self, agent: dict[str, Any]) -> dict[str, Any]:
+        triggers = agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {}
+        triggers = triggers or {}
+
+        allowed_tools = {
+            "price",
+            "volume",
+            "sentiment",
+            "news",
+            "prediction_markets",
+            "deep_research",
+            "simulation",
+        }
+        allowed_sources = {"perplexity", "x", "reddit", "prediction_markets", "deep"}
+        allowed_channels = {"twilio", "poke"}
+        tool_mode = str(triggers.get("tool_mode") or "auto").strip().lower()
+        if tool_mode not in {"auto", "manual"}:
+            tool_mode = "auto"
+
+        tools: list[str] = []
+        raw_tools = triggers.get("tools")
+        if tool_mode == "manual" and isinstance(raw_tools, list):
+            for item in raw_tools:
+                token = str(item).strip().lower()
+                if token in allowed_tools and token not in tools:
+                    tools.append(token)
+
+        if not tools:
+            tools = ["price", "volume"]
+            if any(key in triggers for key in {"sentiment_bearish_threshold", "sentiment_bullish_threshold", "x_bearish_threshold"}):
+                tools.extend(["sentiment", "news"])
+            if bool(agent.get("auto_simulate")) or bool(triggers.get("simulate_on_alert")):
+                tools.append("simulation")
+
+        research_sources: list[str] = []
+        raw_sources = triggers.get("research_sources")
+        if isinstance(raw_sources, list):
+            for item in raw_sources:
+                token = str(item).strip().lower()
+                if token in allowed_sources and token not in research_sources:
+                    research_sources.append(token)
+
+        if not research_sources and any(token in tools for token in {"sentiment", "news", "prediction_markets", "deep_research"}):
+            research_sources = ["perplexity", "x", "reddit"]
+
+        notify_channels: list[str] = []
+        notify_channels_from_trigger = False
+        raw_channels = triggers.get("notify_channels")
+        if isinstance(raw_channels, list):
+            for item in raw_channels:
+                token = str(item).strip().lower()
+                if token in allowed_channels and token not in notify_channels:
+                    notify_channels.append(token)
+        if notify_channels:
+            notify_channels_from_trigger = True
+        if not notify_channels:
+            notify_channels = ["twilio", "poke"]
+
+        poll_interval = triggers.get("poll_interval_seconds")
+        try:
+            poll_interval_seconds = int(float(poll_interval))
+        except Exception:
+            poll_interval_seconds = self.settings.tracker_poll_interval_seconds
+        poll_interval_seconds = max(30, min(3600, poll_interval_seconds))
+
+        report_interval = triggers.get("report_interval_seconds")
+        try:
+            report_interval_seconds = int(float(report_interval))
+        except Exception:
+            report_interval_seconds = poll_interval_seconds
+        report_interval_seconds = max(30, min(86400, report_interval_seconds))
+
+        schedule_mode = str(triggers.get("schedule_mode") or "realtime").strip().lower()
+        if schedule_mode not in {"realtime", "hourly", "daily", "custom"}:
+            schedule_mode = "realtime"
+        if schedule_mode == "hourly":
+            poll_interval_seconds = 3600
+            report_interval_seconds = max(report_interval_seconds, 3600)
+        elif schedule_mode == "daily":
+            poll_interval_seconds = 86400
+            report_interval_seconds = max(report_interval_seconds, 86400)
+
+        daily_run_time = str(triggers.get("daily_run_time") or "09:30").strip()
+        if not re.match(r"^\d{1,2}:\d{2}$", daily_run_time):
+            daily_run_time = "09:30"
+
+        timezone_name = str(triggers.get("timezone") or "America/New_York").strip() or "America/New_York"
+        try:
+            ZoneInfo(timezone_name)
+        except Exception:
+            timezone_name = "America/New_York"
+
+        start_at = self._parse_timestamp(triggers.get("start_at"))
+
+        baseline_mode = str(triggers.get("baseline_mode") or "prev_close").strip().lower()
+        if baseline_mode not in {"prev_close", "last_check", "last_alert", "session_open"}:
+            baseline_mode = "prev_close"
+
+        report_mode_raw = str(triggers.get("report_mode") or "triggers_only").strip().lower()
+        report_mode_aliases = {
+            "alerts": "triggers_only",
+            "alerts_only": "triggers_only",
+            "trigger_only": "triggers_only",
+            "report": "periodic",
+            "reports": "periodic",
+            "mixed": "hybrid",
+        }
+        report_mode = report_mode_aliases.get(report_mode_raw, report_mode_raw)
+        if report_mode not in {"triggers_only", "periodic", "hybrid"}:
+            report_mode = "triggers_only"
+
+        timeframe = str(triggers.get("research_timeframe") or "7d")
+        notify_phone = str(triggers.get("notify_phone") or "").strip() or None
+        simulate_on_alert = bool(triggers.get("simulate_on_alert")) or bool(agent.get("auto_simulate"))
+
+        return {
+            "tools": tools,
+            "research_sources": research_sources,
+            "notify_channels": notify_channels,
+            "notify_channels_from_trigger": notify_channels_from_trigger,
+            "poll_interval_seconds": poll_interval_seconds,
+            "report_interval_seconds": report_interval_seconds,
+            "report_mode": report_mode,
+            "research_timeframe": timeframe,
+            "notify_phone": notify_phone,
+            "simulate_on_alert": simulate_on_alert,
+            "use_prediction_markets": "prediction_markets" in tools,
+            "tool_mode": tool_mode,
+            "baseline_mode": baseline_mode,
+            "schedule_mode": schedule_mode,
+            "daily_run_time": daily_run_time,
+            "timezone": timezone_name,
+            "start_at": start_at.isoformat() if start_at else None,
+        }
+
+    def _agent_poll_due(self, agent: dict[str, Any], tooling: dict[str, Any], now: datetime) -> bool:
+        start_at = self._parse_timestamp(tooling.get("start_at"))
+        if start_at and now < start_at:
+            return False
+
+        schedule_mode = str(tooling.get("schedule_mode") or "realtime")
+        if schedule_mode == "daily":
+            return self._agent_daily_due(
+                agent,
+                now,
+                daily_run_time=str(tooling.get("daily_run_time") or "09:30"),
+                timezone_name=str(tooling.get("timezone") or "America/New_York"),
+            )
+
+        poll_interval_seconds = int(tooling.get("poll_interval_seconds") or self.settings.tracker_poll_interval_seconds)
+        raw = agent.get("last_checked_at")
+        if not raw:
+            return True
+        try:
+            stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+        except Exception:
+            return True
+        return (now - stamp) >= timedelta(seconds=max(30, poll_interval_seconds))
+
+    def _agent_report_due(self, agent: dict[str, Any], report_interval_seconds: int, now: datetime) -> bool:
+        raw = agent.get("last_alert_at")
+        if not raw:
+            return True
+        try:
+            stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+        except Exception:
+            return True
+        return (now - stamp) >= timedelta(seconds=max(30, report_interval_seconds))
+
+    def _agent_daily_due(self, agent: dict[str, Any], now: datetime, *, daily_run_time: str, timezone_name: str) -> bool:
+        try:
+            tz = ZoneInfo(timezone_name)
+        except Exception:
+            tz = timezone.utc
+        local_now = now.astimezone(tz)
+        parts = daily_run_time.split(":")
+        try:
+            hh = max(0, min(23, int(parts[0])))
+            mm = max(0, min(59, int(parts[1])))
+        except Exception:
+            hh, mm = 9, 30
+
+        local_scheduled = local_now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        last_checked = self._parse_timestamp(agent.get("last_checked_at"))
+        if last_checked is not None:
+            last_local = last_checked.astimezone(tz)
+        else:
+            last_local = None
+
+        if local_now >= local_scheduled:
+            return last_local is None or last_local < local_scheduled
+        previous_window = local_scheduled - timedelta(days=1)
+        return last_local is None or last_local < previous_window
+
+    def _resolve_agent_price_change(
+        self,
+        *,
+        agent: dict[str, Any],
+        metric: Any,
+        observed_poll_change: float,
+        tooling: dict[str, Any],
+    ) -> tuple[float, str, float | None]:
+        baseline_mode = str(tooling.get("baseline_mode") or "prev_close")
+        current_price = float(metric.price or 0.0)
+        if current_price <= 0:
+            return observed_poll_change, "prev_close", None
+
+        if baseline_mode in {"prev_close", "session_open"}:
+            # MarketMetric.change_percent is provider-based move vs prior close/session open baseline.
+            try:
+                return float(metric.change_percent or 0.0), baseline_mode, None
+            except Exception:
+                return observed_poll_change, baseline_mode, None
+
+        if baseline_mode == "last_check":
+            baseline = agent.get("last_price")
+            try:
+                base = float(baseline)
+            except Exception:
+                base = 0.0
+            if base > 0:
+                return ((current_price - base) / base) * 100.0, baseline_mode, base
+            return observed_poll_change, baseline_mode, None
+
+        if baseline_mode == "last_alert":
+            triggers = agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {}
+            baseline = triggers.get("last_alert_price") if isinstance(triggers, dict) else None
+            try:
+                base = float(baseline)
+            except Exception:
+                base = 0.0
+            if base > 0:
+                return ((current_price - base) / base) * 100.0, baseline_mode, base
+            return observed_poll_change, baseline_mode, None
+
+        return observed_poll_change, "prev_close", None
+
+    async def _update_agent_thesis(
+        self,
+        *,
+        agent: dict[str, Any],
+        metric: Any,
+        event_type: str,
+        reasons: list[str],
+        narrative: str,
+        price_change: float,
+        research: dict[str, Any],
+        simulation_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        aggregate_sentiment = float(research.get("aggregate_sentiment", 0.0) or 0.0)
+        stance_score = max(-1.0, min(1.0, (aggregate_sentiment * 0.7) + (price_change / 15.0)))
+        confidence = max(0.05, min(0.98, 0.35 + (abs(aggregate_sentiment) * 0.35) + min(0.28, abs(price_change) / 12.0)))
+        thesis = {
+            "drivers": reasons[:5],
+            "aggregate_sentiment": round(aggregate_sentiment, 4),
+            "price_change_pct": round(price_change, 4),
+            "recommendation": str(research.get("recommendation") or "hold"),
+            "simulation": simulation_context or {},
+            "narrative_excerpt": narrative[:280],
+        }
+        summary = (
+            f"Stance {stance_score:+.2f} ({'bullish' if stance_score >= 0 else 'bearish'}) "
+            f"confidence {confidence:.2f}; drivers: {', '.join(reasons[:3]) or 'none'}."
+        )
+        return tracker_repo.upsert_thesis(
+            user_id=agent.get("user_id"),
+            agent_id=str(agent.get("id")),
+            symbol=str(metric.ticker),
+            stance_score=stance_score,
+            confidence=confidence,
+            thesis=thesis,
+            summary=summary,
+            last_event_type=event_type,
+        )
+
+    async def _resolve_notification_phone(
+        self,
+        user_id: str | None,
+        agent: dict[str, Any],
+        tooling: dict[str, Any],
+        notification_prefs: dict[str, Any] | None = None,
+    ) -> str | None:
+        from_triggers = str(tooling.get("notify_phone") or "").strip()
+        if from_triggers:
+            return from_triggers
+        from_prefs = str((notification_prefs or {}).get("phone_number") or "").strip()
+        if from_prefs:
+            return from_prefs
+        if not user_id:
+            return self.settings.twilio_default_to_number or None
+
+        client = get_supabase()
+        if client is None:
+            return self.settings.twilio_default_to_number or None
+        try:
+            profile = (
+                client.table("profiles")
+                .select("phone_number,phone,sms_number")
+                .eq("id", user_id)
+                .single()
+                .execute()
+                .data
+            ) or {}
+            for key in ("phone_number", "phone", "sms_number"):
+                value = str(profile.get(key) or "").strip()
+                if value:
+                    return value
+        except Exception:
+            return self.settings.twilio_default_to_number or None
+        return self.settings.twilio_default_to_number or None
+
+    def _quick_simulation_context(self, price_change: float, aggregate_sentiment: float, base_price: float) -> dict[str, Any]:
+        horizon_steps = 40
+        simulations = 120
+        drift = float((aggregate_sentiment * 0.0007) + (price_change * 0.0003))
+        sigma = float(max(0.004, min(0.06, 0.012 + abs(price_change) * 0.0012)))
+        shocks = self._rng.normal(loc=drift, scale=sigma, size=(simulations, horizon_steps))
+        cumulative = shocks.sum(axis=1)
+        projected_prices = base_price * np.exp(cumulative)
+        projected_returns_pct = ((projected_prices - base_price) / max(1e-6, base_price)) * 100
+
+        expected_return = float(np.mean(projected_returns_pct))
+        downside_prob = float(np.mean(projected_returns_pct <= -3.0))
+        upside_prob = float(np.mean(projected_returns_pct >= 3.0))
+        worst_case = float(np.percentile(projected_returns_pct, 5))
+        best_case = float(np.percentile(projected_returns_pct, 95))
+        return {
+            "expected_return_pct": round(expected_return, 2),
+            "upside_prob_3pct": round(upside_prob, 3),
+            "downside_prob_3pct": round(downside_prob, 3),
+            "p05_return_pct": round(worst_case, 2),
+            "p95_return_pct": round(best_case, 2),
+            "horizon_steps": horizon_steps,
+            "paths": simulations,
+        }
+
+    async def _maybe_launch_simulation_session(self, metric: Any, user_id: str | None) -> str | None:
+        if self.orchestrator is None:
+            return None
+        try:
+            from app.schemas import SimulationStartRequest
+
+            req = SimulationStartRequest(
+                ticker=str(metric.ticker),
+                duration_seconds=90,
+                initial_price=float(metric.price),
+                starting_cash=100_000,
+                volatility=0.02 + min(0.02, abs(float(metric.change_percent or 0.0)) / 100),
+                user_id=user_id,
+                inference_runtime="modal",
+                agents=[],
+            )
+            state = await self.orchestrator.start(req)
+            return state.session_id
+        except Exception:
+            return None
+
+    async def _get_research_snapshot(
+        self,
+        ticker: str,
+        timeframe: str = "7d",
+        sources: list[str] | None = None,
+        include_prediction_markets: bool = False,
+    ) -> dict[str, Any]:
+        source_key = ",".join(sorted([str(item).lower() for item in (sources or [])])) or "default"
+        key = f"{ticker.upper()}:{timeframe}:{source_key}:{int(include_prediction_markets)}"
         cached = self._research_cache.get(key)
         if cached:
             at = cached.get("cached_at")
             if isinstance(at, datetime) and (datetime.now(timezone.utc) - at) < timedelta(minutes=5):
                 return dict(cached.get("data") or {})
         try:
-            data = await run_research(
-                ResearchRequest(ticker=ticker.upper(), timeframe=timeframe, include_prediction_markets=False),
+            data = await run_research_with_source_selection(
+                ResearchRequest(
+                    ticker=ticker.upper(),
+                    timeframe=timeframe,
+                    include_prediction_markets=include_prediction_markets,
+                ),
                 self.settings,
+                sources=sources,
             )
             payload = {
                 "aggregate_sentiment": data.aggregate_sentiment,
                 "recommendation": data.recommendation,
                 "breakdown": {item.source: item.score for item in data.source_breakdown},
+                "prediction_markets": list(data.prediction_markets or []),
             }
             self._research_cache[key] = {"cached_at": datetime.now(timezone.utc), "data": payload}
             return payload
         except Exception:
-            return {"aggregate_sentiment": 0.0, "recommendation": "hold", "breakdown": {}}
+            return {"aggregate_sentiment": 0.0, "recommendation": "hold", "breakdown": {}, "prediction_markets": []}
 
     async def _evaluate_agent(
         self,
         agent: dict[str, Any],
         metric: Any,
         price_change: float,
-        volume_spike: bool,
+        volume_ratio: float,
     ) -> dict[str, Any] | None:
-        triggers = agent.get("triggers") or {}
+        triggers = agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {}
+        triggers = triggers or {}
+        now = datetime.now(timezone.utc)
+
         def _as_float(value: Any, default: float) -> float:
             try:
                 return float(value)
             except Exception:
                 return default
 
-        timeframe = str(triggers.get("research_timeframe") or "7d")
-        research = await self._get_research_snapshot(metric.ticker, timeframe=timeframe)
+        tooling = self._agent_tooling_config(agent)
+        notification_prefs = await self._get_notification_preferences(agent.get("user_id"))
+        price_alerts_enabled = bool(notification_prefs.get("price_alerts", True))
+        volume_alerts_enabled = bool(notification_prefs.get("volume_alerts", True))
+        simulation_summary_enabled = bool(notification_prefs.get("simulation_summary", True))
+        report_mode = str(tooling.get("report_mode") or "triggers_only")
+        report_interval_seconds = int(tooling.get("report_interval_seconds") or tooling.get("poll_interval_seconds") or 120)
+        scheduled_report_due = report_mode in {"periodic", "hybrid"} and self._agent_report_due(
+            agent,
+            report_interval_seconds,
+            now,
+        )
+        effective_price_change, baseline_mode, baseline_price = self._resolve_agent_price_change(
+            agent=agent,
+            metric=metric,
+            observed_poll_change=price_change,
+            tooling=tooling,
+        )
+        tools = set(tooling.get("tools") or [])
+        requires_research = bool(
+            tools.intersection({"sentiment", "news", "prediction_markets", "deep_research"})
+            or any(key in triggers for key in {"sentiment_bearish_threshold", "sentiment_bullish_threshold", "x_bearish_threshold"})
+        )
+
+        research = {"aggregate_sentiment": 0.0, "recommendation": "hold", "breakdown": {}, "prediction_markets": []}
+        if requires_research:
+            research = await self._get_research_snapshot(
+                metric.ticker,
+                timeframe=str(tooling.get("research_timeframe") or "7d"),
+                sources=list(tooling.get("research_sources") or []),
+                include_prediction_markets=bool(tooling.get("use_prediction_markets")),
+            )
+
         aggregate = float(research.get("aggregate_sentiment", 0.0))
         x_score = float((research.get("breakdown") or {}).get("X API", 0.0))
 
@@ -204,19 +752,40 @@ class TrackerService:
         bullish_threshold = _as_float(triggers.get("sentiment_bullish_threshold"), 0.25)
         x_bearish = _as_float(triggers.get("x_bearish_threshold"), -0.25)
         price_threshold = _as_float(triggers.get("price_change_pct"), 2.0)
-        volume_ratio = _as_float(triggers.get("volume_spike_ratio"), 1.8)
+        volume_spike_threshold = _as_float(triggers.get("volume_spike_ratio"), 1.8)
 
-        reasons: list[str] = []
-        if abs(price_change) >= price_threshold:
-            reasons.append(f"price move {price_change:.2f}% >= {price_threshold:.2f}%")
-        if volume_spike:
-            reasons.append(f"volume spike exceeded ratio {volume_ratio:.2f}")
-        if aggregate <= bearish_threshold:
-            reasons.append(f"broad sentiment bearish ({aggregate:.2f})")
-        if aggregate >= bullish_threshold:
-            reasons.append(f"broad sentiment bullish ({aggregate:.2f})")
-        if x_score <= x_bearish:
-            reasons.append(f"X sentiment deeply bearish ({x_score:.2f})")
+        trigger_reasons: list[str] = []
+        if "price" in tools and price_alerts_enabled and abs(effective_price_change) >= price_threshold:
+            trigger_reasons.append(
+                f"price move {effective_price_change:.2f}% >= {price_threshold:.2f}% "
+                f"(baseline={baseline_mode})"
+            )
+        volume_spike = volume_ratio >= volume_spike_threshold
+        if "volume" in tools and volume_alerts_enabled and volume_spike:
+            trigger_reasons.append(f"volume spike exceeded ratio {volume_spike_threshold:.2f}")
+        if "sentiment" in tools and aggregate <= bearish_threshold:
+            trigger_reasons.append(f"broad sentiment bearish ({aggregate:.2f})")
+        if "sentiment" in tools and aggregate >= bullish_threshold:
+            trigger_reasons.append(f"broad sentiment bullish ({aggregate:.2f})")
+        if "sentiment" in tools and x_score <= x_bearish:
+            trigger_reasons.append(f"X sentiment deeply bearish ({x_score:.2f})")
+        if "prediction_markets" in tools and (research.get("prediction_markets") or []):
+            top_market = (research.get("prediction_markets") or [])[0]
+            top_score = float(top_market.get("relevance_score", 0.0) or 0.0)
+            if top_score >= 0.45:
+                trigger_reasons.append(f"prediction-market signal elevated ({top_score:.2f})")
+
+        quick_investigation = ""
+        if "news" in tools and (abs(effective_price_change) >= (price_threshold * 0.75) or volume_spike or scheduled_report_due):
+            quick_investigation = await self._investigate_with_perplexity(
+                metric.ticker,
+                (
+                    f"price_change={effective_price_change:.2f}% volume_ratio={volume_ratio:.2f} "
+                    f"sentiment={aggregate:.2f} reasons={'; '.join(trigger_reasons) or 'none'}"
+                ),
+            )
+            if quick_investigation and trigger_reasons:
+                trigger_reasons.append("news catalysts detected")
 
         await log_agent_activity(
             module="tracker",
@@ -227,116 +796,444 @@ class TrackerService:
             details={
                 "agent_id": agent.get("id"),
                 "symbol": metric.ticker,
-                "description": "Checked price, volume, and social sentiment signals.",
-                "price_change_pct": round(price_change, 3),
+                "description": "Checked configured tools for this agent across price/volume/research/simulation.",
+                "price_change_pct": round(effective_price_change, 3),
+                "baseline_mode": baseline_mode,
+                "baseline_price": baseline_price,
                 "volume_spike": bool(volume_spike),
+                "volume_ratio": round(volume_ratio, 3),
                 "aggregate_sentiment": round(aggregate, 3),
                 "x_sentiment": round(x_score, 3),
-                "trigger_matches": reasons,
+                "tools": sorted(tools),
+                "research_sources": tooling.get("research_sources") or [],
+                "trigger_matches": trigger_reasons,
+                "report_mode": report_mode,
+                "scheduled_report_due": scheduled_report_due,
             },
         )
-        if not reasons:
+
+        if report_mode == "periodic":
+            trigger_reasons = []
+
+        if trigger_reasons and self._agent_in_cooldown(agent):
+            if not scheduled_report_due:
+                tracker_repo.create_run(
+                    user_id=agent.get("user_id"),
+                    agent_id=str(agent.get("id")),
+                    symbol=metric.ticker,
+                    run_type="noop",
+                    trigger_reasons=trigger_reasons,
+                    tools_used=list(tools),
+                    research_sources=list(tooling.get("research_sources") or []),
+                    market_snapshot={
+                        "price": metric.price,
+                        "price_change_pct": round(effective_price_change, 4),
+                        "baseline_mode": baseline_mode,
+                        "baseline_price": baseline_price,
+                        "volume": metric.volume,
+                        "volume_ratio": round(volume_ratio, 4),
+                    },
+                    research_snapshot=research,
+                    decision={"event_type": "noop", "cooldown": True},
+                    note="Trigger met but cooldown suppressed alert.",
+                )
+                tracker_repo.update_agent(
+                    user_id=agent.get("user_id"),
+                    agent_id=str(agent.get("id")),
+                    updates={"last_checked_at": now.isoformat(), "last_price": float(metric.price)},
+                )
+                return None
+            trigger_reasons = []
+
+        event_type: str | None = None
+        reasons: list[str] = []
+        if trigger_reasons:
+            event_type = "alert"
+            reasons = list(trigger_reasons)
+        elif scheduled_report_due:
+            event_type = "report"
+            reasons = [f"scheduled report ({report_interval_seconds}s cadence)"]
+            if quick_investigation:
+                reasons.append("news context refreshed")
+
+        if event_type is None:
+            tracker_repo.create_run(
+                user_id=agent.get("user_id"),
+                agent_id=str(agent.get("id")),
+                symbol=metric.ticker,
+                run_type="noop",
+                trigger_reasons=[],
+                tools_used=list(tools),
+                research_sources=list(tooling.get("research_sources") or []),
+                market_snapshot={
+                    "price": metric.price,
+                    "price_change_pct": round(effective_price_change, 4),
+                    "baseline_mode": baseline_mode,
+                    "baseline_price": baseline_price,
+                    "volume": metric.volume,
+                    "volume_ratio": round(volume_ratio, 4),
+                },
+                research_snapshot=research,
+                decision={"event_type": "noop"},
+                note="No trigger or periodic report due this cycle.",
+            )
+            await self._update_agent_thesis(
+                agent=agent,
+                metric=metric,
+                event_type="noop",
+                reasons=[],
+                narrative="No event emitted this cycle.",
+                price_change=effective_price_change,
+                research=research,
+                simulation_context=None,
+            )
+            tracker_repo.update_agent(
+                user_id=agent.get("user_id"),
+                agent_id=str(agent.get("id")),
+                updates={"last_checked_at": now.isoformat(), "last_price": float(metric.price)},
+            )
             return None
 
+        prior_alerts = tracker_repo.list_alerts(
+            user_id=agent.get("user_id"),
+            agent_id=str(agent.get("id")),
+            limit=6,
+        )
+        prior_context_rows = tracker_repo.list_alert_context(
+            user_id=agent.get("user_id"),
+            agent_id=str(agent.get("id")),
+            limit=4,
+        )
+        recent_alert_context: list[dict[str, Any]] = []
+        for item in prior_alerts:
+            recent_alert_context.append(
+                {
+                    "created_at": item.get("created_at"),
+                    "trigger_reason": str(item.get("trigger_reason") or ""),
+                    "narrative": str(item.get("narrative") or "")[:240],
+                    "market_snapshot": item.get("market_snapshot") if isinstance(item.get("market_snapshot"), dict) else {},
+                }
+            )
+        prior_alert_line = " | ".join(
+            [
+                f"{str(row.get('created_at') or '')}: {str(row.get('trigger_reason') or '')}"
+                for row in recent_alert_context[:4]
+                if str(row.get("trigger_reason") or "").strip()
+            ]
+        ) or "none"
+        prior_context_line = " | ".join(
+            [
+                str(item.get("context_summary") or "").strip()
+                for item in prior_context_rows[:3]
+                if str(item.get("context_summary") or "").strip()
+            ]
+        ) or "none"
         context = (
             f"Agent={agent.get('name')} symbol={metric.ticker} price={metric.price} "
-            f"change={price_change:.2f}% aggregate_sentiment={aggregate:.2f} x_score={x_score:.2f} "
-            f"matches={'; '.join(reasons)}"
+            f"change={effective_price_change:.2f}% baseline={baseline_mode} "
+            f"aggregate_sentiment={aggregate:.2f} x_score={x_score:.2f} "
+            f"matches={'; '.join(reasons)} prior_alerts={prior_alert_line} "
+            f"prior_analysis={prior_context_line}"
         )
+        if quick_investigation:
+            context = f"{context} | catalyst_note={quick_investigation}"
         narrative = await self._synthesize_narrative(metric.ticker, context)
+
+        simulation_context: dict[str, Any] | None = None
+        launched_session_id: str | None = None
+        simulation_requested = bool(tooling.get("simulate_on_alert")) or ("simulation" in tools)
+        if ("simulation" in tools and simulation_summary_enabled) or simulation_requested:
+            simulation_context = self._quick_simulation_context(
+                price_change=effective_price_change,
+                aggregate_sentiment=aggregate,
+                base_price=float(metric.price),
+            )
+            if simulation_requested and event_type == "alert":
+                launched_session_id = await self._maybe_launch_simulation_session(
+                    metric=metric,
+                    user_id=agent.get("user_id"),
+                )
+
+        channels = self._resolve_channels(tooling, notification_prefs)
+        notification_allowed, block_reason = self._notification_allowed(agent, notification_prefs, now)
+        if event_type == "report" and not notification_allowed:
+            tracker_repo.create_run(
+                user_id=agent.get("user_id"),
+                agent_id=str(agent.get("id")),
+                symbol=metric.ticker,
+                run_type="report_skipped",
+                trigger_reasons=reasons,
+                tools_used=list(tools),
+                research_sources=list(tooling.get("research_sources") or []),
+                market_snapshot={
+                    "price": metric.price,
+                    "price_change_pct": round(effective_price_change, 4),
+                    "baseline_mode": baseline_mode,
+                    "baseline_price": baseline_price,
+                    "volume": metric.volume,
+                    "volume_ratio": round(volume_ratio, 4),
+                },
+                research_snapshot=research,
+                decision={"notification_allowed": False, "block_reason": block_reason, "event_type": event_type},
+                note="Periodic report skipped due to notification preferences.",
+            )
+            await self._update_agent_thesis(
+                agent=agent,
+                metric=metric,
+                event_type="report_skipped",
+                reasons=reasons,
+                narrative=narrative,
+                price_change=effective_price_change,
+                research=research,
+                simulation_context=simulation_context,
+            )
+            tracker_repo.update_agent(
+                user_id=agent.get("user_id"),
+                agent_id=str(agent.get("id")),
+                updates={"last_checked_at": now.isoformat(), "last_price": float(metric.price)},
+            )
+            return None
+
+        title = f"TickerMaster {'Report' if event_type == 'report' else 'Alert'}: {metric.ticker}"
+        simulation_line = ""
+        if simulation_context:
+            simulation_line = (
+                f" Sim outlook: exp {simulation_context['expected_return_pct']:+.2f}% | "
+                f"downside>3% {simulation_context['downside_prob_3pct'] * 100:.0f}%."
+            )
+        body = (
+            f"{'; '.join(reasons)} | Price {float(metric.price):.2f}"
+            f"{simulation_line}"
+        )
+        if notification_allowed:
+            notification = await dispatch_alert_notification(
+                settings=self.settings,
+                title=title,
+                body=body[:480],
+                link=f"https://localhost:5173?tab=tracker&ticker={metric.ticker}",
+                preferred_channels=channels,
+                to_number=await self._resolve_notification_phone(
+                    user_id=agent.get("user_id"),
+                    agent=agent,
+                    tooling=tooling,
+                    notification_prefs=notification_prefs,
+                ),
+                metadata={
+                    "ticker": metric.ticker,
+                    "price": metric.price,
+                    "change_percent": round(effective_price_change, 2),
+                    "reason": "; ".join(reasons),
+                    "agent_id": agent.get("id"),
+                    "event_type": event_type,
+                },
+            )
+        else:
+            notification = {
+                "channels": channels,
+                "delivered": False,
+                "skipped": True,
+                "reason": block_reason,
+                "twilio": {"attempted": False, "delivered": False},
+                "poke": {"attempted": False, "delivered": False},
+            }
+
         alert = tracker_repo.create_alert(
             symbol=metric.ticker,
             trigger_reason="; ".join(reasons),
             narrative=narrative,
             market_snapshot={
                 "price": metric.price,
-                "change_percent": round(price_change, 2),
+                "change_percent": round(effective_price_change, 2),
                 "volume": metric.volume,
+                "volume_ratio": round(volume_ratio, 3),
                 "sentiment": aggregate,
                 "x_sentiment": x_score,
+                "baseline_mode": baseline_mode,
+                "baseline_price": baseline_price,
             },
-            investigation_data={"research": research},
+            investigation_data={
+                "research": research,
+                "investigation": quick_investigation,
+                "simulation": simulation_context,
+                "simulation_session_id": launched_session_id,
+                "notification": notification,
+                "tooling": tooling,
+                "notification_preferences": notification_prefs,
+                "event_type": event_type,
+                "baseline_mode": baseline_mode,
+            },
             user_id=agent.get("user_id"),
             agent_id=agent.get("id"),
+            simulation_id=launched_session_id,
+            poke_sent=bool(notification.get("delivered")),
         )
-        update_payload = {
-            "last_alert_at": datetime.now(timezone.utc).isoformat(),
-            "total_alerts": int(agent.get("total_alerts") or 0) + 1,
+        alert_context_payload = {
+            "event_type": event_type,
+            "reasons": reasons,
+            "analysis_context": context,
+            "market_snapshot": {
+                "price": metric.price,
+                "change_percent": round(effective_price_change, 2),
+                "volume": metric.volume,
+                "volume_ratio": round(volume_ratio, 3),
+                "baseline_mode": baseline_mode,
+                "baseline_price": baseline_price,
+            },
+            "research_snapshot": research,
+            "quick_investigation": quick_investigation,
+            "recent_alerts": recent_alert_context,
+            "recent_analysis_context": prior_context_rows,
+            "simulation": simulation_context or {},
+            "simulation_session_id": launched_session_id,
+            "tooling": tooling,
         }
+        tracker_repo.create_alert_context(
+            user_id=agent.get("user_id"),
+            agent_id=str(agent.get("id")),
+            symbol=metric.ticker,
+            alert_id=str(alert.get("id")) if alert.get("id") else None,
+            event_type=event_type,
+            context_summary=f"{'; '.join(reasons)} | price={float(metric.price):.2f}"[:300],
+            context_payload=alert_context_payload,
+            simulation_requested=simulation_requested,
+        )
+        if agent.get("user_id") and agent.get("id"):
+            try:
+                await asyncio.to_thread(
+                    append_alert_context_csv,
+                    user_id=str(agent.get("user_id")),
+                    agent_id=str(agent.get("id")),
+                    symbol=str(metric.ticker),
+                    event_type=event_type,
+                    generated_at=now.isoformat(),
+                    alert_id=str(alert.get("id")) if alert.get("id") else None,
+                    context_summary=f"{'; '.join(reasons)} | price={float(metric.price):.2f}"[:300],
+                    simulation_requested=simulation_requested,
+                    context_payload=alert_context_payload,
+                )
+            except Exception:
+                pass
+        update_payload = {
+            "last_checked_at": now.isoformat(),
+            "last_alert_at": now.isoformat(),
+            "last_price": float(metric.price),
+        }
+        if event_type == "alert":
+            update_payload["total_alerts"] = int(agent.get("total_alerts") or 0) + 1
+            existing_triggers = agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {}
+            update_payload["triggers"] = {
+                **(existing_triggers or {}),
+                "last_alert_price": float(metric.price),
+            }
         tracker_repo.update_agent(user_id=agent.get("user_id"), agent_id=str(agent.get("id")), updates=update_payload)
+
+        tracker_repo.create_run(
+            user_id=agent.get("user_id"),
+            agent_id=str(agent.get("id")),
+            symbol=metric.ticker,
+            run_type=event_type,
+            trigger_reasons=reasons,
+            tools_used=list(tools),
+            research_sources=list(tooling.get("research_sources") or []),
+            market_snapshot={
+                "price": metric.price,
+                "price_change_pct": round(effective_price_change, 4),
+                "baseline_mode": baseline_mode,
+                "baseline_price": baseline_price,
+                "volume": metric.volume,
+                "volume_ratio": round(volume_ratio, 4),
+            },
+            research_snapshot=research,
+            simulation_snapshot={
+                "context": simulation_context or {},
+                "session_id": launched_session_id,
+            },
+            decision={
+                "notification": notification,
+                "event_type": event_type,
+            },
+            note=narrative[:400],
+        )
+        await self._update_agent_thesis(
+            agent=agent,
+            metric=metric,
+            event_type=event_type,
+            reasons=reasons,
+            narrative=narrative,
+            price_change=effective_price_change,
+            research=research,
+            simulation_context=simulation_context,
+        )
+
         await log_agent_activity(
             module="tracker",
             agent_name=str(agent.get("name") or f"{metric.ticker} Associate"),
-            action=f"Published associate alert for {metric.ticker}",
+            action=f"Published associate {event_type} for {metric.ticker}",
             status="success",
             user_id=agent.get("user_id"),
             details={
                 "agent_id": agent.get("id"),
                 "symbol": metric.ticker,
-                "description": "Generated narrative from price/volume/sentiment context and persisted alert.",
+                "description": "Generated narrative from configured tools and persisted tracker output.",
+                "event_type": event_type,
                 "trigger_reason": "; ".join(reasons),
                 "narrative": narrative[:300],
+                "notification_delivered": bool(notification.get("delivered")),
+                "channels": channels,
+                "simulation_session_id": launched_session_id,
+                "baseline_mode": baseline_mode,
             },
         )
         return {
             "ticker": metric.ticker,
             "agent_id": agent.get("id"),
             "agent_name": agent.get("name"),
+            "event_type": event_type,
             "reason": "; ".join(reasons),
             "analysis": narrative,
-            "change_percent": round(price_change, 2),
+            "change_percent": round(effective_price_change, 2),
             "price": metric.price,
             "alert_id": alert.get("id"),
+            "alert_time": alert.get("created_at"),
+            "notification": notification,
+            "simulation": simulation_context,
+            "simulation_session_id": launched_session_id,
+            "baseline_mode": baseline_mode,
         }
 
     async def poll_once(self) -> TrackerSnapshot:
-        metrics = await asyncio.to_thread(fetch_watchlist_metrics, self.list_watchlist())
+        now = datetime.now(timezone.utc)
+
         symbol_agents: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for agent in tracker_repo.list_agents(user_id=None):
+        agents = tracker_repo.list_agents(user_id=None)
+        for agent in agents:
             if str(agent.get("status", "")).lower() != "active":
                 continue
             symbol = str(agent.get("symbol", "")).upper()
             if symbol:
                 symbol_agents[symbol].append(agent)
 
+        symbols = set(self.list_watchlist())
+        symbols.update(symbol_agents.keys())
+        metrics = await asyncio.to_thread(fetch_watchlist_metrics, sorted(symbols))
+
         alerts_triggered: List[Dict[str, Any]] = []
         for metric in metrics:
             attached_agents = symbol_agents.get(metric.ticker, [])
-            if attached_agents:
-                for agent in attached_agents:
-                    await log_agent_activity(
-                        module="tracker",
-                        agent_name=str(agent.get("name") or f"{metric.ticker} Tracker"),
-                        action=f"Monitoring {metric.ticker}: price {metric.price:.2f}, move {metric.change_percent:.2f}%",
-                        status="running",
-                        user_id=agent.get("user_id"),
-                        details={
-                            "agent_id": agent.get("id"),
-                            "symbol": metric.ticker,
-                            "description": "Scanning live quote and trigger thresholds.",
-                            "change_percent": metric.change_percent,
-                            "volume": metric.volume,
-                        },
-                    )
-            else:
-                await log_agent_activity(
-                    module="tracker",
-                    agent_name=f"{metric.ticker} Tracker",
-                    action=f"Price check {metric.ticker} @ {metric.price}",
-                    status="running",
-                    details={
-                        "symbol": metric.ticker,
-                        "description": "Price scan completed with no dedicated deployed agent found.",
-                        "change_percent": metric.change_percent,
-                        "volume": metric.volume,
-                    },
-                )
             previous = self._previous.get(metric.ticker)
-            if previous:
-                price_change = ((metric.price - previous["price"]) / previous["price"]) * 100 if previous["price"] else 0
-                volume_spike = metric.volume and previous.get("volume") and metric.volume > previous["volume"] * 1.8
+            previous_price = float(previous.get("price", 0.0)) if previous else 0.0
+            previous_volume = float(previous.get("volume", 0.0)) if previous else 0.0
+            price_change = ((metric.price - previous_price) / previous_price) * 100 if previous_price else 0.0
+            observed_volume_ratio = (float(metric.volume or 0.0) / previous_volume) if previous_volume > 0 else 1.0
+            generic_volume_spike = observed_volume_ratio >= 1.8
+
+            if attached_agents:
+                evaluation_tasks: list[asyncio.Task] = []
                 for agent in attached_agents:
-                    if self._agent_in_cooldown(agent):
+                    tooling = self._agent_tooling_config(agent)
+                    if not self._agent_poll_due(agent, tooling, now):
+                        continue
+                    if self._agent_in_cooldown(agent) and str(tooling.get("report_mode") or "triggers_only") == "triggers_only":
                         await log_agent_activity(
                             module="tracker",
                             agent_name=str(agent.get("name") or f"{metric.ticker} Associate"),
@@ -350,99 +1247,147 @@ class TrackerService:
                             },
                         )
                         continue
-                    agent_alert = await self._evaluate_agent(agent=agent, metric=metric, price_change=price_change, volume_spike=bool(volume_spike))
-                    if agent_alert:
-                        alerts_triggered.append(agent_alert)
 
-                for alert in self.alerts:
-                    if alert.ticker != metric.ticker:
-                        continue
-                    if alert.direction == "up" and price_change < alert.threshold_percent:
-                        continue
-                    if alert.direction == "down" and price_change > -alert.threshold_percent:
-                        continue
-                    if alert.direction == "either" and abs(price_change) < alert.threshold_percent:
-                        continue
-                    alerts_triggered.append(
-                        {
-                            "ticker": metric.ticker,
-                            "reason": f"Custom alert threshold hit ({price_change:.2f}%).",
-                            "change_percent": round(price_change, 2),
-                        }
-                    )
-                    tracker_repo.create_alert(
-                        symbol=metric.ticker,
-                        trigger_reason=f"Custom alert threshold hit ({price_change:.2f}%).",
-                        narrative=None,
-                        market_snapshot={"price": metric.price, "change_percent": round(price_change, 2)},
-                        user_id=None,
-                    )
                     await log_agent_activity(
                         module="tracker",
-                        agent_name=f"{metric.ticker} Tracker",
-                        action=f"Custom trigger fired for {metric.ticker}",
-                        status="success",
+                        agent_name=str(agent.get("name") or f"{metric.ticker} Tracker"),
+                        action=f"Monitoring {metric.ticker}: price {metric.price:.2f}, move {price_change:.2f}%",
+                        status="running",
+                        user_id=agent.get("user_id"),
                         details={
+                            "agent_id": agent.get("id"),
                             "symbol": metric.ticker,
-                            "description": "Alert condition matched custom price-change threshold.",
-                            "price_change": round(price_change, 2),
-                            "threshold": alert.threshold_percent,
-                        },
-                    )
-
-                if abs(price_change) > 2.0 or volume_spike:
-                    trigger_context = (
-                        f"price_change={price_change:.2f}% volume={metric.volume} prior_volume={previous.get('volume')}"
-                    )
-                    why = await self._investigate_with_perplexity(metric.ticker, trigger_context)
-                    synthesis = await self._synthesize_narrative(metric.ticker, why)
-                    event = {
-                        "ticker": metric.ticker,
-                        "reason": trigger_context,
-                        "investigation": why,
-                        "analysis": synthesis,
-                        "change_percent": round(price_change, 2),
-                        "price": metric.price,
-                    }
-                    poke_handoff = await prepare_poke_recipe_handoff(
-                        settings=self.settings,
-                        title=f"TickerMaster Alert: {metric.ticker}",
-                        body=synthesis[:200],
-                        link=f"https://localhost:5173?tab=simulation&ticker={metric.ticker}",
-                        metadata={
-                            "ticker": metric.ticker,
-                            "price": metric.price,
-                            "change_percent": round(price_change, 2),
-                            "reason": trigger_context,
-                        },
-                    )
-                    event["poke"] = poke_handoff
-                    event["poke_sent"] = bool(poke_handoff.get("delivered"))
-                    alerts_triggered.append(event)
-                    tracker_repo.create_alert(
-                        symbol=metric.ticker,
-                        trigger_reason=trigger_context,
-                        narrative=synthesis,
-                        market_snapshot={
-                            "price": metric.price,
-                            "change_percent": round(price_change, 2),
+                            "description": "Scanning configured tools and thresholds.",
+                            "change_percent": round(price_change, 3),
                             "volume": metric.volume,
-                        },
-                        investigation_data={"investigation": why, "poke": poke_handoff},
-                        user_id=None,
-                        poke_sent=bool(poke_handoff.get("delivered")),
-                    )
-                    await log_agent_activity(
-                        module="tracker",
-                        agent_name=f"{metric.ticker} Tracker",
-                        action=f"Pipeline alert fired for {metric.ticker}",
-                        status="success",
-                        details={
-                            "symbol": metric.ticker,
-                            "description": "Full investigation pipeline ran and narrative alert was generated.",
-                            "reason": trigger_context,
+                            "volume_ratio": round(observed_volume_ratio, 3),
+                            "tools": tooling.get("tools"),
                         },
                     )
+                    evaluation_tasks.append(
+                        asyncio.create_task(
+                            self._evaluate_agent(
+                                agent=agent,
+                                metric=metric,
+                                price_change=price_change,
+                                volume_ratio=observed_volume_ratio,
+                            )
+                        )
+                    )
+
+                if evaluation_tasks:
+                    results = await asyncio.gather(*evaluation_tasks, return_exceptions=True)
+                    for result in results:
+                        if isinstance(result, Exception) or result is None:
+                            continue
+                        alerts_triggered.append(result)
+            else:
+                await log_agent_activity(
+                    module="tracker",
+                    agent_name=f"{metric.ticker} Tracker",
+                    action=f"Price check {metric.ticker} @ {metric.price}",
+                    status="running",
+                    details={
+                        "symbol": metric.ticker,
+                        "description": "Price scan completed with no dedicated deployed agent found.",
+                        "change_percent": round(price_change, 3),
+                        "volume": metric.volume,
+                        "volume_ratio": round(observed_volume_ratio, 3),
+                    },
+                )
+
+            for alert in self.alerts:
+                if alert.ticker != metric.ticker:
+                    continue
+                if alert.direction == "up" and price_change < alert.threshold_percent:
+                    continue
+                if alert.direction == "down" and price_change > -alert.threshold_percent:
+                    continue
+                if alert.direction == "either" and abs(price_change) < alert.threshold_percent:
+                    continue
+                alerts_triggered.append(
+                    {
+                        "ticker": metric.ticker,
+                        "reason": f"Custom alert threshold hit ({price_change:.2f}%).",
+                        "change_percent": round(price_change, 2),
+                    }
+                )
+                tracker_repo.create_alert(
+                    symbol=metric.ticker,
+                    trigger_reason=f"Custom alert threshold hit ({price_change:.2f}%).",
+                    narrative=None,
+                    market_snapshot={"price": metric.price, "change_percent": round(price_change, 2)},
+                    user_id=None,
+                )
+                await log_agent_activity(
+                    module="tracker",
+                    agent_name=f"{metric.ticker} Tracker",
+                    action=f"Custom trigger fired for {metric.ticker}",
+                    status="success",
+                    details={
+                        "symbol": metric.ticker,
+                        "description": "Alert condition matched custom price-change threshold.",
+                        "price_change": round(price_change, 2),
+                        "threshold": alert.threshold_percent,
+                    },
+                )
+
+            # Keep a baseline crawler for unassigned watchlist symbols.
+            if (not attached_agents) and (abs(price_change) > 2.0 or generic_volume_spike):
+                trigger_context = (
+                    f"price_change={price_change:.2f}% volume={metric.volume} prior_volume={previous_volume:.0f}"
+                )
+                why = await self._investigate_with_perplexity(metric.ticker, trigger_context)
+                synthesis = await self._synthesize_narrative(metric.ticker, why)
+                notification = await dispatch_alert_notification(
+                    settings=self.settings,
+                    title=f"TickerMaster Alert: {metric.ticker}",
+                    body=synthesis[:220],
+                    link=f"https://localhost:5173?tab=tracker&ticker={metric.ticker}",
+                    preferred_channels=["twilio", "poke"],
+                    metadata={
+                        "ticker": metric.ticker,
+                        "price": metric.price,
+                        "change_percent": round(price_change, 2),
+                        "reason": trigger_context,
+                    },
+                )
+                event = {
+                    "ticker": metric.ticker,
+                    "reason": trigger_context,
+                    "investigation": why,
+                    "analysis": synthesis,
+                    "change_percent": round(price_change, 2),
+                    "price": metric.price,
+                    "notification": notification,
+                }
+                alerts_triggered.append(event)
+                tracker_repo.create_alert(
+                    symbol=metric.ticker,
+                    trigger_reason=trigger_context,
+                    narrative=synthesis,
+                    market_snapshot={
+                        "price": metric.price,
+                        "change_percent": round(price_change, 2),
+                        "volume": metric.volume,
+                        "volume_ratio": round(observed_volume_ratio, 3),
+                    },
+                    investigation_data={"investigation": why, "notification": notification},
+                    user_id=None,
+                    poke_sent=bool(notification.get("delivered")),
+                )
+                await log_agent_activity(
+                    module="tracker",
+                    agent_name=f"{metric.ticker} Tracker",
+                    action=f"Baseline crawler alert fired for {metric.ticker}",
+                    status="success",
+                    details={
+                        "symbol": metric.ticker,
+                        "description": "Independent crawler detected unusual move and sent notification.",
+                        "reason": trigger_context,
+                        "notification_delivered": bool(notification.get("delivered")),
+                    },
+                )
 
             self._previous[metric.ticker] = {
                 "price": metric.price,

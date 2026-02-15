@@ -4,9 +4,10 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from app.routers.api import sanitize_tracker_triggers
 from app.schemas import AlertConfig, TrackerWatchlistRequest
 from app.services.market_data import fetch_watchlist_metrics
 from app.services.tracker_repository import tracker_repo
@@ -98,11 +99,14 @@ async def poll_now(request: Request):
 @router.post("/agents")
 async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Request, user_id: str | None = None):
     resolved_user_id = user_id or get_user_id_from_request(request)
+    clean_triggers = sanitize_tracker_triggers(payload.triggers)
+    if not str(clean_triggers.get("start_at") or "").strip():
+        raise HTTPException(status_code=422, detail="start_at is required.")
     return tracker_repo.create_agent(
         user_id=resolved_user_id,
         symbol=payload.symbol,
         name=payload.name,
-        triggers=payload.triggers,
+        triggers=clean_triggers,
         auto_simulate=payload.auto_simulate,
     )
 
@@ -116,7 +120,17 @@ async def list_tracker_agents(request: Request, user_id: str | None = None):
 @router.patch("/agents/{agent_id}")
 async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, request: Request, user_id: str | None = None):
     resolved_user_id = user_id or get_user_id_from_request(request)
-    item = tracker_repo.update_agent(user_id=resolved_user_id, agent_id=agent_id, updates=payload.model_dump(exclude_none=True))
+    existing = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
+    if existing is None:
+        return {"error": "not_found"}
+    updates = payload.model_dump(exclude_none=True)
+    if "triggers" in updates and isinstance(updates["triggers"], dict):
+        existing_triggers = sanitize_tracker_triggers(existing.get("triggers")) if isinstance(existing.get("triggers"), dict) else {}
+        merged_triggers = {**existing_triggers, **sanitize_tracker_triggers(updates["triggers"])}
+        if not str(merged_triggers.get("start_at") or "").strip():
+            raise HTTPException(status_code=422, detail="start_at is required.")
+        updates["triggers"] = merged_triggers
+    item = tracker_repo.update_agent(user_id=resolved_user_id, agent_id=agent_id, updates=updates)
     return item or {"error": "not_found"}
 
 

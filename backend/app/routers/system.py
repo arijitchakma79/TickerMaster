@@ -35,6 +35,7 @@ async def integrations(request: Request):
         "polymarket": True,
         "modal": bool(settings.modal_token_id),
         "poke_recipe": bool(settings.poke_recipe_enabled),
+        "twilio": bool(settings.twilio_account_sid and settings.twilio_auth_token and settings.twilio_from_number),
         "cerebras": bool(settings.cerebras_api_key),
         "nvidia_nim": bool(settings.nvidia_nim_api_key),
     }

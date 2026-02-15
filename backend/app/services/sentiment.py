@@ -172,6 +172,16 @@ _REDDIT_TOKEN_STOPWORDS = {
 
 _MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 _MARKDOWN_CITATION_PATTERN = re.compile(r"\s*\[(?:\d+(?:\s*,\s*\d+)*)\]")
+_SOURCE_LABELS = {
+    "perplexity": "Perplexity Sonar",
+    "x": "X API",
+    "reddit": "Reddit API",
+}
+_SOURCE_WEIGHTS = {
+    "perplexity": 0.45,
+    "reddit": 0.30,
+    "x": 0.25,
+}
 
 
 def _site_name_from_url(url: str) -> str:
@@ -791,6 +801,155 @@ def _build_narratives(items: List[SentimentBreakdown]) -> List[str]:
         lines.append("Downside case: valuation and macro uncertainty can trigger drawdowns on negative surprises.")
     lines.append("Execution note: use smaller sizes around event windows due to elevated slippage risk.")
     return lines
+
+
+def _normalize_source_selection(sources: List[str] | None) -> List[str]:
+    if not sources:
+        return ["perplexity", "x", "reddit"]
+
+    aliases = {
+        "perplexity": "perplexity",
+        "sonar": "perplexity",
+        "x": "x",
+        "twitter": "x",
+        "reddit": "reddit",
+        "deep": "perplexity",
+    }
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in sources:
+        token = str(item or "").strip().lower()
+        key = aliases.get(token)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out or ["perplexity", "x", "reddit"]
+
+
+def _aggregate_for_sources(breakdown: List[SentimentBreakdown], selected_sources: List[str]) -> float:
+    if not breakdown:
+        return 0.0
+    weights = {
+        source: _SOURCE_WEIGHTS.get(source, 0.0)
+        for source in selected_sources
+        if source in _SOURCE_WEIGHTS
+    }
+    total_weight = sum(weights.values())
+    if total_weight <= 0:
+        return 0.0
+
+    score_by_label = {row.source: row.score for row in breakdown}
+    aggregate = 0.0
+    for source, weight in weights.items():
+        label = _SOURCE_LABELS[source]
+        aggregate += float(score_by_label.get(label, 0.0)) * (weight / total_weight)
+    return aggregate
+
+
+async def run_research_with_source_selection(
+    request: ResearchRequest,
+    settings: Settings,
+    sources: List[str] | None = None,
+) -> ResearchResponse:
+    selected_sources = _normalize_source_selection(sources)
+    include_prediction_markets = bool(request.include_prediction_markets)
+
+    cache_suffix = ",".join(sorted(selected_sources))
+    cache_key = f"research:v6:{request.timeframe}:{int(include_prediction_markets)}:{cache_suffix}"
+    ticker = request.ticker.upper().strip()
+    cached = get_cached_research(ticker, cache_key)
+    if cached:
+        return ResearchResponse(**cached)
+
+    tasks: dict[str, asyncio.Future] = {}
+    if "perplexity" in selected_sources:
+        tasks["perplexity"] = asyncio.create_task(_perplexity_summary(ticker, settings))
+    if "x" in selected_sources:
+        tasks["x"] = asyncio.create_task(_x_summary(ticker, settings))
+    if "reddit" in selected_sources:
+        tasks["reddit"] = asyncio.create_task(_reddit_summary(ticker, settings))
+
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True) if tasks else []
+    payload_by_key: Dict[str, Dict[str, Any]] = {}
+    for key, result in zip(tasks.keys(), results):
+        if isinstance(result, Exception):
+            continue
+        if isinstance(result, dict):
+            payload_by_key[key] = result
+
+    breakdown: List[SentimentBreakdown] = []
+    for source_key in selected_sources:
+        item = payload_by_key.get(source_key)
+        if not item:
+            continue
+        label = _SOURCE_LABELS.get(source_key)
+        if not label:
+            continue
+        breakdown.append(
+            SentimentBreakdown(
+                source=label,
+                sentiment=_label(float(item.get("score", 0.0))),
+                score=round(float(item.get("score", 0.0)), 3),
+                summary=str(item.get("summary") or ""),
+                links=item.get("links") or [],
+            )
+        )
+
+    if not breakdown:
+        # Fall back to the full pipeline if source-targeted collection yielded nothing.
+        return await run_research(request, settings)
+
+    prediction_markets: List[Dict[str, Any]] = []
+    if include_prediction_markets:
+        company_name = ""
+        try:
+            lookup = await search_tickers(ticker, limit=1)
+            if lookup:
+                company_name = str(lookup[0].name or "")
+        except Exception:
+            company_name = ""
+
+        kalshi_markets, polymarket_markets = await asyncio.gather(
+            fetch_kalshi_markets(ticker, settings, company_name=company_name),
+            fetch_polymarket_markets(ticker, settings, company_name=company_name),
+        )
+        prediction_markets = sorted(
+            kalshi_markets + polymarket_markets,
+            key=lambda item: float(item.get("relevance_score", 0.0) or 0.0),
+            reverse=True,
+        )
+        if len(prediction_markets) == 0:
+            prediction_markets = _synthetic_prediction_fallback(ticker, company_name=company_name)
+
+    aggregate = float(_aggregate_for_sources(breakdown, selected_sources))
+    links = [
+        SourceLink(source="Perplexity Sonar", title="Perplexity", url="https://www.perplexity.ai"),
+        SourceLink(source="X API", title="X Developer", url="https://developer.x.com/en/docs"),
+        SourceLink(source="Reddit API", title="Reddit Dev", url="https://www.reddit.com/dev/api/"),
+        SourceLink(source="Kalshi API", title="Kalshi Docs", url="https://docs.kalshi.com/"),
+        SourceLink(source="Polymarket", title="Polymarket", url="https://docs.polymarket.com/"),
+    ]
+
+    response = ResearchResponse(
+        ticker=ticker,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        aggregate_sentiment=round(aggregate, 3),
+        recommendation=_recommendation(aggregate),
+        narratives=_build_narratives(breakdown),
+        source_breakdown=breakdown,
+        prediction_markets=prediction_markets,
+        tool_links=links,
+    )
+    set_cached_research(ticker, cache_key, response.model_dump(), ttl_minutes=10)
+    await log_agent_activity(
+        module="research",
+        agent_name="Composite Sentiment",
+        action=f"Computed selective sentiment for {ticker}",
+        status="success",
+        details={"score": response.aggregate_sentiment, "sources": selected_sources},
+    )
+    return response
 
 
 async def run_research(request: ResearchRequest, settings: Settings) -> ResearchResponse:
