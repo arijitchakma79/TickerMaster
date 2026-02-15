@@ -55,7 +55,10 @@ function normalizeWatchlist(tickers: string[]) {
   return Array.from(new Set(cleaned));
 }
 
-function shouldRequireUsername(profile: UserProfile | null, authEmail?: string) {
+function shouldRequireUsername(
+  profile: UserProfile | null,
+  authEmail?: string,
+) {
   if (!profile) return true;
   const displayName = (profile.display_name ?? "").trim();
   const email = (profile.email ?? authEmail ?? "").trim();
@@ -146,13 +149,26 @@ export default function App() {
         setWorkspaceLoading(true);
       }
       try {
-        const [serverWatchlist, favoriteSymbols, profilePayload] = await Promise.all([
-          getWatchlist().catch(() => []),
-          authSession?.user?.id ? getFavoriteStocks().catch(() => []) : Promise.resolve([]),
-          authSession?.user?.id
-            ? getUserProfile().catch(() => ({ user_id: null, profile: null, require_username_setup: false, username_locked: false }))
-            : Promise.resolve({ user_id: null, profile: null, require_username_setup: false, username_locked: false }),
-        ]);
+        const [serverWatchlist, favoriteSymbols, profilePayload] =
+          await Promise.all([
+            getWatchlist().catch(() => []),
+            authSession?.user?.id
+              ? getFavoriteStocks().catch(() => [])
+              : Promise.resolve([]),
+            authSession?.user?.id
+              ? getUserProfile().catch(() => ({
+                  user_id: null,
+                  profile: null,
+                  require_username_setup: false,
+                  username_locked: false,
+                }))
+              : Promise.resolve({
+                  user_id: null,
+                  profile: null,
+                  require_username_setup: false,
+                  username_locked: false,
+                }),
+          ]);
 
         if (!active) return;
         const synced = normalizeWatchlist(serverWatchlist);
@@ -227,7 +243,9 @@ export default function App() {
   }, [avatarCropSource]);
 
   useEffect(() => {
-    let favicon = document.querySelector("link[rel='icon']") as HTMLLinkElement | null;
+    let favicon = document.querySelector(
+      "link[rel='icon']",
+    ) as HTMLLinkElement | null;
     if (!favicon) {
       favicon = document.createElement("link");
       favicon.rel = "icon";
@@ -310,7 +328,10 @@ export default function App() {
         setAwaitingEmailConfirm(false);
         setAuthModalOpen(false);
       } else {
-        const session = await signUpWithPassword(authEmail.trim(), authPassword);
+        const session = await signUpWithPassword(
+          authEmail.trim(),
+          authPassword,
+        );
         if (!session) {
           setAwaitingEmailConfirm(true);
           setAuthError("");
@@ -321,14 +342,17 @@ export default function App() {
       }
       setAuthPassword("");
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : "Authentication failed.");
+      setAuthError(
+        error instanceof Error ? error.message : "Authentication failed.",
+      );
     } finally {
       setAuthLoading(false);
     }
   }
 
   useEffect(() => {
-    if (!authModalOpen || !awaitingEmailConfirm || authMode !== "sign_up") return;
+    if (!authModalOpen || !awaitingEmailConfirm || authMode !== "sign_up")
+      return;
     if (!authEmail.trim() || !authPassword) return;
     if (authSession?.user?.id) return;
 
@@ -352,7 +376,14 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [authModalOpen, awaitingEmailConfirm, authMode, authEmail, authPassword, authSession?.user?.id]);
+  }, [
+    authModalOpen,
+    awaitingEmailConfirm,
+    authMode,
+    authEmail,
+    authPassword,
+    authSession?.user?.id,
+  ]);
 
   async function tryCompleteEmailConfirmation() {
     if (!authEmail.trim() || !authPassword) return;
@@ -364,7 +395,11 @@ export default function App() {
       setAuthModalOpen(false);
       setAuthPassword("");
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : "Confirmation not complete yet.");
+      setAuthError(
+        error instanceof Error
+          ? error.message
+          : "Confirmation not complete yet.",
+      );
     } finally {
       setAuthLoading(false);
     }
@@ -391,7 +426,12 @@ export default function App() {
   async function buildAvatarDataUrlIfNeeded() {
     if (!avatarCropSource) return undefined;
     try {
-      return await cropAvatarToDataUrl(avatarCropSource, avatarZoom, avatarOffsetX, avatarOffsetY);
+      return await cropAvatarToDataUrl(
+        avatarCropSource,
+        avatarZoom,
+        avatarOffsetX,
+        avatarOffsetY,
+      );
     } catch {
       throw new Error("Could not crop avatar image.");
     }
@@ -422,14 +462,17 @@ export default function App() {
       setUserProfile({
         display_name: nextProfile.display_name,
         avatar_url: nextProfile.avatar_url,
-        email: nextProfile.email ?? userProfile?.email ?? authSession?.user?.email,
+        email:
+          nextProfile.email ?? userProfile?.email ?? authSession?.user?.email,
         require_username_setup: false,
         username_locked: true,
       });
       setUsernameSetupOpen(false);
       resetAvatarCropEditor();
     } catch (error) {
-      setProfileError(error instanceof Error ? error.message : "Unable to save username.");
+      setProfileError(
+        error instanceof Error ? error.message : "Unable to save username.",
+      );
     } finally {
       setProfileSaving(false);
     }
@@ -444,9 +487,14 @@ export default function App() {
         avatar_data_url: avatarDataUrl,
       });
       if (!response.ok) {
-        throw new Error("Could not save profile image right now. Please try again.");
+        throw new Error(
+          "Could not save profile image right now. Please try again.",
+        );
       }
-      const savedAvatar = response.profile?.avatar_url ?? avatarDataUrl ?? userProfile?.avatar_url;
+      const savedAvatar =
+        response.profile?.avatar_url ??
+        avatarDataUrl ??
+        userProfile?.avatar_url;
       setUserProfile((prev) => ({
         ...(prev ?? {}),
         avatar_url: savedAvatar,
@@ -455,7 +503,11 @@ export default function App() {
       setProfileModalOpen(false);
       resetAvatarCropEditor();
     } catch (error) {
-      setProfileError(error instanceof Error ? error.message : "Unable to save profile image.");
+      setProfileError(
+        error instanceof Error
+          ? error.message
+          : "Unable to save profile image.",
+      );
     } finally {
       setProfileSaving(false);
     }
@@ -508,10 +560,7 @@ export default function App() {
               playsInline
               preload="auto"
             >
-              <source
-                src={LANDING_VIDEO_SRC}
-                type="video/mp4"
-              />
+              <source src={LANDING_VIDEO_SRC} type="video/mp4" />
             </video>
           </div>
           <div className="wallstreet-video-overlay" aria-hidden="true" />
@@ -520,7 +569,11 @@ export default function App() {
 
       <div className="brand-corner">
         <div className="brand-lockup" aria-label="TickerMaster">
-          <img src={brandLogo} alt="TickerMaster" className="brand-logo-image" />
+          <img
+            src={brandLogo}
+            alt="TickerMaster"
+            className="brand-logo-image"
+          />
         </div>
       </div>
       <div className="toggle-corner">
@@ -558,13 +611,22 @@ export default function App() {
                 }}
               >
                 {userProfile?.avatar_url ? (
-                  <img src={userProfile.avatar_url} alt="Profile" className="profile-avatar" />
+                  <img
+                    src={userProfile.avatar_url}
+                    alt="Profile"
+                    className="profile-avatar"
+                  />
                 ) : (
-                  <span className="profile-avatar profile-avatar-fallback">{profileName.slice(0, 1).toUpperCase()}</span>
+                  <span className="profile-avatar profile-avatar-fallback">
+                    {profileName.slice(0, 1).toUpperCase()}
+                  </span>
                 )}
                 <span className="profile-name">{profileName}</span>
               </button>
-              <button className="secondary auth-btn account-signout" onClick={() => void signOut()}>
+              <button
+                className="secondary auth-btn account-signout"
+                onClick={() => void signOut()}
+              >
                 Sign Out
               </button>
             </div>
@@ -578,7 +640,9 @@ export default function App() {
         )
       ) : (
         <div className="account-corner">
-          <span className="muted auth-config-hint auth-config-hint-left">Set Supabase env vars to enable sign in.</span>
+          <span className="muted auth-config-hint auth-config-hint-left">
+            Set Supabase env vars to enable sign in.
+          </span>
         </div>
       )}
 
@@ -680,7 +744,9 @@ export default function App() {
                 trackerEvent={lastTrackerSnapshot}
               />
             ) : null}
-            {tab === "tracker" ? <TrackerPrefsRail connected={connected} /> : null}
+            {tab === "tracker" ? (
+              <TrackerPrefsRail connected={connected} />
+            ) : null}
           </main>
         </>
       ) : (
@@ -689,9 +755,16 @@ export default function App() {
             <div className="tv-tape" aria-label="Market ticker">
               <div className="tv-tape-marquee">
                 {[0, 1].map((loop) => (
-                  <div className="tv-tape-track" aria-hidden={loop === 1} key={loop}>
+                  <div
+                    className="tv-tape-track"
+                    aria-hidden={loop === 1}
+                    key={loop}
+                  >
                     {landingTapeItems.map((item) => (
-                      <span className="tv-tape-item" key={`${loop}-${item.symbol}`}>
+                      <span
+                        className="tv-tape-item"
+                        key={`${loop}-${item.symbol}`}
+                      >
                         {item.symbol} {item.value}{" "}
                         <b className={item.up ? "up" : "down"}>{item.change}</b>
                       </span>
@@ -702,9 +775,12 @@ export default function App() {
             </div>
             <div className="tv-hero-inner">
               <p className="tv-kicker">TickerMaster Platform</p>
-              <h2 className="tv-title">Bloomberg Terminal For Retail Traders</h2>
+              <h2 className="tv-title">
+                Professional Market Intelligence For Modern Traders
+              </h2>
               <p className="tv-subtitle">
-                Public/latest sentiments summarized into high-signal narratives.
+                Research, simulation, and personalized tracking in one
+                integrated workflow.
               </p>
               <button className="tv-cta" onClick={openSignInModal}>
                 Try Now
@@ -720,15 +796,24 @@ export default function App() {
             <div className="tv-feature-grid">
               <article className="tv-feature-card">
                 <h4>AI Research Workbench</h4>
-                <p>Aggregate macro, sentiment, and market signals into a single thesis view.</p>
+                <p>
+                  Aggregate macro, sentiment, and market signals into a single
+                  thesis view.
+                </p>
               </article>
               <article className="tv-feature-card">
                 <h4>Multi-Agent Simulation</h4>
-                <p>Stress-test strategies across volatility regimes before committing capital.</p>
+                <p>
+                  Stress-test strategies across volatility regimes before
+                  committing capital.
+                </p>
               </article>
               <article className="tv-feature-card">
                 <h4>Persistent Tracker</h4>
-                <p>Maintain user-specific watchlists, favorites, alerts, and monitoring agents.</p>
+                <p>
+                  Maintain user-specific watchlists, favorites, alerts, and
+                  monitoring agents.
+                </p>
               </article>
             </div>
           </section>
@@ -745,11 +830,15 @@ export default function App() {
               </div>
               <div className="tv-stat-card">
                 <strong>Per-User Data</strong>
-                <span>Profiles, favorites, and agents persist securely by account.</span>
+                <span>
+                  Profiles, favorites, and agents persist securely by account.
+                </span>
               </div>
               <div className="tv-stat-card">
                 <strong>End-to-End Flow</strong>
-                <span>Research, simulate, and track without switching platforms.</span>
+                <span>
+                  Research, simulate, and track without switching platforms.
+                </span>
               </div>
             </div>
           </section>
@@ -766,10 +855,15 @@ export default function App() {
         <div
           className="auth-modal-backdrop"
           onClick={() =>
-            !authLoading && !awaitingEmailConfirm ? setAuthModalOpen(false) : null
+            !authLoading && !awaitingEmailConfirm
+              ? setAuthModalOpen(false)
+              : null
           }
         >
-          <div className="auth-modal" onClick={(event) => event.stopPropagation()}>
+          <div
+            className="auth-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
             <h3>{authMode === "sign_in" ? "Sign In" : "Create Account"}</h3>
             <p className="muted">
               {authMode === "sign_in"
@@ -795,8 +889,15 @@ export default function App() {
                 }
               }}
             />
-            <button onClick={() => void handleAuthSubmit()} disabled={authLoading}>
-              {authLoading ? "Working..." : authMode === "sign_in" ? "Sign In" : "Sign Up"}
+            <button
+              onClick={() => void handleAuthSubmit()}
+              disabled={authLoading}
+            >
+              {authLoading
+                ? "Working..."
+                : authMode === "sign_in"
+                  ? "Sign In"
+                  : "Sign Up"}
             </button>
             {authMode === "sign_in" ? (
               <button
@@ -814,9 +915,14 @@ export default function App() {
             {authMode === "sign_up" && awaitingEmailConfirm ? (
               <div className="auth-confirm-box">
                 <p className="muted">
-                  Check your email and click the confirmation link. We will sign you in automatically once confirmed.
+                  Check your email and click the confirmation link. We will sign
+                  you in automatically once confirmed.
                 </p>
-                <button className="secondary" onClick={() => void tryCompleteEmailConfirmation()} disabled={authLoading}>
+                <button
+                  className="secondary"
+                  onClick={() => void tryCompleteEmailConfirmation()}
+                  disabled={authLoading}
+                >
                   I've Confirmed My Email
                 </button>
               </div>
@@ -841,9 +947,14 @@ export default function App() {
 
       {usernameSetupOpen ? (
         <div className="auth-modal-backdrop">
-          <div className="auth-modal" onClick={(event) => event.stopPropagation()}>
+          <div
+            className="auth-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
             <h3>Set Your Username</h3>
-            <p className="muted">Choose your permanent username. It cannot be changed later.</p>
+            <p className="muted">
+              Choose your permanent username. It cannot be changed later.
+            </p>
             <input
               type="text"
               value={usernameInput}
@@ -855,11 +966,18 @@ export default function App() {
             />
             <label className="auth-upload-field">
               Profile Photo
-              <input type="file" accept="image/*" onChange={handleAvatarFileSelected} />
+              <input
+                type="file"
+                accept="image/*"
+                onChange={handleAvatarFileSelected}
+              />
             </label>
             {avatarCropSource ? (
               <div className="avatar-crop-stack">
-                <div className="avatar-crop-frame" aria-label="Avatar crop preview">
+                <div
+                  className="avatar-crop-frame"
+                  aria-label="Avatar crop preview"
+                >
                   <img
                     src={avatarCropSource}
                     alt="Avatar crop preview"
@@ -877,7 +995,9 @@ export default function App() {
                     max={3}
                     step={0.01}
                     value={avatarZoom}
-                    onChange={(event) => setAvatarZoom(Number(event.target.value))}
+                    onChange={(event) =>
+                      setAvatarZoom(Number(event.target.value))
+                    }
                   />
                 </label>
                 <label>
@@ -888,7 +1008,9 @@ export default function App() {
                     max={180}
                     step={1}
                     value={avatarOffsetX}
-                    onChange={(event) => setAvatarOffsetX(Number(event.target.value))}
+                    onChange={(event) =>
+                      setAvatarOffsetX(Number(event.target.value))
+                    }
                   />
                 </label>
                 <label>
@@ -899,12 +1021,17 @@ export default function App() {
                     max={180}
                     step={1}
                     value={avatarOffsetY}
-                    onChange={(event) => setAvatarOffsetY(Number(event.target.value))}
+                    onChange={(event) =>
+                      setAvatarOffsetY(Number(event.target.value))
+                    }
                   />
                 </label>
               </div>
             ) : null}
-            <button onClick={() => void handleCompleteUsernameSetup()} disabled={profileSaving}>
+            <button
+              onClick={() => void handleCompleteUsernameSetup()}
+              disabled={profileSaving}
+            >
               {profileSaving ? "Saving..." : "Continue"}
             </button>
             {profileError ? <p className="auth-error">{profileError}</p> : null}
@@ -913,18 +1040,37 @@ export default function App() {
       ) : null}
 
       {profileModalOpen ? (
-        <div className="auth-modal-backdrop" onClick={() => (!profileSaving ? setProfileModalOpen(false) : null)}>
-          <div className="auth-modal" onClick={(event) => event.stopPropagation()}>
+        <div
+          className="auth-modal-backdrop"
+          onClick={() => (!profileSaving ? setProfileModalOpen(false) : null)}
+        >
+          <div
+            className="auth-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
             <h3>Profile</h3>
-            <p className="muted">Username is permanent and cannot be changed.</p>
-            <input type="text" value={userProfile?.display_name ?? profileName} readOnly />
+            <p className="muted">
+              Username is permanent and cannot be changed.
+            </p>
+            <input
+              type="text"
+              value={userProfile?.display_name ?? profileName}
+              readOnly
+            />
             <label className="auth-upload-field">
               Upload New Profile Photo
-              <input type="file" accept="image/*" onChange={handleAvatarFileSelected} />
+              <input
+                type="file"
+                accept="image/*"
+                onChange={handleAvatarFileSelected}
+              />
             </label>
             {avatarCropSource ? (
               <div className="avatar-crop-stack">
-                <div className="avatar-crop-frame" aria-label="Avatar crop preview">
+                <div
+                  className="avatar-crop-frame"
+                  aria-label="Avatar crop preview"
+                >
                   <img
                     src={avatarCropSource}
                     alt="Avatar crop preview"
@@ -942,7 +1088,9 @@ export default function App() {
                     max={3}
                     step={0.01}
                     value={avatarZoom}
-                    onChange={(event) => setAvatarZoom(Number(event.target.value))}
+                    onChange={(event) =>
+                      setAvatarZoom(Number(event.target.value))
+                    }
                   />
                 </label>
                 <label>
@@ -953,7 +1101,9 @@ export default function App() {
                     max={180}
                     step={1}
                     value={avatarOffsetX}
-                    onChange={(event) => setAvatarOffsetX(Number(event.target.value))}
+                    onChange={(event) =>
+                      setAvatarOffsetX(Number(event.target.value))
+                    }
                   />
                 </label>
                 <label>
@@ -964,15 +1114,24 @@ export default function App() {
                     max={180}
                     step={1}
                     value={avatarOffsetY}
-                    onChange={(event) => setAvatarOffsetY(Number(event.target.value))}
+                    onChange={(event) =>
+                      setAvatarOffsetY(Number(event.target.value))
+                    }
                   />
                 </label>
               </div>
             ) : null}
-            <button onClick={() => void handleSaveProfile()} disabled={profileSaving}>
+            <button
+              onClick={() => void handleSaveProfile()}
+              disabled={profileSaving}
+            >
               {profileSaving ? "Saving..." : "Save"}
             </button>
-            <button className="secondary" onClick={() => setProfileModalOpen(false)} disabled={profileSaving}>
+            <button
+              className="secondary"
+              onClick={() => setProfileModalOpen(false)}
+              disabled={profileSaving}
+            >
               Cancel
             </button>
             {profileError ? <p className="auth-error">{profileError}</p> : null}
