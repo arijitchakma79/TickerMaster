@@ -143,6 +143,62 @@ function sentimentToneClass(score: number): "bullish" | "neutral" | "bearish" {
   return "neutral";
 }
 
+function toPercentValue(value: unknown): number | null {
+  if (value == null) return null;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) return null;
+    if (value <= 1) return value * 100;
+    return value <= 100 ? value : null;
+  }
+  if (typeof value === "string") {
+    const clean = value.trim();
+    if (!clean) return null;
+    if (clean.startsWith("[") && clean.endsWith("]")) return null;
+    const parsed = Number(clean.replace("%", "").replace(",", ""));
+    if (!Number.isFinite(parsed) || parsed < 0) return null;
+    if (parsed <= 1) return parsed * 100;
+    return parsed <= 100 ? parsed : null;
+  }
+  return null;
+}
+
+function parseOutcomePrices(raw: unknown): [number | null, number | null] {
+  if (Array.isArray(raw)) {
+    return [toPercentValue(raw[0]), toPercentValue(raw[1])];
+  }
+  if (typeof raw === "string") {
+    const text = raw.trim();
+    if (!text) return [null, null];
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        return [toPercentValue(parsed[0]), toPercentValue(parsed[1])];
+      }
+    } catch {
+      const parts = text.split(",").map((part) => part.trim());
+      if (parts.length >= 2) {
+        return [toPercentValue(parts[0]), toPercentValue(parts[1])];
+      }
+    }
+  }
+  return [null, null];
+}
+
+function predictionSignalText(market: Record<string, unknown>): string {
+  let yes = toPercentValue(market.yes_price);
+  let no = toPercentValue(market.no_price);
+
+  if (yes == null || no == null) {
+    const [yesOutcome, noOutcome] = parseOutcomePrices(market.probability);
+    if (yes == null) yes = yesOutcome;
+    if (no == null) no = noOutcome;
+  }
+  if (yes == null) yes = toPercentValue(market.probability);
+  if (yes != null && no == null) no = Math.max(0, 100 - yes);
+  if (yes == null || no == null) return "-";
+  return `Yes ${yes.toFixed(1)}% | No ${no.toFixed(1)}%`;
+}
+
 type SummarySection = {
   heading: string;
   bullets: string[];
@@ -1662,8 +1718,8 @@ export default function ResearchPanel({
                         </td>
                         <td>{String(market.market ?? "-")}</td>
                         <td>
-                          {String(
-                            market.probability ?? market.yes_price ?? "-",
+                          {predictionSignalText(
+                            market as Record<string, unknown>,
                           )}
                         </td>
                       </tr>
@@ -1672,6 +1728,15 @@ export default function ResearchPanel({
                     <tr>
                       <td colSpan={3} className="muted">
                         No relevant prediction market found for this ticker.
+                      </td>
+                    </tr>
+                  ) : null}
+                  {(research?.prediction_markets ?? []).some(
+                    (m) => m.context === "macro-adjacent",
+                  ) ? (
+                    <tr>
+                      <td colSpan={3} className="muted" style={{ fontSize: "0.85em", paddingTop: "0.5rem" }}>
+                        Showing macro/economic markets that may impact this ticker.
                       </td>
                     </tr>
                   ) : null}

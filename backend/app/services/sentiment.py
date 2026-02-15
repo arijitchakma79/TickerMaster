@@ -17,7 +17,7 @@ from app.config import Settings
 from app.schemas import ResearchRequest, ResearchResponse, SentimentBreakdown, SourceLink
 from app.services.agent_logger import log_agent_activity
 from app.services.market_data import search_tickers
-from app.services.prediction_markets import fetch_kalshi_markets, fetch_polymarket_markets
+from app.services.prediction_markets import fetch_kalshi_markets, fetch_polymarket_markets, fetch_macro_fallback_markets
 from app.services.research_cache import get_cached_research, set_cached_research
 
 
@@ -327,48 +327,6 @@ def _macro_queries_for_context(ticker: str, company_name: str | None = None) -> 
         seen.add(key)
         out.append(item)
     return out
-
-
-def _synthetic_prediction_fallback(ticker: str, company_name: str | None = None) -> List[Dict[str, Any]]:
-    name = (company_name or ticker).strip() or ticker
-    return [
-        {
-            "source": "Kalshi",
-            "market": f"Will the Fed cut rates at the next FOMC meeting? ({name} macro beta)",
-            "yes_price": "See market",
-            "link": "https://kalshi.com/markets/kxfeddecision",
-            "relevance_score": 0.42,
-            "context": "macro-adjacent",
-            "query": "fed rates",
-        },
-        {
-            "source": "Polymarket",
-            "market": f"Will U.S. CPI cool in the next release window? ({name} demand/multiple sensitivity)",
-            "probability": "See market",
-            "link": "https://polymarket.com/",
-            "relevance_score": 0.39,
-            "context": "macro-adjacent",
-            "query": "cpi inflation",
-        },
-        {
-            "source": "Polymarket",
-            "market": f"Will U.S. unemployment rise by next quarter? ({name} earnings risk proxy)",
-            "probability": "See market",
-            "link": "https://polymarket.com/",
-            "relevance_score": 0.36,
-            "context": "macro-adjacent",
-            "query": "jobs report unemployment",
-        },
-        {
-            "source": "Kalshi",
-            "market": f"Will real GDP growth beat consensus this quarter? ({name} top-line sensitivity)",
-            "yes_price": "See market",
-            "link": "https://kalshi.com/markets",
-            "relevance_score": 0.34,
-            "context": "macro-adjacent",
-            "query": "gdp growth",
-        },
-    ]
 
 
 async def _perplexity_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
@@ -795,7 +753,7 @@ def _build_narratives(items: List[SentimentBreakdown]) -> List[str]:
 
 async def run_research(request: ResearchRequest, settings: Settings) -> ResearchResponse:
     ticker = request.ticker.upper().strip()
-    cache_key = f"research:v5:{request.timeframe}:{int(request.include_prediction_markets)}"
+    cache_key = f"research:v8:{request.timeframe}:{int(request.include_prediction_markets)}"
     cached = get_cached_research(ticker, cache_key)
     if cached:
         return ResearchResponse(**cached)
@@ -832,6 +790,12 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
 
     prediction_markets = []
     if request.include_prediction_markets:
+        await log_agent_activity(
+            module="research",
+            agent_name="Prediction Markets",
+            action=f"Fetching prediction markets for {ticker}",
+            status="running",
+        )
         company_name = ""
         try:
             lookup = await search_tickers(ticker, limit=1)
@@ -849,46 +813,35 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
             reverse=True,
         )
 
-        # Fallback: if no direct ticker markets exist, return macro/company-adjacent lines
-        # (Fed rates, CPI, jobs, etc.) so prediction panel is still actionable.
-        if len(prediction_markets) == 0:
-            fallback_queries = _macro_queries_for_context(ticker, company_name=company_name)
-            fallback_batches = await asyncio.gather(
-                *[
-                    asyncio.gather(
-                        fetch_kalshi_markets(query, settings, company_name=company_name),
-                        fetch_polymarket_markets(query, settings, company_name=company_name),
-                    )
-                    for query in fallback_queries
-                ]
+        # Fallback: if no stock-specific markets found, fetch macro/economic markets
+        # These are relevant for demos and provide context on factors affecting all stocks
+        if not prediction_markets:
+            macro_markets = await fetch_macro_fallback_markets(settings, limit=5)
+            if macro_markets:
+                prediction_markets = macro_markets
+                await log_agent_activity(
+                    module="research",
+                    agent_name="Prediction Markets",
+                    action=f"Using {len(macro_markets)} macro/economic markets as fallback for {ticker}",
+                    status="success",
+                    details={"fallback": True, "macro_count": len(macro_markets)},
+                )
+            else:
+                await log_agent_activity(
+                    module="research",
+                    agent_name="Prediction Markets",
+                    action=f"No prediction markets found for {ticker}",
+                    status="pending",
+                    details={"kalshi_count": 0, "polymarket_count": 0, "macro_count": 0},
+                )
+        else:
+            await log_agent_activity(
+                module="research",
+                agent_name="Prediction Markets",
+                action=f"Found {len(prediction_markets)} relevant prediction markets for {ticker}",
+                status="success",
+                details={"kalshi_count": len(kalshi_markets), "polymarket_count": len(polymarket_markets)},
             )
-            merged: Dict[str, Dict[str, Any]] = {}
-            for query, (kalshi_batch, poly_batch) in zip(fallback_queries, fallback_batches):
-                for item in [*(kalshi_batch or []), *(poly_batch or [])]:
-                    if not isinstance(item, dict):
-                        continue
-                    link = str(item.get("link") or "")
-                    market = str(item.get("market") or "")
-                    if not link and not market:
-                        continue
-                    key = f"{item.get('source','')}|{link}|{market}".lower()
-                    existing = merged.get(key)
-                    candidate = dict(item)
-                    # Keep macro fallback visible but below direct ticker contracts.
-                    base_score = float(candidate.get("relevance_score", 0.0) or 0.0)
-                    candidate["relevance_score"] = round(max(0.15, base_score * 0.55), 3)
-                    candidate["context"] = "macro-adjacent"
-                    candidate["query"] = query
-                    if existing is None or float(candidate.get("relevance_score", 0.0) or 0.0) > float(existing.get("relevance_score", 0.0) or 0.0):
-                        merged[key] = candidate
-            prediction_markets = sorted(
-                merged.values(),
-                key=lambda item: float(item.get("relevance_score", 0.0) or 0.0),
-                reverse=True,
-            )[:6]
-
-        if len(prediction_markets) == 0:
-            prediction_markets = _synthetic_prediction_fallback(ticker, company_name=company_name)
 
     # Composite weighting from spec: Perplexity 45%, Reddit 30%, X 25%
     aggregate = float((breakdown[0].score * 0.45) + (breakdown[2].score * 0.30) + (breakdown[1].score * 0.25))
