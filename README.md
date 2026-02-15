@@ -53,6 +53,11 @@ BACKEND_URL=http://localhost:8000
 ```
 
 Add your API keys for Alpaca / Finnhub / Perplexity / OpenAI / OpenRouter / X / Browserbase / Modal as needed.
+For SMS notifications, also configure Twilio:
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_AUTH_TOKEN`
+- `TWILIO_FROM_NUMBER`
+- optional fallback recipient `TWILIO_DEFAULT_TO_NUMBER`
 
 For Modal sandbox runtime, also set:
 - `MODAL_SIMULATION_APP_NAME` (default `tickermaster-simulation`)
@@ -133,6 +138,8 @@ If cache writes appear but activity/alerts do not, confirm backend is using `SUP
 - `POST /tracker/watchlist`
 - `POST /tracker/alerts`
 - `POST /tracker/poll`
+- `POST /api/tracker/agents/nl-create` (natural-language tracker agent creation)
+- `POST /api/tracker/agents/{agent_id}/interact` (manager chat + tool routing)
 - `POST /chat/commentary`
 - `GET /integrations`
 - `WS /ws/stream?channels=global,simulation,tracker`

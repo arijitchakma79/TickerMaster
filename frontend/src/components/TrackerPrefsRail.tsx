@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
+import {
+  getNotificationPreferences,
+  updateNotificationPreferences,
+  type NotificationPreferencesPayload,
+} from "../lib/api";
 
 interface Props {
   connected: boolean;
+  userId?: string | null;
 }
 
 interface NotificationPreferences {
@@ -16,8 +22,6 @@ interface NotificationPreferences {
   quietEnd: string;
 }
 
-const STORAGE_KEY = "tickermaster-notification-preferences";
-
 const DEFAULT_PREFS: NotificationPreferences = {
   phone: "",
   email: "",
@@ -30,40 +34,115 @@ const DEFAULT_PREFS: NotificationPreferences = {
   quietEnd: "07:00"
 };
 
-function readStoredPreferences(): NotificationPreferences {
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return DEFAULT_PREFS;
-    const parsed = JSON.parse(raw) as Partial<NotificationPreferences>;
-    return {
-      ...DEFAULT_PREFS,
-      ...parsed
-    };
-  } catch {
-    return DEFAULT_PREFS;
-  }
+function toUiPreferences(source: NotificationPreferencesPayload | null | undefined): NotificationPreferences {
+  if (!source) return DEFAULT_PREFS;
+  return {
+    phone: String(source.phone_number ?? "").trim(),
+    email: String(source.email ?? "").trim(),
+    channel: source.preferred_channel ?? "push",
+    frequency: source.alert_frequency ?? "realtime",
+    priceAlerts: source.price_alerts ?? true,
+    volumeAlerts: source.volume_alerts ?? true,
+    simulationSummary: source.simulation_summary ?? true,
+    quietStart: String(source.quiet_start ?? "22:00").slice(0, 5),
+    quietEnd: String(source.quiet_end ?? "07:00").slice(0, 5)
+  };
 }
 
-export default function TrackerPrefsRail({ connected }: Props) {
+function toPayload(prefs: NotificationPreferences): Partial<NotificationPreferencesPayload> {
+  return {
+    phone_number: prefs.phone.trim() || null,
+    email: prefs.email.trim() || null,
+    preferred_channel: prefs.channel,
+    alert_frequency: prefs.frequency,
+    price_alerts: prefs.priceAlerts,
+    volume_alerts: prefs.volumeAlerts,
+    simulation_summary: prefs.simulationSummary,
+    quiet_start: prefs.quietStart,
+    quiet_end: prefs.quietEnd
+  };
+}
+
+export default function TrackerPrefsRail({ connected, userId }: Props) {
   const [prefs, setPrefs] = useState<NotificationPreferences>(DEFAULT_PREFS);
   const [savedAt, setSavedAt] = useState<string>("");
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const quietHoursDisabled = prefs.quietStart === prefs.quietEnd;
 
   useEffect(() => {
-    setPrefs(readStoredPreferences());
-  }, []);
+    let active = true;
+    if (!userId) {
+      setPrefs(DEFAULT_PREFS);
+      setSavedAt("");
+      setError("");
+      return () => {
+        active = false;
+      };
+    }
+
+    setLoading(true);
+    void getNotificationPreferences()
+      .then((data) => {
+        if (!active) return;
+        setPrefs(toUiPreferences(data.preferences));
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        setPrefs(DEFAULT_PREFS);
+        setError(err instanceof Error ? err.message : "Could not load notification preferences.");
+      })
+      .finally(() => {
+        if (!active) return;
+        setLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [userId]);
 
   const statusLabel = useMemo(() => {
+    if (!userId) return "Sign in to save preferences";
+    if (loading) return "Loading...";
+    if (saving) return "Saving...";
     if (!savedAt) return "Not saved yet";
     return `Saved ${new Date(savedAt).toLocaleTimeString()}`;
-  }, [savedAt]);
+  }, [loading, savedAt, saving, userId]);
 
   function update<K extends keyof NotificationPreferences>(key: K, value: NotificationPreferences[K]) {
     setPrefs((prev) => ({ ...prev, [key]: value }));
   }
 
   function savePreferences() {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
-    setSavedAt(new Date().toISOString());
+    if (!userId) return;
+    setSaving(true);
+    setError("");
+    void updateNotificationPreferences(toPayload(prefs))
+      .then((data) => {
+        if (data.preferences) {
+          setPrefs(toUiPreferences(data.preferences));
+        }
+        setSavedAt(new Date().toISOString());
+      })
+      .catch((err: unknown) => {
+        setError(err instanceof Error ? err.message : "Could not save notification preferences.");
+      })
+      .finally(() => {
+        setSaving(false);
+      });
+  }
+
+  function disableQuietHours() {
+    setPrefs((prev) => {
+      const marker = prev.quietStart || "00:00";
+      return {
+        ...prev,
+        quietStart: marker,
+        quietEnd: marker,
+      };
+    });
   }
 
   return (
@@ -157,9 +236,27 @@ export default function TrackerPrefsRail({ connected }: Props) {
           />
         </label>
       </div>
+      <div className="tracker-quiet-hours-actions">
+        <button
+          type="button"
+          className="secondary"
+          onClick={disableQuietHours}
+          disabled={quietHoursDisabled}
+        >
+          {quietHoursDisabled ? "Quiet Hours Disabled" : "Disable Quiet Hours"}
+        </button>
+        <p className="muted">
+          {quietHoursDisabled
+            ? "Quiet hours are off. Notifications can send any time."
+            : "Set start and end to the same time to disable quiet hours."}
+        </p>
+      </div>
 
-      <button onClick={savePreferences}>Save Notification Preferences</button>
+      <button onClick={savePreferences} disabled={!userId || loading || saving}>
+        {saving ? "Saving..." : "Save Notification Preferences"}
+      </button>
       <p className="muted">{statusLabel}</p>
+      {error ? <p className="error">{error}</p> : null}
     </aside>
   );
 }

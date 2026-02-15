@@ -193,6 +193,21 @@ export interface TrackerSnapshot {
   alerts_triggered: Array<Record<string, unknown>>;
 }
 
+export interface TrackerSymbolSuggestion {
+  ticker: string;
+  name?: string;
+  exchange?: string | null;
+}
+
+export interface TrackerSymbolResolution {
+  input_symbol?: string;
+  resolved_symbol?: string | null;
+  auto_corrected?: boolean;
+  confidence?: "high" | "low" | string;
+  suggestions?: TrackerSymbolSuggestion[];
+  message?: string | null;
+}
+
 export interface TrackerAgent {
   id: string;
   symbol: string;
@@ -203,12 +218,17 @@ export interface TrackerAgent {
   total_alerts?: number;
   last_alert_at?: string | null;
   created_at?: string;
+  _creation_notification?: Record<string, unknown>;
+  symbol_resolution?: TrackerSymbolResolution | null;
 }
 
 export interface TrackerAgentDetail {
   agent: TrackerAgent;
   market: MarketMetric | null;
   recent_alerts: Array<Record<string, unknown>>;
+  recent_alert_context?: Array<Record<string, unknown>>;
+  recent_runs?: TrackerAgentRunItem[];
+  thesis?: TrackerAgentThesis | null;
   recent_actions: Array<Record<string, unknown>>;
 }
 
@@ -223,6 +243,68 @@ export interface TrackerAgentInteractResponse {
     chart?: { period: string; interval: string; points: CandlePoint[] };
     research?: Record<string, unknown>;
     simulation?: { session_id: string; ticker: string };
+  };
+}
+
+export interface TrackerAgentHistoryItem {
+  id: string;
+  agent_id: string;
+  user_id?: string | null;
+  event_type: "create_prompt" | "manager_instruction" | "system_update" | "agent_response" | string;
+  raw_prompt?: string | null;
+  parsed_intent?: Record<string, unknown> | null;
+  trigger_snapshot?: Record<string, unknown> | null;
+  tool_outputs?: Record<string, unknown> | null;
+  note?: string | null;
+  created_at?: string;
+}
+
+export interface TrackerAgentRunItem {
+  id: string;
+  agent_id: string;
+  user_id?: string | null;
+  symbol: string;
+  run_type: "noop" | "alert" | "report" | "report_skipped" | string;
+  trigger_reasons?: string[];
+  tools_used?: string[];
+  research_sources?: string[];
+  market_snapshot?: Record<string, unknown>;
+  research_snapshot?: Record<string, unknown>;
+  simulation_snapshot?: Record<string, unknown>;
+  decision?: Record<string, unknown>;
+  note?: string | null;
+  created_at?: string;
+}
+
+export interface TrackerAgentThesis {
+  id?: string;
+  agent_id: string;
+  user_id?: string | null;
+  symbol: string;
+  stance_score: number;
+  confidence: number;
+  thesis?: Record<string, unknown>;
+  summary?: string | null;
+  last_event_type?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface TrackerAgentContext {
+  agent: TrackerAgent;
+  thesis: TrackerAgentThesis | null;
+  runs: TrackerAgentRunItem[];
+  history: TrackerAgentHistoryItem[];
+  csv_export: {
+    bucket?: string | null;
+    path?: string | null;
+    rows?: Array<Record<string, string>>;
+  };
+  alert_context?: Array<Record<string, unknown>>;
+  alert_context_csv?: {
+    bucket?: string | null;
+    path?: string | null;
+    rows?: Array<Record<string, string>>;
   };
 }
 

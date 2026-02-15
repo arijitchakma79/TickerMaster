@@ -14,6 +14,8 @@ const US_EXCHANGES = new Set([
   "IEX",
 ]);
 
+const API_BASE = String(import.meta.env.VITE_API_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+
 function normalizeText(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
@@ -123,6 +125,40 @@ async function searchTwelveData(query: string, limit: number): Promise<RankedTic
   return out;
 }
 
+async function searchBackend(query: string, limit: number): Promise<RankedTicker[]> {
+  const url = new URL(`${API_BASE}/research/search/tickers`);
+  url.searchParams.set("query", query);
+  url.searchParams.set("limit", String(Math.min(Math.max(limit, 1), 20)));
+
+  const response = await fetch(url.toString());
+  if (!response.ok) return [];
+
+  const payload = (await response.json()) as {
+    results?: Array<{
+      ticker?: string;
+      name?: string;
+      exchange?: string;
+      instrument_type?: string;
+    }>;
+  };
+  if (!Array.isArray(payload.results)) return [];
+
+  const out: RankedTicker[] = [];
+  for (const row of payload.results) {
+    if (!row?.ticker) continue;
+    const normalized = normalizeLookup(
+      query,
+      row.ticker,
+      row.name || row.ticker,
+      row.exchange,
+      row.instrument_type,
+      null,
+    );
+    if (normalized) out.push(normalized);
+  }
+  return out;
+}
+
 async function searchFinnhub(query: string): Promise<RankedTicker[]> {
   const token = import.meta.env.VITE_FINNHUB_API_KEY;
   if (!token) return [];
@@ -166,6 +202,23 @@ export async function searchTickerDirectory(query: string, limit = 8): Promise<T
   const cleanQuery = query.trim();
   if (!cleanQuery) return [];
 
+  const backendResult = await searchBackend(cleanQuery, limit).catch(() => []);
+  if (backendResult.length >= limit) {
+    return backendResult
+      .sort((a, b) => {
+        if (b._score !== a._score) return b._score - a._score;
+        if (a._isUs !== b._isUs) return a._isUs ? -1 : 1;
+        return a.ticker.localeCompare(b.ticker);
+      })
+      .slice(0, limit)
+      .map(({ ticker, name, exchange, instrument_type }) => ({
+        ticker,
+        name,
+        exchange,
+        instrument_type,
+      }));
+  }
+
   const [twelveDataResult, finnhubResult] = await Promise.allSettled([
     searchTwelveData(cleanQuery, limit),
     searchFinnhub(cleanQuery),
@@ -183,6 +236,7 @@ export async function searchTickerDirectory(query: string, limit = 8): Promise<T
     }
   };
 
+  addAll(backendResult);
   if (twelveDataResult.status === "fulfilled") addAll(twelveDataResult.value);
   if (finnhubResult.status === "fulfilled") addAll(finnhubResult.value);
 
