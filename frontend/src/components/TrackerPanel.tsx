@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  addAlert,
   createTrackerAgent,
   deleteTrackerAgent,
   getTrackerAgentHistory,
@@ -21,9 +20,7 @@ interface Props {
   onTickerChange: (ticker: string) => void;
   trackerEvent?: WSMessage;
   watchlist: string[];
-  favorites: string[];
   onWatchlistChange: (tickers: string[]) => Promise<string[]>;
-  onToggleFavorite: (ticker: string) => Promise<void>;
 }
 
 type ScheduleMode = "realtime" | "custom" | "hourly" | "daily";
@@ -76,9 +73,7 @@ export default function TrackerPanel({
   onTickerChange,
   trackerEvent,
   watchlist,
-  favorites,
-  onWatchlistChange,
-  onToggleFavorite
+  onWatchlistChange
 }: Props) {
   const [watchlistInput, setWatchlistInput] = useState("");
   const [watchlistInputFocused, setWatchlistInputFocused] = useState(false);
@@ -86,14 +81,13 @@ export default function TrackerPanel({
   const [watchlistSearchLoading, setWatchlistSearchLoading] = useState(false);
   const [snapshot, setSnapshot] = useState<TrackerSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
-  const [threshold, setThreshold] = useState(2);
-  const [direction, setDirection] = useState<"up" | "down" | "either">("either");
   const [agents, setAgents] = useState<TrackerAgent[]>([]);
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState("");
   const [createNotice, setCreateNotice] = useState("");
   const [createForm, setCreateForm] = useState<TrackerCreateForm>(() => buildDefaultCreateForm(activeTicker));
+  const [createSymbolFocused, setCreateSymbolFocused] = useState(false);
   const [createSearchLoading, setCreateSearchLoading] = useState(false);
   const [createSearchError, setCreateSearchError] = useState("");
   const [createSearchResults, setCreateSearchResults] = useState<TickerLookup[]>([]);
@@ -161,15 +155,43 @@ export default function TrackerPanel({
     };
   }, [watchlistInput]);
 
+  useEffect(() => {
+    if (!createModalOpen) return;
+    const query = createForm.symbol.trim();
+    if (!query) {
+      setCreateSearchResults([]);
+      setCreateSearchLoading(false);
+      return;
+    }
+
+    let active = true;
+    const timer = window.setTimeout(() => {
+      setCreateSearchLoading(true);
+      void searchTickerDirectory(query, 8)
+        .then((results) => {
+          if (!active) return;
+          setCreateSearchResults(results);
+        })
+        .catch(() => {
+          if (!active) return;
+          setCreateSearchResults([]);
+        })
+        .finally(() => {
+          if (!active) return;
+          setCreateSearchLoading(false);
+        });
+    }, 180);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [createForm.symbol, createModalOpen]);
+
   const availableWatchlistSuggestions = useMemo(
     () => watchlistSuggestions.filter((entry) => !watchlist.includes(entry.ticker)),
     [watchlistSuggestions, watchlist]
   );
-  const resolvedInputTicker = useMemo(
-    () => resolveTickerCandidate(watchlistInput, watchlistSuggestions),
-    [watchlistInput, watchlistSuggestions]
-  );
-  const alertTargetTicker = resolvedInputTicker || activeTicker;
   const selectedInstructionAgent = useMemo(
     () => agents.find((agent) => agent.id === instructionModalAgentId) ?? null,
     [agents, instructionModalAgentId]
@@ -209,15 +231,6 @@ export default function TrackerPanel({
     }
   }
 
-  async function handleAddAlert() {
-    if (!alertTargetTicker) return;
-    await addAlert({
-      ticker: alertTargetTicker,
-      threshold_percent: threshold,
-      direction
-    });
-  }
-
   async function handlePoll() {
     setLoading(true);
     try {
@@ -250,35 +263,6 @@ export default function TrackerPanel({
       updateCreateForm("name", `${resolvedTicker} Tracker Agent`);
     }
     setCreateSearchError("");
-  }
-
-  async function handleCreateTickerSearch() {
-    const query = createForm.symbol.trim();
-    if (!query) {
-      setCreateSearchError("Type a company name or ticker first.");
-      setCreateSearchResults([]);
-      return;
-    }
-    setCreateSearchLoading(true);
-    setCreateSearchError("");
-    try {
-      const results = await searchTickerDirectory(query, 8);
-      setCreateSearchResults(results);
-      if (results.length === 0) {
-        setCreateSearchError("No ticker matches found for that company.");
-        return;
-      }
-      if (results.length === 1) {
-        applyCreateTickerResult(results[0]);
-      } else {
-        setCreateSearchError("Multiple matches found. Select the correct ticker below.");
-      }
-    } catch {
-      setCreateSearchResults([]);
-      setCreateSearchError("Ticker lookup failed. Try again.");
-    } finally {
-      setCreateSearchLoading(false);
-    }
   }
 
   async function handleCreateAgentWithSettings() {
@@ -533,8 +517,6 @@ export default function TrackerPanel({
         activeTicker={activeTicker}
         onSelectTicker={onTickerChange}
         onRemoveTicker={handleRemoveWatchlistTicker}
-        favorites={favorites}
-        onToggleFavorite={(ticker) => void onToggleFavorite(ticker)}
       />
 
       <div className="glass-card card-row tracker-actions tracker-watchlist-card">
@@ -584,38 +566,6 @@ export default function TrackerPanel({
         <button className="secondary" onClick={handlePoll} disabled={loading}>
           {loading ? "Refreshing…" : "Refresh Market Data"}
         </button>
-      </div>
-
-      <div className="glass-card card-row tracker-actions">
-        <div className="tracker-alert-target">
-          <p className="muted">Alert Target</p>
-          <strong>{alertTargetTicker}</strong>
-          <p className="muted">
-            {resolvedInputTicker
-              ? "Using the ticker resolved from Add Company / Ticker."
-              : "Using the currently selected watchlist ticker."}
-          </p>
-        </div>
-        <label>
-          Threshold %
-          <input
-            type="number"
-            min={0.1}
-            max={25}
-            step={0.1}
-            value={threshold}
-            onChange={(event) => setThreshold(Number(event.target.value) || 2)}
-          />
-        </label>
-        <label>
-          Direction
-          <select value={direction} onChange={(event) => setDirection(event.target.value as "up" | "down" | "either")}>
-            <option value="either">Either</option>
-            <option value="up">Up</option>
-            <option value="down">Down</option>
-          </select>
-        </label>
-        <button onClick={handleAddAlert}>Add Alert</button>
       </div>
 
       <div className="glass-card stack">
@@ -769,40 +719,47 @@ export default function TrackerPanel({
             <div className="tracker-create-grid">
               <label>
                 Ticker or Company
-                <div className="tracker-create-symbol-row">
+                <div className="ticker-autocomplete">
                   <input
                     value={createForm.symbol}
+                    onFocus={() => setCreateSymbolFocused(true)}
+                    onBlur={() => setTimeout(() => setCreateSymbolFocused(false), 120)}
                     onChange={(event) => {
                       updateCreateForm("symbol", normalizeSymbol(event.target.value));
                       setCreateSearchError("");
                     }}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter") return;
+                      event.preventDefault();
+                      const top = createSearchResults[0];
+                      if (top) applyCreateTickerResult(top);
+                    }}
                     placeholder="NVDA or Nvidia"
                   />
-                  <button
-                    type="button"
-                    className="secondary tracker-create-search-btn"
-                    onClick={() => void handleCreateTickerSearch()}
-                    disabled={createLoading || createSearchLoading || !createForm.symbol.trim()}
-                  >
-                    {createSearchLoading ? "Searching..." : "Search"}
-                  </button>
+                  {createSymbolFocused && createForm.symbol.trim() ? (
+                    <div className="ticker-suggestions" role="listbox" aria-label="Ticker suggestions">
+                      {createSearchResults.length > 0 ? (
+                        createSearchResults.slice(0, 6).map((result) => (
+                          <button
+                            key={`${result.ticker}-${result.name}`}
+                            type="button"
+                            className="ticker-suggestion"
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => applyCreateTickerResult(result)}
+                          >
+                            <span className="ticker-suggestion-symbol">{result.ticker}</span>
+                            <span className="ticker-suggestion-name">{result.name}</span>
+                          </button>
+                        ))
+                      ) : createSearchLoading ? (
+                        <p className="ticker-suggestion-empty">Searching…</p>
+                      ) : (
+                        <p className="ticker-suggestion-empty">No matches found</p>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
                 {createSearchError ? <span className="muted">{createSearchError}</span> : null}
-                {createSearchResults.length > 0 ? (
-                  <div className="tracker-create-search-results">
-                    {createSearchResults.slice(0, 5).map((result) => (
-                      <button
-                        key={`${result.ticker}-${result.name}`}
-                        type="button"
-                        className="tracker-create-search-item"
-                        onClick={() => applyCreateTickerResult(result)}
-                      >
-                        <span className="tracker-create-search-symbol">{result.ticker}</span>
-                        <span className="tracker-create-search-name">{result.name}</span>
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
               </label>
 
               <label>

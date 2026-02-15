@@ -3139,58 +3139,6 @@ pre {
   grid-column: 1 / -1;
 }
 
-.tracker-create-symbol-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
-  align-items: center;
-}
-
-.tracker-create-search-btn {
-  padding-inline: 14px;
-  white-space: nowrap;
-}
-
-.tracker-create-search-results {
-  margin-top: 8px;
-  display: grid;
-  gap: 6px;
-}
-
-.tracker-create-search-item {
-  width: 100%;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 8px 10px;
-  background: var(--card-soft-bg-3);
-  color: var(--ink);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  text-align: left;
-  box-shadow: none;
-  transform: none;
-}
-
-.tracker-create-search-item:hover:not(:disabled) {
-  transform: none;
-  filter: none;
-  background: var(--surface-2);
-}
-
-.tracker-create-search-symbol {
-  font-family: "IBM Plex Mono", monospace;
-  font-weight: 700;
-  letter-spacing: 0.03em;
-}
-
-.tracker-create-search-name {
-  color: var(--muted);
-  font-size: 0.84rem;
-  font-weight: 600;
-}
-
 .tracker-fieldset {
   border: 1px solid var(--line);
   border-radius: 10px;

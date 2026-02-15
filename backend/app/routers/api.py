@@ -64,8 +64,8 @@ class PokeInboundRequest(BaseModel):
 
 
 class TrackerAgentCreateRequest(BaseModel):
-    symbol: str = Field(min_length=1, max_length=12, pattern=_SYMBOL_PATTERN)
-    name: str = Field(min_length=1, max_length=120)
+    symbol: str | None = Field(default=None, min_length=1, max_length=12, pattern=_SYMBOL_PATTERN)
+    name: str | None = Field(default=None, min_length=1, max_length=120)
     triggers: dict[str, Any] = Field(default_factory=dict)
     auto_simulate: bool = False
     create_prompt: str | None = None
@@ -881,6 +881,11 @@ async def ticker_full(symbol: str, request: Request, timeframe: str = "7d") -> d
         last = get_cached_research(symbol, "quote:last")
         if last:
             metric_payload = {**last, "stale": True, "provider_error": str(metric_out)}
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Market data provider unavailable for {symbol.upper()}: {metric_out}",
+            )
     else:
         metric_payload = metric_out.model_dump()
         set_cached_research(symbol, "quote:last", metric_payload, ttl_minutes=24 * 60)
@@ -1559,7 +1564,7 @@ async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, 
     resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     existing = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if existing is None:
-        return {"error": "not_found"}
+        raise HTTPException(status_code=404, detail="Agent not found")
     updates = payload.model_dump(exclude_none=True)
     symbol_resolution: dict[str, Any] | None = None
     if "symbol" in updates:
@@ -1584,7 +1589,7 @@ async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, 
         updates["triggers"] = merged_triggers
     item = tracker_repo.update_agent(user_id=resolved_user_id, agent_id=agent_id, updates=updates)
     if item is None:
-        return {"error": "not_found"}
+        raise HTTPException(status_code=404, detail="Agent not found")
     tracker_repo.create_history(
         user_id=resolved_user_id,
         agent_id=agent_id,
@@ -2418,7 +2423,7 @@ async def patch_preferences(payload: UserPrefsRequest, request: Request) -> dict
 
     user_id = get_user_id_from_request(request)
     if not user_id:
-        return {"ok": False, "error": "missing_user_id"}
+        raise HTTPException(status_code=401, detail=_AUTH_REQUIRED_DETAIL)
 
     client = get_supabase()
     if client is None:

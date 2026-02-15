@@ -784,9 +784,7 @@ export default function App() {
                   onTickerChange={setTicker}
                   trackerEvent={lastTrackerSnapshot}
                   watchlist={watchlist}
-                  favorites={favoriteStocks}
                   onWatchlistChange={handleWatchlistChange}
-                  onToggleFavorite={handleToggleFavorite}
                 />
               ) : null}
             </div>
