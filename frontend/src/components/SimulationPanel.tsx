@@ -71,7 +71,18 @@ const DEFAULT_CUSTOM = {
   news: 42
 };
 
-const STRATEGY_TEMPLATES = [
+interface StrategyTemplate {
+  label: string;
+  prompt: string;
+  name?: string;
+  emoji?: string;
+  risk?: number;
+  tempo?: number;
+  style?: number;
+  news?: number;
+}
+
+const STRATEGY_TEMPLATES: readonly StrategyTemplate[] = [
   {
     label: "Momentum",
     prompt: "I am a momentum trader. Buy upside breakouts with rising volume and cut losses quickly when trend structure fails."
@@ -87,8 +98,30 @@ const STRATEGY_TEMPLATES = [
   {
     label: "News Reversal",
     prompt: "I trade post-news dislocations. Fade initial overreaction after catalyst headlines and only size up when follow-through confirms."
+  },
+  {
+    label: "🚀 To the Moon",
+    name: "To the Moon",
+    emoji: "🚀",
+    prompt:
+      "I trade aggressively on GOOG stock only and follow what is trending across the market. Take high-conviction momentum entries and react quickly to hot themes, but execute trades only in GOOG.",
+    risk: 86,
+    tempo: 92,
+    style: 84,
+    news: 86
+  },
+  {
+    label: "🏠 Safety House",
+    name: "Safety House",
+    emoji: "🏠",
+    prompt:
+      "I am a safe trader and only hold long, valuable positions. I do not care about current market trends and avoid hype-driven or short-term trades.",
+    risk: 24,
+    tempo: 22,
+    style: 18,
+    news: 14
   }
-] as const;
+];
 
 const ALL_MARKET_PROMPT_PATTERN =
   /\b(all stocks|all tickers|entire market|whole market|market-wide|across the market)\b/i;
@@ -1428,7 +1461,15 @@ export default function SimulationPanel({
                     key={template.label}
                     type="button"
                     className="secondary strategy-template-chip"
-                    onClick={() => setCustomPrompt(template.prompt)}
+                    onClick={() => {
+                      setCustomPrompt(template.prompt);
+                      if (template.name) setCustomName(template.name);
+                      if (template.emoji) setCustomEmoji(template.emoji);
+                      if (typeof template.risk === "number") setCustomRisk(template.risk);
+                      if (typeof template.tempo === "number") setCustomTempo(template.tempo);
+                      if (typeof template.style === "number") setCustomStyle(template.style);
+                      if (typeof template.news === "number") setCustomNews(template.news);
+                    }}
                     disabled={customEditorDisabled}
                   >
                     {template.label}
