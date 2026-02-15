@@ -434,11 +434,23 @@ export async function updateUserPreferences(payload: {
   watchlist?: string[];
   favorites?: string[];
 }): Promise<{ ok: boolean; profile?: UserProfilePayload | null; require_username_setup?: boolean }> {
-  const { data } = await client.patch<{ ok: boolean; profile?: UserProfilePayload | null; require_username_setup?: boolean }>(
-    "/api/user/preferences",
-    payload,
-  );
-  return data;
+  try {
+    const { data } = await client.patch<{ ok: boolean; profile?: UserProfilePayload | null; require_username_setup?: boolean }>(
+      "/api/user/preferences",
+      payload,
+    );
+    return data;
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      const detail =
+        (error.response?.data as { detail?: unknown; error?: unknown } | undefined)?.detail ??
+        (error.response?.data as { detail?: unknown; error?: unknown } | undefined)?.error;
+      if (typeof detail === "string" && detail.trim()) {
+        throw new Error(detail.trim());
+      }
+    }
+    throw error;
+  }
 }
 
 export async function addAlert(payload: { ticker: string; threshold_percent: number; direction: "up" | "down" | "either" }) {

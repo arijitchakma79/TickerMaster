@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import re
+from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Any
 
@@ -659,6 +663,64 @@ def _needs_username_setup(profile: dict[str, Any] | None) -> bool:
     return bool(email and display_name.lower() == email.lower())
 
 
+_AVATAR_DATA_URL_RE = re.compile(r"^data:image/([A-Za-z0-9.+-]+);base64,(.+)$", re.DOTALL)
+
+
+def _decode_avatar_data_url(data_url: str) -> tuple[bytes, str]:
+    match = _AVATAR_DATA_URL_RE.match(data_url.strip())
+    if not match:
+        raise HTTPException(status_code=422, detail="Avatar payload must be a base64 image data URL.")
+    ext = match.group(1).lower()
+    if ext == "jpeg":
+        ext = "jpg"
+    if ext not in {"jpg", "png", "webp", "gif"}:
+        raise HTTPException(status_code=422, detail="Unsupported avatar image format.")
+    encoded = match.group(2).strip()
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=422, detail="Avatar image payload is invalid.") from exc
+    if len(raw) > 1_500_000:
+        raise HTTPException(status_code=422, detail="Avatar image is too large.")
+    return raw, ext
+
+
+def _ensure_avatar_bucket(client: Any, bucket: str) -> None:
+    try:
+        existing = client.storage.list_buckets()
+        for item in existing or []:
+            item_id = str(getattr(item, "id", "") or "")
+            if item_id == bucket:
+                return
+    except Exception:
+        # Continue and attempt create directly.
+        pass
+    try:
+        client.storage.create_bucket(
+            bucket,
+            options={"public": True, "file_size_limit": 2_000_000, "allowed_mime_types": ["image/jpeg", "image/png", "image/webp", "image/gif"]},
+        )
+    except Exception:
+        # Bucket may already exist or policy may block create.
+        pass
+
+
+def _upload_avatar_to_supabase(client: Any, bucket: str, user_id: str, data_url: str) -> str:
+    raw, ext = _decode_avatar_data_url(data_url)
+    mime = "image/jpeg" if ext == "jpg" else f"image/{ext}"
+    _ensure_avatar_bucket(client, bucket)
+    path = f"{user_id}/avatar-{uuid4().hex}.{ext}"
+    try:
+        client.storage.from_(bucket).upload(
+            path,
+            raw,
+            {"content-type": mime, "upsert": "true"},
+        )
+        return str(client.storage.from_(bucket).get_public_url(path))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Could not upload avatar image to Supabase storage.") from exc
+
+
 @router.patch("/user/preferences")
 async def patch_preferences(payload: UserPrefsRequest, request: Request) -> dict[str, Any]:
     from app.services.database import get_supabase
@@ -670,6 +732,7 @@ async def patch_preferences(payload: UserPrefsRequest, request: Request) -> dict
     client = get_supabase()
     if client is None:
         return {"ok": False, "error": "supabase_unavailable"}
+    settings = request.app.state.settings
 
     updates = payload.model_dump(exclude_none=True)
     watchlist = updates.pop("watchlist", None)
@@ -708,7 +771,12 @@ async def patch_preferences(payload: UserPrefsRequest, request: Request) -> dict
                 raise HTTPException(status_code=422, detail="Avatar payload must be an image data URL.")
             if len(normalized_avatar) > 2_000_000:
                 raise HTTPException(status_code=422, detail="Avatar image is too large.")
-            updates["avatar_url"] = normalized_avatar
+            updates["avatar_url"] = _upload_avatar_to_supabase(
+                client,
+                settings.supabase_avatar_bucket,
+                user_id,
+                normalized_avatar,
+            )
 
     profile = None
     if updates:

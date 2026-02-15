@@ -655,7 +655,7 @@ export default function App() {
       {isAuthConfigured() ? (
         authSession?.user?.id ? (
           <div className="account-corner">
-            <div className="account-panel glass-card">
+            <div className="account-panel">
               <button
                 type="button"
                 className="profile-trigger"

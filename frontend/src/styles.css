@@ -140,15 +140,15 @@ a {
 }
 
 .account-corner {
-  position: fixed;
-  left: 18px;
-  bottom: 18px;
+  position: absolute;
+  top: 12px;
+  right: 95px;
   z-index: 55;
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 8px;
-  max-width: min(280px, calc(100vw - 30px));
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  max-width: min(420px, calc(100vw - 30px));
 }
 
 .brand-lockup {
@@ -349,7 +349,7 @@ a {
 .profile-trigger {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   border: 0;
   background: transparent;
   color: inherit;
@@ -357,21 +357,28 @@ a {
 }
 
 .account-panel {
-  min-width: 220px;
-  padding: 10px;
+  min-width: 0;
+  padding: 0;
   display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 8px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 4px;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  backdrop-filter: none;
 }
 
 .account-panel .profile-trigger {
-  width: 100%;
+  width: auto;
   justify-content: flex-start;
 }
 
 .account-signout {
-  width: 100%;
+  width: auto;
+  white-space: nowrap;
+  margin-left: 4px;
 }
 
 .profile-avatar {
@@ -1616,6 +1623,15 @@ h1 {
 .research-ticker-field {
   min-width: 0;
   grid-column: span 4;
+  overflow: visible;
+}
+
+.research-ticker-field .ticker-autocomplete {
+  width: 100%;
+}
+
+.research-ticker-field .ticker-autocomplete input {
+  width: 100%;
 }
 
 .research-controls-grid > .research-control:nth-child(2),
@@ -3509,6 +3525,10 @@ time {
     grid-column: span 1;
   }
 
+  .research-ticker-field .ticker-autocomplete {
+    width: 100%;
+  }
+
   .roundtable-grid,
   .agents-grid,
   .telemetry-board-row,
@@ -3607,15 +3627,17 @@ time {
   }
 
   .account-corner {
-    left: 12px;
-    right: 12px;
-    bottom: 12px;
-    max-width: none;
+    top: 8px;
+    right: 82px;
+    left: auto;
+    bottom: auto;
+    max-width: calc(100vw - 20px);
   }
 
   .account-panel {
-    width: 100%;
+    width: auto;
     min-width: 0;
+    max-width: calc(100vw - 20px);
   }
 
   .landing-shell {

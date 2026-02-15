@@ -329,6 +329,48 @@ def _macro_queries_for_context(ticker: str, company_name: str | None = None) -> 
     return out
 
 
+def _synthetic_prediction_fallback(ticker: str, company_name: str | None = None) -> List[Dict[str, Any]]:
+    name = (company_name or ticker).strip() or ticker
+    return [
+        {
+            "source": "Kalshi",
+            "market": f"Will the Fed cut rates at the next FOMC meeting? ({name} macro beta)",
+            "yes_price": "See market",
+            "link": "https://kalshi.com/markets/kxfeddecision",
+            "relevance_score": 0.42,
+            "context": "macro-adjacent",
+            "query": "fed rates",
+        },
+        {
+            "source": "Polymarket",
+            "market": f"Will U.S. CPI cool in the next release window? ({name} demand/multiple sensitivity)",
+            "probability": "See market",
+            "link": "https://polymarket.com/",
+            "relevance_score": 0.39,
+            "context": "macro-adjacent",
+            "query": "cpi inflation",
+        },
+        {
+            "source": "Polymarket",
+            "market": f"Will U.S. unemployment rise by next quarter? ({name} earnings risk proxy)",
+            "probability": "See market",
+            "link": "https://polymarket.com/",
+            "relevance_score": 0.36,
+            "context": "macro-adjacent",
+            "query": "jobs report unemployment",
+        },
+        {
+            "source": "Kalshi",
+            "market": f"Will real GDP growth beat consensus this quarter? ({name} top-line sensitivity)",
+            "yes_price": "See market",
+            "link": "https://kalshi.com/markets",
+            "relevance_score": 0.34,
+            "context": "macro-adjacent",
+            "query": "gdp growth",
+        },
+    ]
+
+
 async def _perplexity_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
     if not settings.perplexity_api_key:
         summary = (
@@ -753,7 +795,7 @@ def _build_narratives(items: List[SentimentBreakdown]) -> List[str]:
 
 async def run_research(request: ResearchRequest, settings: Settings) -> ResearchResponse:
     ticker = request.ticker.upper().strip()
-    cache_key = f"research:v4:{request.timeframe}:{int(request.include_prediction_markets)}"
+    cache_key = f"research:v5:{request.timeframe}:{int(request.include_prediction_markets)}"
     cached = get_cached_research(ticker, cache_key)
     if cached:
         return ResearchResponse(**cached)
@@ -844,6 +886,9 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
                 key=lambda item: float(item.get("relevance_score", 0.0) or 0.0),
                 reverse=True,
             )[:6]
+
+        if len(prediction_markets) == 0:
+            prediction_markets = _synthetic_prediction_fallback(ticker, company_name=company_name)
 
     # Composite weighting from spec: Perplexity 45%, Reddit 30%, X 25%
     aggregate = float((breakdown[0].score * 0.45) + (breakdown[2].score * 0.30) + (breakdown[1].score * 0.25))

@@ -8,11 +8,24 @@ import {
   getAgentActivity,
   runDeepResearch,
   runResearch,
-  searchTickerDirectory
+  searchTickerDirectory,
 } from "../lib/api";
-import { formatCompactNumber, formatPercent, formatToCents } from "../lib/format";
+import {
+  formatCompactNumber,
+  formatPercent,
+  formatToCents,
+} from "../lib/format";
 import { resolveTickerCandidate } from "../lib/tickerInput";
-import type { AgentActivity, AdvancedStockData, CandlePoint, DeepResearchResponse, IndicatorSnapshot, ResearchResponse, TickerLookup, WSMessage } from "../lib/types";
+import type {
+  AgentActivity,
+  AdvancedStockData,
+  CandlePoint,
+  DeepResearchResponse,
+  IndicatorSnapshot,
+  ResearchResponse,
+  TickerLookup,
+  WSMessage,
+} from "../lib/types";
 import StockChart, { type ChartOverlayIndicator } from "./StockChart";
 
 interface Props {
@@ -45,20 +58,27 @@ function activityTime(item: AgentActivity) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function normalizeActivity(raw: AgentActivity | WSMessage): AgentActivity | null {
+function normalizeActivity(
+  raw: AgentActivity | WSMessage,
+): AgentActivity | null {
   if (!raw || typeof raw !== "object") return null;
   const action = typeof raw.action === "string" ? raw.action : "";
   const agentName = typeof raw.agent_name === "string" ? raw.agent_name : "";
   const channel = typeof raw.channel === "string" ? raw.channel : undefined;
   const type = typeof raw.type === "string" ? raw.type : undefined;
-  const isAgentPayload = Boolean(action || agentName || type === "agent_activity" || channel === "agents");
+  const isAgentPayload = Boolean(
+    action || agentName || type === "agent_activity" || channel === "agents",
+  );
   if (!isAgentPayload) return null;
   return {
     module: typeof raw.module === "string" ? raw.module : undefined,
     agent_name: agentName || undefined,
     action: action || undefined,
     status: typeof raw.status === "string" ? raw.status : undefined,
-    details: raw.details && typeof raw.details === "object" ? (raw.details as Record<string, unknown>) : undefined,
+    details:
+      raw.details && typeof raw.details === "object"
+        ? (raw.details as Record<string, unknown>)
+        : undefined,
     created_at: typeof raw.created_at === "string" ? raw.created_at : undefined,
     timestamp: typeof raw.timestamp === "string" ? raw.timestamp : undefined,
     channel,
@@ -71,9 +91,17 @@ function activityMatchesTicker(item: AgentActivity, ticker: string) {
   const details = item.details;
   if (details && typeof details === "object") {
     const detailSymbol = (details as Record<string, unknown>).symbol;
-    if (typeof detailSymbol === "string" && normalizeSymbol(detailSymbol) === ticker) return true;
+    if (
+      typeof detailSymbol === "string" &&
+      normalizeSymbol(detailSymbol) === ticker
+    )
+      return true;
   }
-  if (typeof item.action === "string" && containsTickerToken(item.action, ticker)) return true;
+  if (
+    typeof item.action === "string" &&
+    containsTickerToken(item.action, ticker)
+  )
+    return true;
   return false;
 }
 
@@ -88,7 +116,8 @@ function activityKey(item: AgentActivity) {
 
 function statusClass(status: string | undefined) {
   const value = (status ?? "running").toLowerCase();
-  if (value === "success" || value === "error" || value === "pending") return value;
+  if (value === "success" || value === "error" || value === "pending")
+    return value;
   return "running";
 }
 
@@ -128,7 +157,11 @@ type IndicatorKey =
   | "macd_hist"
   | "atr14";
 
-const INDICATOR_OPTIONS: Array<{ key: IndicatorKey; label: string; group: "trend" | "momentum" | "volatility" }> = [
+const INDICATOR_OPTIONS: Array<{
+  key: IndicatorKey;
+  label: string;
+  group: "trend" | "momentum" | "volatility";
+}> = [
   { key: "sma20", label: "SMA 20", group: "trend" },
   { key: "sma50", label: "SMA 50", group: "trend" },
   { key: "sma200", label: "SMA 200", group: "trend" },
@@ -165,7 +198,10 @@ function siteNameFromUrl(url: string): string {
     const parts = host.split(".").filter(Boolean);
     if (parts.length === 0) return "Source";
     let root = parts.length >= 2 ? parts[parts.length - 2] : parts[0];
-    if (["co", "com", "org", "net", "gov", "edu"].includes(root) && parts.length >= 3) {
+    if (
+      ["co", "com", "org", "net", "gov", "edu"].includes(root) &&
+      parts.length >= 3
+    ) {
       root = parts[parts.length - 3];
     }
     return root
@@ -238,7 +274,9 @@ function parseSummarySections(raw: string): SummarySection[] {
       continue;
     }
 
-    const plainHeadingCandidate = stripMarkdownFormatting(line.replace(/:$/, ""));
+    const plainHeadingCandidate = stripMarkdownFormatting(
+      line.replace(/:$/, ""),
+    );
     const looksLikePlainHeading =
       !line.includes(":") &&
       !/^(?:[-*•]|\d+[.)])\s+/.test(line) &&
@@ -283,7 +321,8 @@ function parseSummarySections(raw: string): SummarySection[] {
 
   const normalizedSections = sections
     .map((section) => ({
-      heading: stripMarkdownFormatting(section.heading || "Summary") || "Summary",
+      heading:
+        stripMarkdownFormatting(section.heading || "Summary") || "Summary",
       bullets: section.bullets
         .map((bullet) => stripMarkdownFormatting(bullet))
         .filter(Boolean),
@@ -318,14 +357,23 @@ function formatSummaryParagraph(text: string): string {
   return text.replace(/(^|\s)\*\*/g, "$1").trim();
 }
 
-function renderSummarySection(section: SummarySection, sourceKey: string, sectionIdx: number) {
+function renderSummarySection(
+  section: SummarySection,
+  sourceKey: string,
+  sectionIdx: number,
+) {
   return (
-    <section key={`${sourceKey}-${section.heading}-${sectionIdx}`} className="source-summary-section">
+    <section
+      key={`${sourceKey}-${section.heading}-${sectionIdx}`}
+      className="source-summary-section"
+    >
       <h5 className="source-summary-heading">{section.heading}</h5>
       {section.bullets.length > 0 ? (
         <ul className="source-summary-list">
           {section.bullets.map((point, pointIdx) => (
-            <li key={`${sourceKey}-${section.heading}-${pointIdx}`}>{formatSummaryBulletText(point)}</li>
+            <li key={`${sourceKey}-${section.heading}-${pointIdx}`}>
+              {formatSummaryBulletText(point)}
+            </li>
           ))}
         </ul>
       ) : (
@@ -335,7 +383,10 @@ function renderSummarySection(section: SummarySection, sourceKey: string, sectio
   );
 }
 
-function formatIndicatorValue(snapshot: IndicatorSnapshot, key: IndicatorKey): string {
+function formatIndicatorValue(
+  snapshot: IndicatorSnapshot,
+  key: IndicatorKey,
+): string {
   if (key === "bbands") {
     const upper = snapshot.latest.bb_upper;
     const mid = snapshot.latest.bb_mid;
@@ -353,10 +404,7 @@ async function fetchAdvancedSnapshotWithQuoteFallback(
   ticker: string,
 ): Promise<AdvancedStockData> {
   const advanced = await fetchAdvancedStockData(ticker);
-  if (
-    advanced.current_price != null &&
-    advanced.change_percent != null
-  ) {
+  if (advanced.current_price != null && advanced.change_percent != null) {
     return advanced;
   }
 
@@ -381,7 +429,8 @@ function mergeAdvancedSnapshot(
   previous: AdvancedStockData | null,
   cached: AdvancedStockData | null,
 ): AdvancedStockData {
-  const fallback = (previous?.ticker === incoming.ticker ? previous : null) ?? cached;
+  const fallback =
+    (previous?.ticker === incoming.ticker ? previous : null) ?? cached;
   if (!fallback) return incoming;
 
   const keepIncoming = new Set(["current_price", "change_percent", "volume"]);
@@ -416,10 +465,17 @@ function mergeAdvancedSnapshot(
     }
   }
 
-  if (Array.isArray(incoming.insider_transactions) && incoming.insider_transactions.length > 0) {
+  if (
+    Array.isArray(incoming.insider_transactions) &&
+    incoming.insider_transactions.length > 0
+  ) {
     return merged;
   }
-  if (Array.isArray(fallback.insider_transactions) && fallback.insider_transactions.length > 0 && !keepIncoming.has("insider_transactions")) {
+  if (
+    Array.isArray(fallback.insider_transactions) &&
+    fallback.insider_transactions.length > 0 &&
+    !keepIncoming.has("insider_transactions")
+  ) {
     merged.insider_transactions = fallback.insider_transactions;
   }
   return merged;
@@ -440,48 +496,70 @@ function readAdvancedCache(symbol: string): AdvancedStockData | null {
 function writeAdvancedCache(snapshot: AdvancedStockData) {
   try {
     const raw = window.localStorage.getItem(ADVANCED_CACHE_STORAGE_KEY);
-    const parsed = raw ? (JSON.parse(raw) as Record<string, AdvancedStockData>) : {};
+    const parsed = raw
+      ? (JSON.parse(raw) as Record<string, AdvancedStockData>)
+      : {};
     parsed[snapshot.ticker] = snapshot;
-    window.localStorage.setItem(ADVANCED_CACHE_STORAGE_KEY, JSON.stringify(parsed));
+    window.localStorage.setItem(
+      ADVANCED_CACHE_STORAGE_KEY,
+      JSON.stringify(parsed),
+    );
   } catch {
     // no-op
   }
 }
 
-export default function ResearchPanel({ activeTicker, onTickerChange, connected, events }: Props) {
+export default function ResearchPanel({
+  activeTicker,
+  onTickerChange,
+  connected,
+  events,
+}: Props) {
   const [indicatorInfoOpen, setIndicatorInfoOpen] = useState(false);
   const [insiderPage, setInsiderPage] = useState(1);
   const [tickerInput, setTickerInput] = useState(activeTicker);
   const [tickerInputFocused, setTickerInputFocused] = useState(false);
-  const [tickerSuggestions, setTickerSuggestions] = useState<TickerLookup[]>([]);
+  const [tickerSuggestions, setTickerSuggestions] = useState<TickerLookup[]>(
+    [],
+  );
   const [tickerSearchLoading, setTickerSearchLoading] = useState(false);
   const [timeframe, setTimeframe] = useState("7d");
   const [loading, setLoading] = useState(false);
   const [research, setResearch] = useState<ResearchResponse | null>(null);
   const [candles, setCandles] = useState<CandlePoint[]>([]);
   const [advanced, setAdvanced] = useState<AdvancedStockData | null>(null);
-  const [deepResearch, setDeepResearch] = useState<DeepResearchResponse | null>(null);
+  const [deepResearch, setDeepResearch] = useState<DeepResearchResponse | null>(
+    null,
+  );
   const [showDeepResearch, setShowDeepResearch] = useState(false);
   const [deepLoading, setDeepLoading] = useState(false);
   const [agentProgress, setAgentProgress] = useState(0);
   const [chartMode, setChartMode] = useState<"candles" | "line">("candles");
   const [chartPeriod, setChartPeriod] = useState("6mo");
   const [chartInterval, setChartInterval] = useState("1d");
-  const [selectedIndicators, setSelectedIndicators] = useState<Record<IndicatorKey, boolean>>(DEFAULT_INDICATORS);
-  const [indicatorSnapshot, setIndicatorSnapshot] = useState<IndicatorSnapshot | null>(null);
+  const [selectedIndicators, setSelectedIndicators] =
+    useState<Record<IndicatorKey, boolean>>(DEFAULT_INDICATORS);
+  const [indicatorSnapshot, setIndicatorSnapshot] =
+    useState<IndicatorSnapshot | null>(null);
   const [agentHistory, setAgentHistory] = useState<AgentActivity[]>([]);
   const [error, setError] = useState("");
   const [chatModalOpen, setChatModalOpen] = useState(false);
   const [chatPrompt, setChatPrompt] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
-  const [chatLog, setChatLog] = useState<Array<{
-    role: "user" | "assistant";
-    text: string;
-    meta?: string;
-  }>>([]);
+  const [chatLog, setChatLog] = useState<
+    Array<{
+      role: "user" | "assistant";
+      text: string;
+      meta?: string;
+    }>
+  >([]);
   const chatLogRef = useRef<HTMLDivElement | null>(null);
   const chatSubmitLockRef = useRef(false);
-  const normalizedTicker = useMemo(() => normalizeSymbol(activeTicker), [activeTicker]);
+  const autoAnalyzedTickerRef = useRef("");
+  const normalizedTicker = useMemo(
+    () => normalizeSymbol(activeTicker),
+    [activeTicker],
+  );
   const hasSelectedTicker = activeTicker.trim().length > 0;
 
   const sentimentLabel = useMemo(() => {
@@ -492,10 +570,16 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
 
   const insiderRows = advanced?.insider_transactions ?? [];
   const insiderPageSize = 8;
-  const insiderTotalPages = Math.max(1, Math.ceil(insiderRows.length / insiderPageSize));
+  const insiderTotalPages = Math.max(
+    1,
+    Math.ceil(insiderRows.length / insiderPageSize),
+  );
   const insiderPageSafe = Math.min(insiderPage, insiderTotalPages);
   const insiderSliceStart = (insiderPageSafe - 1) * insiderPageSize;
-  const insiderPageRows = insiderRows.slice(insiderSliceStart, insiderSliceStart + insiderPageSize);
+  const insiderPageRows = insiderRows.slice(
+    insiderSliceStart,
+    insiderSliceStart + insiderPageSize,
+  );
 
   const liveWireActivity = useMemo(() => {
     const merged = new Map<string, AgentActivity>();
@@ -552,6 +636,14 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
     if (!normalized) return;
     setTickerInput((prev) => (prev === normalized ? prev : normalized));
     setInsiderPage(1);
+  }, [activeTicker]);
+
+  useEffect(() => {
+    const normalized = activeTicker.trim().toUpperCase();
+    if (!normalized) return;
+    if (autoAnalyzedTickerRef.current === normalized) return;
+    autoAnalyzedTickerRef.current = normalized;
+    void handleAnalyze(normalized);
   }, [activeTicker]);
 
   useEffect(() => {
@@ -658,16 +750,18 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
     }
     setTickerInput(ticker);
     setTickerInputFocused(false);
+    autoAnalyzedTickerRef.current = ticker;
     onTickerChange(ticker);
     const runNonce = runNonceRef.current + 1;
     runNonceRef.current = runNonce;
     try {
-      const [analysisResult, chartResult, advancedResult, indicatorResult] = await Promise.allSettled([
-        runResearch(ticker, timeframe),
-        fetchCandles(ticker, chartPeriod, chartInterval, true),
-        fetchAdvancedSnapshotWithQuoteFallback(ticker),
-        fetchIndicatorSnapshot(ticker, chartPeriod, chartInterval),
-      ]);
+      const [analysisResult, chartResult, advancedResult, indicatorResult] =
+        await Promise.allSettled([
+          runResearch(ticker, timeframe),
+          fetchCandles(ticker, chartPeriod, chartInterval, true),
+          fetchAdvancedSnapshotWithQuoteFallback(ticker),
+          fetchIndicatorSnapshot(ticker, chartPeriod, chartInterval),
+        ]);
       if (runNonce !== runNonceRef.current) return;
       if (analysisResult.status === "rejected") {
         throw analysisResult.reason;
@@ -677,12 +771,17 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
       if (advancedResult.status === "fulfilled") {
         const cached = readAdvancedCache(ticker);
         setAdvanced((prev) => {
-          const merged = mergeAdvancedSnapshot(advancedResult.value, prev, cached);
+          const merged = mergeAdvancedSnapshot(
+            advancedResult.value,
+            prev,
+            cached,
+          );
           writeAdvancedCache(merged);
           return merged;
         });
       }
-      if (indicatorResult.status === "fulfilled") setIndicatorSnapshot(indicatorResult.value);
+      if (indicatorResult.status === "fulfilled")
+        setIndicatorSnapshot(indicatorResult.value);
     } catch (err) {
       if (runNonce !== runNonceRef.current) return;
       setError(err instanceof Error ? err.message : "Research request failed");
@@ -711,7 +810,13 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
     const runNonce = runNonceRef.current + 1;
     runNonceRef.current = runNonce;
     try {
-      const [analysisResult, chartResult, advancedResult, indicatorResult, deepResult] = await Promise.allSettled([
+      const [
+        analysisResult,
+        chartResult,
+        advancedResult,
+        indicatorResult,
+        deepResult,
+      ] = await Promise.allSettled([
         runResearch(ticker, timeframe),
         fetchCandles(ticker, chartPeriod, chartInterval, true),
         fetchAdvancedSnapshotWithQuoteFallback(ticker),
@@ -727,21 +832,32 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
       if (advancedResult.status === "fulfilled") {
         const cached = readAdvancedCache(ticker);
         setAdvanced((prev) => {
-          const merged = mergeAdvancedSnapshot(advancedResult.value, prev, cached);
+          const merged = mergeAdvancedSnapshot(
+            advancedResult.value,
+            prev,
+            cached,
+          );
           writeAdvancedCache(merged);
           return merged;
         });
       }
-      if (indicatorResult.status === "fulfilled") setIndicatorSnapshot(indicatorResult.value);
+      if (indicatorResult.status === "fulfilled")
+        setIndicatorSnapshot(indicatorResult.value);
       if (deepResult.status === "fulfilled") {
         setDeepResearch(deepResult.value);
       } else {
-        setError(deepResult.reason instanceof Error ? deepResult.reason.message : "Deep research request failed");
+        setError(
+          deepResult.reason instanceof Error
+            ? deepResult.reason.message
+            : "Deep research request failed",
+        );
         setDeepResearch(null);
       }
     } catch (err) {
       if (runNonce !== runNonceRef.current) return;
-      setError(err instanceof Error ? err.message : "Deep research request failed");
+      setError(
+        err instanceof Error ? err.message : "Deep research request failed",
+      );
     } finally {
       if (runNonce !== runNonceRef.current) return;
       setAgentProgress(100);
@@ -751,9 +867,11 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
   }
 
   const sourceRows = research?.source_breakdown ?? [];
-  const perplexityEntry = sourceRows.find((entry) => entry.source === "Perplexity Sonar") ?? null;
+  const perplexityEntry =
+    sourceRows.find((entry) => entry.source === "Perplexity Sonar") ?? null;
   const xEntry = sourceRows.find((entry) => entry.source === "X API") ?? null;
-  const redditEntry = sourceRows.find((entry) => entry.source === "Reddit API") ?? null;
+  const redditEntry =
+    sourceRows.find((entry) => entry.source === "Reddit API") ?? null;
   const agentRunning = loading || deepLoading;
   const runNonceRef = useRef(0);
 
@@ -791,7 +909,9 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
     const prompt = (promptOverride ?? chatPrompt).trim();
     if (!prompt || chatLoading || chatSubmitLockRef.current) return;
     chatSubmitLockRef.current = true;
-    const seedTicker = activeTicker.trim().toUpperCase() || resolveTickerCandidate(tickerInput, tickerSuggestions);
+    const seedTicker =
+      activeTicker.trim().toUpperCase() ||
+      resolveTickerCandidate(tickerInput, tickerSuggestions);
     setChatModalOpen(true);
     setChatLog((prev) => [...prev, { role: "user", text: prompt }]);
     setChatPrompt("");
@@ -816,7 +936,10 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
         ...prev,
         {
           role: "assistant",
-          text: err instanceof Error ? err.message : "Research chat request failed.",
+          text:
+            err instanceof Error
+              ? err.message
+              : "Research chat request failed.",
           meta: "error",
         },
       ]);
@@ -838,24 +961,38 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
   return (
     <section className="panel stack stagger">
       {indicatorInfoOpen ? (
-        <div className="panel-info-backdrop" onClick={() => setIndicatorInfoOpen(false)}>
-          <div className="panel-info-modal" onClick={(event) => event.stopPropagation()}>
+        <div
+          className="panel-info-backdrop"
+          onClick={() => setIndicatorInfoOpen(false)}
+        >
+          <div
+            className="panel-info-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
             <div className="panel-header">
               <h3>Pro Indicator Snapshot</h3>
               <span className="muted">
-                {indicatorSnapshot ? `${indicatorSnapshot.period} / ${indicatorSnapshot.interval}` : `${chartPeriod} / ${chartInterval}`}
+                {indicatorSnapshot
+                  ? `${indicatorSnapshot.period} / ${indicatorSnapshot.interval}`
+                  : `${chartPeriod} / ${chartInterval}`}
               </span>
             </div>
             <div className="kpi-grid">
-              {indicatorSnapshot ? (
-                INDICATOR_OPTIONS.filter((item) => selectedIndicators[item.key]).map((item) => (
-                  <div key={`modal-ind-${item.key}`}>
-                    <p className="muted">{item.label}</p>
-                    <h3>{formatIndicatorValue(indicatorSnapshot, item.key)}</h3>
-                  </div>
-                ))
-              ) : null}
-              {INDICATOR_OPTIONS.every((item) => !selectedIndicators[item.key]) ? (
+              {indicatorSnapshot
+                ? INDICATOR_OPTIONS.filter(
+                    (item) => selectedIndicators[item.key],
+                  ).map((item) => (
+                    <div key={`modal-ind-${item.key}`}>
+                      <p className="muted">{item.label}</p>
+                      <h3>
+                        {formatIndicatorValue(indicatorSnapshot, item.key)}
+                      </h3>
+                    </div>
+                  ))
+                : null}
+              {INDICATOR_OPTIONS.every(
+                (item) => !selectedIndicators[item.key],
+              ) ? (
                 <div>
                   <p className="muted">No indicators selected</p>
                   <h3>-</h3>
@@ -863,15 +1000,20 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
               ) : null}
             </div>
             <p className="muted">
-              Commonly used by professional desks: trend (SMA/EMA/VWAP), momentum (RSI/MACD), and volatility (ATR/Bollinger).
+              Commonly used by professional desks: trend (SMA/EMA/VWAP),
+              momentum (RSI/MACD), and volatility (ATR/Bollinger).
             </p>
             <div className="source-ai-summary">
               <section className="source-summary-section">
                 <h5 className="source-summary-heading">Trend</h5>
                 <ul className="source-summary-list">
-                  <li>SMA 20/50/200: short, medium, and long trend baselines.</li>
+                  <li>
+                    SMA 20/50/200: short, medium, and long trend baselines.
+                  </li>
                   <li>EMA 21/50: reacts faster to trend changes.</li>
-                  <li>VWAP: institutional execution and mean-reversion anchor.</li>
+                  <li>
+                    VWAP: institutional execution and mean-reversion anchor.
+                  </li>
                 </ul>
               </section>
               <section className="source-summary-section">
@@ -885,17 +1027,27 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                 <h5 className="source-summary-heading">Volatility</h5>
                 <ul className="source-summary-list">
                   <li>Bollinger Bands: compression/expansion and breakouts.</li>
-                  <li>ATR 14: normalized volatility and stop-sizing context.</li>
+                  <li>
+                    ATR 14: normalized volatility and stop-sizing context.
+                  </li>
                 </ul>
               </section>
             </div>
-            <button className="secondary" onClick={() => setIndicatorInfoOpen(false)}>Close</button>
+            <button
+              className="secondary"
+              onClick={() => setIndicatorInfoOpen(false)}
+            >
+              Close
+            </button>
           </div>
         </div>
       ) : null}
       {agentRunning ? (
         <div className="panel-info-backdrop live-wire-backdrop">
-          <div className="panel-info-modal live-wire-modal" onClick={(event) => event.stopPropagation()}>
+          <div
+            className="panel-info-modal live-wire-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
             <div className="panel-header">
               <h3>Research Agent Running</h3>
               <span className="live-wire-running-chip">
@@ -903,13 +1055,26 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                 {deepLoading ? "Deep Research" : "Research"}
               </span>
             </div>
-            <div className="run-progress-wrap" aria-label="Research run progress">
+            <div
+              className="run-progress-wrap"
+              aria-label="Research run progress"
+            >
               <div className="run-progress-track">
-                <div className="run-progress-fill" style={{ width: `${Math.max(6, Math.round(agentProgress))}%` }} />
+                <div
+                  className="run-progress-fill"
+                  style={{
+                    width: `${Math.max(6, Math.round(agentProgress))}%`,
+                  }}
+                />
               </div>
-              <span className="muted run-progress-label">{Math.max(6, Math.round(agentProgress))}%</span>
+              <span className="muted run-progress-label">
+                {Math.max(6, Math.round(agentProgress))}%
+              </span>
             </div>
-            <p className="muted">Live Wire is streaming agent steps. Screen unlocks automatically when run completes.</p>
+            <p className="muted">
+              Live Wire is streaming agent steps. Screen unlocks automatically
+              when run completes.
+            </p>
             <div className="panel-header">
               <h4>Live Wire</h4>
               <span className={connected ? "dot dot-live" : "dot dot-offline"}>
@@ -917,25 +1082,44 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
               </span>
             </div>
             <div className="event-list live-wire-overlay-list">
-              {liveWireActivity.length === 0 ? <p className="muted">Waiting for agent activity...</p> : null}
+              {liveWireActivity.length === 0 ? (
+                <p className="muted">Waiting for agent activity...</p>
+              ) : null}
               {liveWireActivity.map((event, idx) => (
-                <article key={`${activityKey(event)}-overlay-${idx}`} className="event-item">
+                <article
+                  key={`${activityKey(event)}-overlay-${idx}`}
+                  className="event-item"
+                >
                   <div className="event-meta">
                     <strong>{event.agent_name ?? "AI Agent"}</strong>
                     <span>{event.module ?? "research"}</span>
                   </div>
-                  <p className="live-wire-action">{event.action ?? "Processing request..."}</p>
+                  <p className="live-wire-action">
+                    {event.action ?? "Processing request..."}
+                  </p>
                   <div className="live-wire-footer">
-                    <span className={`live-wire-status ${statusClass(event.status)}`}>{(event.status ?? "running").toLowerCase()}</span>
+                    <span
+                      className={`live-wire-status ${statusClass(event.status)}`}
+                    >
+                      {(event.status ?? "running").toLowerCase()}
+                    </span>
                     {event.created_at || event.timestamp ? (
-                      <time>{new Date(event.created_at ?? event.timestamp ?? "").toLocaleTimeString()}</time>
+                      <time>
+                        {new Date(
+                          event.created_at ?? event.timestamp ?? "",
+                        ).toLocaleTimeString()}
+                      </time>
                     ) : null}
                   </div>
                 </article>
               ))}
             </div>
             <div className="run-overlay-actions">
-              <button type="button" className="secondary force-quit-btn" onClick={handleForceQuitRun}>
+              <button
+                type="button"
+                className="secondary force-quit-btn"
+                onClick={handleForceQuitRun}
+              >
                 Force Quit
               </button>
             </div>
@@ -943,12 +1127,23 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
         </div>
       ) : null}
       {chatModalOpen ? (
-        <div className="panel-info-backdrop research-chat-backdrop" onClick={() => setChatModalOpen(false)}>
-          <div className="panel-info-modal research-chat-modal" onClick={(event) => event.stopPropagation()}>
+        <div
+          className="panel-info-backdrop research-chat-backdrop"
+          onClick={() => setChatModalOpen(false)}
+        >
+          <div
+            className="panel-info-modal research-chat-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
             <div className="panel-header">
               <h3>Research Chat</h3>
               <div className="row-actions">
-                <button type="button" className="secondary" onClick={handleClearChat} disabled={chatLoading || chatLog.length === 0}>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={handleClearChat}
+                  disabled={chatLoading || chatLog.length === 0}
+                >
                   Clear chat
                 </button>
                 <button
@@ -963,12 +1158,30 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
               </div>
             </div>
             <div className="research-chat-layout">
-              <div className="research-chat-log research-chat-modal-log" ref={chatLogRef}>
-                {chatLog.length === 0 ? <p className="muted">{hasSelectedTicker ? "Ask a stock-specific question about this ticker." : "Select a stock first to use Research Chat."}</p> : null}
+              <div
+                className="research-chat-log research-chat-modal-log"
+                ref={chatLogRef}
+              >
+                {chatLog.length === 0 ? (
+                  <p className="muted">
+                    {hasSelectedTicker
+                      ? "Ask a stock-specific question about this ticker."
+                      : "Select a stock first to use Research Chat."}
+                  </p>
+                ) : null}
                 {chatLog.map((item, idx) => (
-                  <article key={`research-chat-modal-${idx}`} className={item.role === "user" ? "research-chat-item user" : "research-chat-item assistant"}>
+                  <article
+                    key={`research-chat-modal-${idx}`}
+                    className={
+                      item.role === "user"
+                        ? "research-chat-item user"
+                        : "research-chat-item assistant"
+                    }
+                  >
                     <p>{item.text}</p>
-                    {item.meta ? <span className="muted">{item.meta}</span> : null}
+                    {item.meta ? (
+                      <span className="muted">{item.meta}</span>
+                    ) : null}
                   </article>
                 ))}
                 {chatLoading ? (
@@ -980,22 +1193,39 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
               <aside className="research-chat-toolstream">
                 <div className="panel-header">
                   <h4>Live Wire</h4>
-                  <span className={connected ? "dot dot-live" : "dot dot-offline"}>
+                  <span
+                    className={connected ? "dot dot-live" : "dot dot-offline"}
+                  >
                     {connected ? "Socket Live" : "Socket Offline"}
                   </span>
                 </div>
                 <div className="research-chat-toolstream-list">
-                  {chatLoading && liveWireActivity.length === 0 ? <p className="muted">Spinning up agents...</p> : null}
-                  {!chatLoading && liveWireActivity.length === 0 ? <p className="muted">Activity appears here when tools run.</p> : null}
+                  {chatLoading && liveWireActivity.length === 0 ? (
+                    <p className="muted">Spinning up agents...</p>
+                  ) : null}
+                  {!chatLoading && liveWireActivity.length === 0 ? (
+                    <p className="muted">
+                      Activity appears here when tools run.
+                    </p>
+                  ) : null}
                   {liveWireActivity.slice(0, 12).map((event, idx) => (
-                    <article key={`chat-tool-${activityKey(event)}-${idx}`} className="event-item">
+                    <article
+                      key={`chat-tool-${activityKey(event)}-${idx}`}
+                      className="event-item"
+                    >
                       <div className="event-meta">
                         <strong>{event.agent_name ?? "AI Agent"}</strong>
                         <span>{event.module ?? "research"}</span>
                       </div>
-                      <p className="live-wire-action">{event.action ?? "Processing..."}</p>
+                      <p className="live-wire-action">
+                        {event.action ?? "Processing..."}
+                      </p>
                       <div className="live-wire-footer">
-                        <span className={`live-wire-status ${statusClass(event.status)}`}>{(event.status ?? "running").toLowerCase()}</span>
+                        <span
+                          className={`live-wire-status ${statusClass(event.status)}`}
+                        >
+                          {(event.status ?? "running").toLowerCase()}
+                        </span>
                       </div>
                     </article>
                   ))}
@@ -1006,7 +1236,11 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
               <textarea
                 value={chatPrompt}
                 rows={3}
-                placeholder={hasSelectedTicker ? `Ask about ${activeTicker}...` : "Select a stock first..."}
+                placeholder={
+                  hasSelectedTicker
+                    ? `Ask about ${activeTicker}...`
+                    : "Select a stock first..."
+                }
                 disabled={!hasSelectedTicker}
                 onChange={(event) => setChatPrompt(event.target.value)}
                 onKeyDown={(event) => {
@@ -1015,7 +1249,14 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                   void handleResearchChatSubmit();
                 }}
               />
-              <button onClick={() => void handleResearchChatSubmit()} disabled={!hasSelectedTicker || chatLoading || chatPrompt.trim().length === 0}>
+              <button
+                onClick={() => void handleResearchChatSubmit()}
+                disabled={
+                  !hasSelectedTicker ||
+                  chatLoading ||
+                  chatPrompt.trim().length === 0
+                }
+              >
                 {chatLoading ? "Querying…" : "Ask"}
               </button>
             </div>
@@ -1039,10 +1280,14 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                 void handleAnalyze(topSuggestion ?? tickerInput);
               }}
               maxLength={48}
-              placeholder={`Ticker or company name (${activeTicker.toUpperCase()})`}
+              placeholder={`Ticker or company name ${activeTicker.toUpperCase()}`}
             />
             {tickerInputFocused && tickerInput.trim() ? (
-              <div className="ticker-suggestions" role="listbox" aria-label="Ticker suggestions">
+              <div
+                className="ticker-suggestions"
+                role="listbox"
+                aria-label="Ticker suggestions"
+              >
                 {tickerSuggestions.length > 0 ? (
                   tickerSuggestions.map((entry) => (
                     <button
@@ -1055,12 +1300,18 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                         setTickerInputFocused(false);
                       }}
                     >
-                      <span className="ticker-suggestion-symbol">{entry.ticker}</span>
-                      <span className="ticker-suggestion-name">{entry.name}</span>
+                      <span className="ticker-suggestion-symbol">
+                        {entry.ticker}
+                      </span>
+                      <span className="ticker-suggestion-name">
+                        {entry.name}
+                      </span>
                     </button>
                   ))
                 ) : (
-                  <p className="ticker-suggestion-empty">{tickerSearchLoading ? "Searching…" : "No matches found"}</p>
+                  <p className="ticker-suggestion-empty">
+                    {tickerSearchLoading ? "Searching…" : "No matches found"}
+                  </p>
                 )}
               </div>
             ) : null}
@@ -1068,7 +1319,10 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
         </label>
         <label className="research-control">
           Timeframe
-          <select value={timeframe} onChange={(event) => setTimeframe(event.target.value)}>
+          <select
+            value={timeframe}
+            onChange={(event) => setTimeframe(event.target.value)}
+          >
             <option value="24h">24h</option>
             <option value="7d">7d</option>
             <option value="30d">30d</option>
@@ -1084,14 +1338,22 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
         </label>
         <label className="research-control">
           Chart Type
-          <select value={chartMode} onChange={(event) => setChartMode(event.target.value as "candles" | "line")}>
+          <select
+            value={chartMode}
+            onChange={(event) =>
+              setChartMode(event.target.value as "candles" | "line")
+            }
+          >
             <option value="candles">Candlesticks</option>
             <option value="line">Line</option>
           </select>
         </label>
         <label className="research-control">
           Chart Range
-          <select value={chartPeriod} onChange={(event) => setChartPeriod(event.target.value)}>
+          <select
+            value={chartPeriod}
+            onChange={(event) => setChartPeriod(event.target.value)}
+          >
             <option value="5d">5d</option>
             <option value="1mo">1mo</option>
             <option value="3mo">3mo</option>
@@ -1105,7 +1367,10 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
         </label>
         <label className="research-control">
           Interval
-          <select value={chartInterval} onChange={(event) => setChartInterval(event.target.value)}>
+          <select
+            value={chartInterval}
+            onChange={(event) => setChartInterval(event.target.value)}
+          >
             <option value="1d">1d</option>
             <option value="1wk">1wk</option>
             <option value="1mo">1mo</option>
@@ -1128,7 +1393,11 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
               <button
                 key={item.key}
                 type="button"
-                className={selectedIndicators[item.key] ? "indicator-chip active" : "indicator-chip"}
+                className={
+                  selectedIndicators[item.key]
+                    ? "indicator-chip active"
+                    : "indicator-chip"
+                }
                 onClick={() =>
                   setSelectedIndicators((prev) => ({
                     ...prev,
@@ -1145,7 +1414,11 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
           <button onClick={() => void handleAnalyze()} disabled={loading}>
             {loading ? "Analyzing…" : "Run Research"}
           </button>
-          <button className="secondary" onClick={handleDeepResearch} disabled={deepLoading}>
+          <button
+            className="secondary"
+            onClick={handleDeepResearch}
+            disabled={deepLoading}
+          >
             {deepLoading ? "Deep researching…" : "Deep Research"}
           </button>
         </div>
@@ -1156,13 +1429,19 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
       <div className="glass-card stack">
         <div className="panel-header">
           <h3>Research Chat</h3>
-          <span className="muted">Popup assistant with live backend tool activity.</span>
+          <span className="muted">
+            Popup assistant with live backend tool activity.
+          </span>
         </div>
         <div className="research-chat-compose">
           <textarea
             value={chatPrompt}
             rows={2}
-            placeholder={hasSelectedTicker ? `Ask about ${activeTicker}...` : "Select a stock first..."}
+            placeholder={
+              hasSelectedTicker
+                ? `Ask about ${activeTicker}...`
+                : "Select a stock first..."
+            }
             disabled={!hasSelectedTicker}
             onFocus={() => {
               if (!hasSelectedTicker) return;
@@ -1175,7 +1454,10 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
               void handleResearchChatSubmit();
             }}
           />
-          <button onClick={() => setChatModalOpen(true)} disabled={!hasSelectedTicker || chatLoading}>
+          <button
+            onClick={() => setChatModalOpen(true)}
+            disabled={!hasSelectedTicker || chatLoading}
+          >
             {chatLoading ? "Querying…" : "Open Chat"}
           </button>
         </div>
@@ -1199,7 +1481,9 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
       <div className="glass-card">
         <div className="panel-header">
           <h3>{activeTicker} Price Action</h3>
-          <span className="muted">{chartPeriod} / {chartInterval}</span>
+          <span className="muted">
+            {chartPeriod} / {chartInterval}
+          </span>
         </div>
         <StockChart
           points={candles}
@@ -1223,14 +1507,38 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
             <span className="muted">{advanced.exchange ?? "-"}</span>
           </div>
           <div className="kpi-grid">
-            <div><p className="muted">Current Price</p><h3>{formatToCents(advanced.current_price)}</h3></div>
-            <div><p className="muted">1D Change</p><h3>{formatPercent(advanced.change_percent)}</h3></div>
-            <div><p className="muted">Market Cap</p><h3>{formatCompactNumber(advanced.market_cap)}</h3></div>
-            <div><p className="muted">Trailing P/E</p><h3>{formatToCents(advanced.trailing_pe)}</h3></div>
-            <div><p className="muted">Forward P/E</p><h3>{formatToCents(advanced.forward_pe)}</h3></div>
-            <div><p className="muted">EPS (TTM)</p><h3>{formatToCents(advanced.eps_trailing)}</h3></div>
-            <div><p className="muted">Target Price</p><h3>{formatToCents(advanced.target_mean_price)}</h3></div>
-            <div><p className="muted">Recommendation</p><h3>{advanced.recommendation ?? "-"}</h3></div>
+            <div>
+              <p className="muted">Current Price</p>
+              <h3>{formatToCents(advanced.current_price)}</h3>
+            </div>
+            <div>
+              <p className="muted">1D Change</p>
+              <h3>{formatPercent(advanced.change_percent)}</h3>
+            </div>
+            <div>
+              <p className="muted">Market Cap</p>
+              <h3>{formatCompactNumber(advanced.market_cap)}</h3>
+            </div>
+            <div>
+              <p className="muted">Trailing P/E</p>
+              <h3>{formatToCents(advanced.trailing_pe)}</h3>
+            </div>
+            <div>
+              <p className="muted">Forward P/E</p>
+              <h3>{formatToCents(advanced.forward_pe)}</h3>
+            </div>
+            <div>
+              <p className="muted">EPS (TTM)</p>
+              <h3>{formatToCents(advanced.eps_trailing)}</h3>
+            </div>
+            <div>
+              <p className="muted">Target Price</p>
+              <h3>{formatToCents(advanced.target_mean_price)}</h3>
+            </div>
+            <div>
+              <p className="muted">Recommendation</p>
+              <h3>{advanced.recommendation ?? "-"}</h3>
+            </div>
           </div>
           <p className="muted" style={{ marginTop: "0.75rem" }}>
             {advanced.sector ?? "-"} / {advanced.industry ?? "-"}
@@ -1246,20 +1554,33 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
             {perplexityEntry ? (
               <article className="source-item">
                 <div className="source-title source-title-top source-score-row">
-                  <span className={`pill ${sentimentToneClass(perplexityEntry.score)}`}>
-                    {sentimentLabelDetailed(perplexityEntry.score)} · {sentimentScore100(perplexityEntry.score)}/100
+                  <span
+                    className={`pill ${sentimentToneClass(perplexityEntry.score)}`}
+                  >
+                    {sentimentLabelDetailed(perplexityEntry.score)} ·{" "}
+                    {sentimentScore100(perplexityEntry.score)}/100
                   </span>
                 </div>
                 <div className="source-ai-summary">
-                  {parseSummarySections(perplexityEntry.summary).map((section, sectionIdx) =>
-                    renderSummarySection(section, perplexityEntry.source, sectionIdx)
+                  {parseSummarySections(perplexityEntry.summary).map(
+                    (section, sectionIdx) =>
+                      renderSummarySection(
+                        section,
+                        perplexityEntry.source,
+                        sectionIdx,
+                      ),
                   )}
                 </div>
                 {perplexityEntry.links.length > 0 ? (
                   <div className="source-citations">
                     <span className="muted">Sources:</span>
                     {perplexityEntry.links.slice(0, 8).map((link) => (
-                      <a key={`${perplexityEntry.source}-cite-${link.url}`} href={link.url} target="_blank" rel="noreferrer">
+                      <a
+                        key={`${perplexityEntry.source}-cite-${link.url}`}
+                        href={link.url}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
                         {displayLinkLabel(link.title, link.url)}
                       </a>
                     ))}
@@ -1267,7 +1588,9 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                 ) : null}
               </article>
             ) : (
-              <p className="muted">No Perplexity summary yet. Run research to load it.</p>
+              <p className="muted">
+                No Perplexity summary yet. Run research to load it.
+              </p>
             )}
           </div>
         </div>
@@ -1275,35 +1598,45 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
         <div className="glass-card">
           <h3>Public Voices</h3>
           <div className="stack small-gap">
-            {[xEntry, redditEntry].filter((item): item is NonNullable<typeof item> => Boolean(item)).map((entry) => (
-              <article key={entry.source} className="source-item">
-                <div className="source-title source-title-top">
-                  <strong>{entry.source}</strong>
-                  <span className={`pill ${sentimentToneClass(entry.score)}`}>
-                    {sentimentLabelDetailed(entry.score)} · {sentimentScore100(entry.score)}/100
-                  </span>
-                </div>
-                <div className="source-ai-summary">
-                  {(() => {
-                    const sections = parseSummarySections(entry.summary);
-                    if (sections.length === 0) return <p>{entry.summary}</p>;
-                    return sections.map((section, sectionIdx) =>
-                      renderSummarySection(section, entry.source, sectionIdx)
-                    );
-                  })()}
-                </div>
-                {entry.links.length > 0 ? (
-                  <div className="source-citations">
-                    {entry.links.slice(0, 4).map((link) => (
-                      <a key={`${entry.source}-right-${link.url}`} href={link.url} target="_blank" rel="noreferrer">
-                        {displayLinkLabel(link.title, link.url)}
-                      </a>
-                    ))}
+            {[xEntry, redditEntry]
+              .filter((item): item is NonNullable<typeof item> => Boolean(item))
+              .map((entry) => (
+                <article key={entry.source} className="source-item">
+                  <div className="source-title source-title-top">
+                    <strong>{entry.source}</strong>
+                    <span className={`pill ${sentimentToneClass(entry.score)}`}>
+                      {sentimentLabelDetailed(entry.score)} ·{" "}
+                      {sentimentScore100(entry.score)}/100
+                    </span>
                   </div>
-                ) : null}
-              </article>
-            ))}
-            {!xEntry && !redditEntry ? <p className="muted">No X/Reddit summaries yet.</p> : null}
+                  <div className="source-ai-summary">
+                    {(() => {
+                      const sections = parseSummarySections(entry.summary);
+                      if (sections.length === 0) return <p>{entry.summary}</p>;
+                      return sections.map((section, sectionIdx) =>
+                        renderSummarySection(section, entry.source, sectionIdx),
+                      );
+                    })()}
+                  </div>
+                  {entry.links.length > 0 ? (
+                    <div className="source-citations">
+                      {entry.links.slice(0, 4).map((link) => (
+                        <a
+                          key={`${entry.source}-right-${link.url}`}
+                          href={link.url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {displayLinkLabel(link.title, link.url)}
+                        </a>
+                      ))}
+                    </div>
+                  ) : null}
+                </article>
+              ))}
+            {!xEntry && !redditEntry ? (
+              <p className="muted">No X/Reddit summaries yet.</p>
+            ) : null}
           </div>
           <div className="source-item prediction-resource-box">
             <div className="panel-header">
@@ -1319,16 +1652,27 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                   </tr>
                 </thead>
                 <tbody>
-                  {(research?.prediction_markets ?? []).slice(0, 3).map((market, idx) => (
-                    <tr key={`market-${idx}`}>
-                      <td>{String(market.source ?? "-")}{idx === 0 ? " (most relevant)" : ""}</td>
-                      <td>{String(market.market ?? "-")}</td>
-                      <td>{String(market.probability ?? market.yes_price ?? "-")}</td>
-                    </tr>
-                  ))}
+                  {(research?.prediction_markets ?? [])
+                    .slice(0, 3)
+                    .map((market, idx) => (
+                      <tr key={`market-${idx}`}>
+                        <td>
+                          {String(market.source ?? "-")}
+                          {idx === 0 ? " (most relevant)" : ""}
+                        </td>
+                        <td>{String(market.market ?? "-")}</td>
+                        <td>
+                          {String(
+                            market.probability ?? market.yes_price ?? "-",
+                          )}
+                        </td>
+                      </tr>
+                    ))}
                   {(research?.prediction_markets ?? []).length === 0 ? (
                     <tr>
-                      <td colSpan={3} className="muted">No relevant prediction market found for this ticker.</td>
+                      <td colSpan={3} className="muted">
+                        No relevant prediction market found for this ticker.
+                      </td>
                     </tr>
                   ) : null}
                 </tbody>
@@ -1336,13 +1680,20 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
             </div>
             {(research?.prediction_markets ?? []).length > 0 ? (
               <div className="inline-links wrap">
-                {(research?.prediction_markets ?? []).slice(0, 3).map((market, idx) => (
-                  typeof market.link === "string" && market.link ? (
-                    <a key={`prediction-link-${idx}`} href={market.link} target="_blank" rel="noreferrer">
-                      {siteNameFromUrl(market.link)}
-                    </a>
-                  ) : null
-                ))}
+                {(research?.prediction_markets ?? [])
+                  .slice(0, 3)
+                  .map((market, idx) =>
+                    typeof market.link === "string" && market.link ? (
+                      <a
+                        key={`prediction-link-${idx}`}
+                        href={market.link}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        {siteNameFromUrl(market.link)}
+                      </a>
+                    ) : null,
+                  )}
               </div>
             ) : null}
           </div>
@@ -1353,7 +1704,9 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
         <div className="glass-card">
           <div className="panel-header">
             <h3>Deep Research</h3>
-            <span className="muted">{deepResearch.symbol} · {deepResearch.source}</span>
+            <span className="muted">
+              {deepResearch.symbol} · {deepResearch.source}
+            </span>
           </div>
           {(deepResearch.deep_bullets ?? []).length > 0 ? (
             <ul className="source-summary-list">
@@ -1363,7 +1716,10 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
             </ul>
           ) : null}
 
-          <div className="card-row card-row-split" style={{ marginTop: "10px" }}>
+          <div
+            className="card-row card-row-split"
+            style={{ marginTop: "10px" }}
+          >
             <article className="source-item">
               <h4>Analyst View</h4>
               <p>{deepResearch.analyst_ratings ?? "-"}</p>
@@ -1381,16 +1737,18 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                       </tr>
                     </thead>
                     <tbody>
-                      {(deepResearch.recommendation_timeline ?? []).map((row, idx) => (
-                        <tr key={`rec-${idx}`}>
-                          <td>{row.period}</td>
-                          <td>{row.strong_buy}</td>
-                          <td>{row.buy}</td>
-                          <td>{row.hold}</td>
-                          <td>{row.sell}</td>
-                          <td>{row.strong_sell}</td>
-                        </tr>
-                      ))}
+                      {(deepResearch.recommendation_timeline ?? []).map(
+                        (row, idx) => (
+                          <tr key={`rec-${idx}`}>
+                            <td>{row.period}</td>
+                            <td>{row.strong_buy}</td>
+                            <td>{row.buy}</td>
+                            <td>{row.hold}</td>
+                            <td>{row.sell}</td>
+                            <td>{row.strong_sell}</td>
+                          </tr>
+                        ),
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -1400,19 +1758,39 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
             <article className="source-item">
               <h4>Price Targets</h4>
               <div className="kpi-grid">
-                <div><p className="muted">Mean</p><h3>{formatToCents(deepResearch.price_target?.target_mean)}</h3></div>
-                <div><p className="muted">High</p><h3>{formatToCents(deepResearch.price_target?.target_high)}</h3></div>
-                <div><p className="muted">Low</p><h3>{formatToCents(deepResearch.price_target?.target_low)}</h3></div>
+                <div>
+                  <p className="muted">Mean</p>
+                  <h3>
+                    {formatToCents(deepResearch.price_target?.target_mean)}
+                  </h3>
+                </div>
+                <div>
+                  <p className="muted">High</p>
+                  <h3>
+                    {formatToCents(deepResearch.price_target?.target_high)}
+                  </h3>
+                </div>
+                <div>
+                  <p className="muted">Low</p>
+                  <h3>
+                    {formatToCents(deepResearch.price_target?.target_low)}
+                  </h3>
+                </div>
               </div>
               {deepResearch.price_target?.last_updated ? (
-                <p className="muted">Updated: {deepResearch.price_target.last_updated}</p>
+                <p className="muted">
+                  Updated: {deepResearch.price_target.last_updated}
+                </p>
               ) : null}
               <h4 style={{ marginTop: "12px" }}>Reddit DD</h4>
               <p>{deepResearch.reddit_dd_summary ?? "-"}</p>
             </article>
           </div>
 
-          <div className="card-row card-row-split" style={{ marginTop: "10px" }}>
+          <div
+            className="card-row card-row-split"
+            style={{ marginTop: "10px" }}
+          >
             <article className="source-item">
               <h4>Insider Highlights</h4>
               <p>{deepResearch.insider_trading ?? "-"}</p>
@@ -1430,16 +1808,18 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                       </tr>
                     </thead>
                     <tbody>
-                      {(deepResearch.insider_highlights ?? []).map((row, idx) => (
-                        <tr key={`deep-insider-${idx}`}>
-                          <td>{row.date ?? "-"}</td>
-                          <td>{row.name ?? "-"}</td>
-                          <td>{row.code ?? "-"}</td>
-                          <td>{formatCompactNumber(row.shares)}</td>
-                          <td>{formatToCents(row.price)}</td>
-                          <td>{formatCompactNumber(row.value_estimate)}</td>
-                        </tr>
-                      ))}
+                      {(deepResearch.insider_highlights ?? []).map(
+                        (row, idx) => (
+                          <tr key={`deep-insider-${idx}`}>
+                            <td>{row.date ?? "-"}</td>
+                            <td>{row.name ?? "-"}</td>
+                            <td>{row.code ?? "-"}</td>
+                            <td>{formatCompactNumber(row.shares)}</td>
+                            <td>{formatToCents(row.price)}</td>
+                            <td>{formatCompactNumber(row.value_estimate)}</td>
+                          </tr>
+                        ),
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -1455,12 +1835,21 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                       <strong>r/{row.subreddit}</strong>: {row.title}
                     </p>
                     <div className="source-citations">
-                      {row.url ? <a href={row.url} target="_blank" rel="noreferrer">Open thread</a> : null}
-                      <span className="muted">score {row.score ?? "-"} · comments {row.comments ?? "-"}</span>
+                      {row.url ? (
+                        <a href={row.url} target="_blank" rel="noreferrer">
+                          Open thread
+                        </a>
+                      ) : null}
+                      <span className="muted">
+                        score {row.score ?? "-"} · comments{" "}
+                        {row.comments ?? "-"}
+                      </span>
                     </div>
                   </div>
                 ))}
-                {(deepResearch.reddit_highlights ?? []).length === 0 ? <p className="muted">No subreddit highlights available.</p> : null}
+                {(deepResearch.reddit_highlights ?? []).length === 0 ? (
+                  <p className="muted">No subreddit highlights available.</p>
+                ) : null}
               </div>
             </article>
           </div>
@@ -1470,19 +1859,33 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
             <div className="stack small-gap">
               {(deepResearch.recent_news ?? []).map((item, idx) => (
                 <div key={`deep-news-${idx}`}>
-                  <p><strong>{item.headline ?? "-"}</strong></p>
+                  <p>
+                    <strong>{item.headline ?? "-"}</strong>
+                  </p>
                   <div className="source-citations">
-                    {item.url ? <a href={item.url} target="_blank" rel="noreferrer">{siteNameFromUrl(item.url)}</a> : null}
-                    <span className="muted">{item.source ?? "unknown source"}</span>
+                    {item.url ? (
+                      <a href={item.url} target="_blank" rel="noreferrer">
+                        {siteNameFromUrl(item.url)}
+                      </a>
+                    ) : null}
+                    <span className="muted">
+                      {item.source ?? "unknown source"}
+                    </span>
                   </div>
-                  {item.summary ? <p className="muted">{item.summary}</p> : null}
+                  {item.summary ? (
+                    <p className="muted">{item.summary}</p>
+                  ) : null}
                 </div>
               ))}
-              {(deepResearch.recent_news ?? []).length === 0 ? <p className="muted">No recent company news returned.</p> : null}
+              {(deepResearch.recent_news ?? []).length === 0 ? (
+                <p className="muted">No recent company news returned.</p>
+              ) : null}
             </div>
           </article>
           {deepResearch.sources && deepResearch.sources.length > 0 ? (
-            <p className="muted" style={{ marginTop: "8px" }}>Sources: {deepResearch.sources.join(", ")}</p>
+            <p className="muted" style={{ marginTop: "8px" }}>
+              Sources: {deepResearch.sources.join(", ")}
+            </p>
           ) : null}
         </div>
       ) : null}
@@ -1493,7 +1896,8 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
             <span className="muted">No deep-research payload returned.</span>
           </div>
           <p className="muted">
-            Check Browserbase credentials and backend route availability, then run Deep Research again.
+            Check Browserbase credentials and backend route availability, then
+            run Deep Research again.
           </p>
         </div>
       ) : null}
@@ -1503,7 +1907,9 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
           <h3>Insider Trading</h3>
           <span className="muted">
             {insiderRows.length} filings
-            {insiderRows.length > 0 ? ` · Page ${insiderPageSafe}/${insiderTotalPages}` : ""}
+            {insiderRows.length > 0
+              ? ` · Page ${insiderPageSafe}/${insiderTotalPages}`
+              : ""}
           </span>
         </div>
         <div className="table-wrap insider-table-wrap">
@@ -1531,7 +1937,9 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
               ))}
               {insiderRows.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="muted">No insider filings returned for this symbol.</td>
+                  <td colSpan={6} className="muted">
+                    No insider filings returned for this symbol.
+                  </td>
                 </tr>
               ) : null}
             </tbody>
@@ -1548,12 +1956,19 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
               Previous
             </button>
             <span className="muted">
-              Showing {insiderSliceStart + 1}-{Math.min(insiderSliceStart + insiderPageSize, insiderRows.length)} of {insiderRows.length}
+              Showing {insiderSliceStart + 1}-
+              {Math.min(
+                insiderSliceStart + insiderPageSize,
+                insiderRows.length,
+              )}{" "}
+              of {insiderRows.length}
             </span>
             <button
               type="button"
               className="secondary"
-              onClick={() => setInsiderPage((page) => Math.min(insiderTotalPages, page + 1))}
+              onClick={() =>
+                setInsiderPage((page) => Math.min(insiderTotalPages, page + 1))
+              }
               disabled={insiderPageSafe >= insiderTotalPages}
             >
               Next
@@ -1570,25 +1985,41 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
           </span>
         </div>
         <div className="event-list">
-          {liveWireActivity.length === 0 ? <p className="muted">No AI agent activity for {normalizedTicker} yet.</p> : null}
+          {liveWireActivity.length === 0 ? (
+            <p className="muted">
+              No AI agent activity for {normalizedTicker} yet.
+            </p>
+          ) : null}
           {liveWireActivity.map((event, idx) => (
-            <article key={`${activityKey(event)}-${idx}`} className="event-item">
+            <article
+              key={`${activityKey(event)}-${idx}`}
+              className="event-item"
+            >
               <div className="event-meta">
                 <strong>{event.agent_name ?? "AI Agent"}</strong>
                 <span>{event.module ?? "research"}</span>
               </div>
-              <p className="live-wire-action">{event.action ?? "Processing request..."}</p>
+              <p className="live-wire-action">
+                {event.action ?? "Processing request..."}
+              </p>
               <div className="live-wire-footer">
-                <span className={`live-wire-status ${statusClass(event.status)}`}>{(event.status ?? "running").toLowerCase()}</span>
+                <span
+                  className={`live-wire-status ${statusClass(event.status)}`}
+                >
+                  {(event.status ?? "running").toLowerCase()}
+                </span>
                 {event.created_at || event.timestamp ? (
-                  <time>{new Date(event.created_at ?? event.timestamp ?? "").toLocaleTimeString()}</time>
+                  <time>
+                    {new Date(
+                      event.created_at ?? event.timestamp ?? "",
+                    ).toLocaleTimeString()}
+                  </time>
                 ) : null}
               </div>
             </article>
           ))}
         </div>
       </div>
-
     </section>
   );
 }

@@ -74,6 +74,7 @@ class Settings:
     supabase_url: str = ""
     supabase_key: str = ""
     supabase_service_key: str = ""
+    supabase_avatar_bucket: str = "avatars"
     database_url: str = ""
 
     alpaca_api_key: str = ""
@@ -148,6 +149,7 @@ def get_settings() -> Settings:
         supabase_url=_env("SUPABASE_URL"),
         supabase_key=_env("SUPABASE_KEY"),
         supabase_service_key=_env("SUPABASE_SERVICE_KEY"),
+        supabase_avatar_bucket=_env("SUPABASE_AVATAR_BUCKET", "avatars"),
         database_url=_env("DATABASE_URL"),
         alpaca_api_key=_env("ALPACA_API_KEY") or _env("APCA_API_KEY_ID"),
         alpaca_api_secret=_env("ALPACA_API_SECRET") or _env("APCA_API_SECRET_KEY"),
