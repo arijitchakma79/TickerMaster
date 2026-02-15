@@ -756,6 +756,15 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
   const redditEntry = sourceRows.find((entry) => entry.source === "Reddit API") ?? null;
   const agentRunning = loading || deepLoading;
   const runNonceRef = useRef(0);
+  const autoBootstrappedRef = useRef(false);
+
+  useEffect(() => {
+    if (autoBootstrappedRef.current) return;
+    const ticker = activeTicker.trim().toUpperCase();
+    if (!ticker) return;
+    autoBootstrappedRef.current = true;
+    void handleAnalyze(ticker);
+  }, [activeTicker]);
 
   useEffect(() => {
     if (!agentRunning) {

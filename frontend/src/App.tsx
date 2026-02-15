@@ -53,7 +53,9 @@ function tabFromQuery(): Tab {
 }
 
 function tickerFromQuery() {
-  return "";
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get("ticker") ?? params.get("symbol") ?? "";
+  return raw.trim().toUpperCase();
 }
 
 function normalizeWatchlist(tickers: string[]) {
@@ -109,7 +111,7 @@ function clampAvatarOffset(value: number) {
 
 export default function App() {
   const [tab, setTab] = useState<Tab>(tabFromQuery());
-  const [ticker, setTicker] = useState("");
+  const [ticker, setTicker] = useState(tickerFromQuery());
   const [watchlist, setWatchlist] = useState<string[]>([]);
   const [favoriteStocks, setFavoriteStocksState] = useState<string[]>([]);
   const [theme, setTheme] = useState<Theme>(() => {
@@ -192,13 +194,15 @@ export default function App() {
 
         if (!active) return;
         const synced = normalizeWatchlist(serverWatchlist);
+        const queryTicker = tickerFromQuery();
         if (synced.length === 0) {
           setWatchlist([]);
-          setTicker("");
+          setTicker(queryTicker || "");
         } else {
           setWatchlist(synced);
-          // Keep research empty on startup/login until user picks a ticker.
-          setTicker("");
+          const preferredTicker =
+            queryTicker || synced[0];
+          setTicker(preferredTicker);
         }
         setFavoriteStocksState(normalizeWatchlist(favoriteSymbols));
         if (profilePayload?.profile) {
