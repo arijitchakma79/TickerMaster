@@ -1,10 +1,10 @@
 @import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
 
 :root {
-  --bg: #eef2ee;
-  --bg-2: #dce7dc;
-  --bg-radial-1: rgba(16, 163, 127, 0.16);
-  --bg-radial-2: rgba(70, 134, 255, 0.12);
+  --bg: #f3f6f7;
+  --bg-2: #e7edf0;
+  --bg-radial-1: rgba(16, 163, 127, 0.09);
+  --bg-radial-2: rgba(70, 134, 255, 0.07);
   --surface: rgba(255, 255, 255, 0.7);
   --surface-2: #f8fbf8;
   --ink: #102026;
@@ -34,8 +34,8 @@
   --card-soft-bg-3: rgba(255, 255, 255, 0.56);
   --card-soft-bg-4: rgba(255, 255, 255, 0.54);
   --selected-row: rgba(16, 163, 127, 0.08);
-  --ambient-1: rgba(16, 163, 127, 0.18);
-  --ambient-2: rgba(79, 163, 200, 0.18);
+  --ambient-1: rgba(16, 163, 127, 0.1);
+  --ambient-2: rgba(79, 163, 200, 0.1);
   --range-fill: rgba(140, 198, 250, 0.97);
   --range-rest: rgba(120, 148, 181, 0.33);
   --range-track-border: rgba(116, 156, 204, 0.55);
@@ -43,10 +43,10 @@
 }
 
 :root[data-theme="dark"] {
-  --bg: #081217;
-  --bg-2: #0e1c24;
-  --bg-radial-1: rgba(16, 163, 127, 0.22);
-  --bg-radial-2: rgba(70, 134, 255, 0.16);
+  --bg: #0b151c;
+  --bg-2: #14222c;
+  --bg-radial-1: rgba(16, 163, 127, 0.15);
+  --bg-radial-2: rgba(70, 134, 255, 0.11);
   --surface: rgba(11, 24, 31, 0.72);
   --surface-2: #102129;
   --ink: #e8f3f1;
@@ -73,8 +73,8 @@
   --card-soft-bg-3: rgba(8, 20, 26, 0.74);
   --card-soft-bg-4: rgba(9, 20, 27, 0.76);
   --selected-row: rgba(16, 163, 127, 0.18);
-  --ambient-1: rgba(16, 163, 127, 0.28);
-  --ambient-2: rgba(79, 163, 200, 0.24);
+  --ambient-1: rgba(16, 163, 127, 0.18);
+  --ambient-2: rgba(79, 163, 200, 0.16);
   --range-fill: rgba(119, 176, 238, 0.94);
   --range-rest: rgba(73, 97, 122, 0.56);
   --range-track-border: rgba(96, 129, 166, 0.6);
@@ -90,9 +90,9 @@ body {
   font-family: "Manrope", "SF Pro Display", "Helvetica Neue", sans-serif;
   color: var(--ink);
   background:
-    radial-gradient(circle at 12% 10%, var(--bg-radial-1), transparent 38%),
-    radial-gradient(circle at 86% 0%, var(--bg-radial-2), transparent 35%),
-    linear-gradient(145deg, var(--bg), var(--bg-2));
+    radial-gradient(circle at 14% 12%, var(--bg-radial-1), transparent 48%),
+    radial-gradient(circle at 84% 2%, var(--bg-radial-2), transparent 44%),
+    linear-gradient(152deg, var(--bg), var(--bg-2));
   min-height: 100vh;
   transition: background 0.25s ease, color 0.25s ease;
 }
@@ -145,26 +145,26 @@ a {
   position: fixed;
   pointer-events: none;
   z-index: 0;
-  filter: blur(46px);
+  filter: blur(58px);
+  opacity: 0.8;
 }
 
 .ambient-1 {
   top: -120px;
   left: -80px;
-  width: 300px;
-  height: 300px;
+  width: 260px;
+  height: 260px;
   background: var(--ambient-1);
 }
 
 .ambient-2 {
   right: -40px;
   bottom: -90px;
-  width: 260px;
-  height: 260px;
+  width: 220px;
+  height: 220px;
   background: var(--ambient-2);
 }
 
-.hero,
 .glass-card {
   position: relative;
   z-index: 1;
@@ -177,11 +177,14 @@ a {
 }
 
 .hero {
+  position: relative;
+  z-index: 1;
   padding: 28px;
   display: flex;
-  justify-content: space-between;
+  justify-content: center;
   gap: 20px;
-  align-items: end;
+  align-items: center;
+  text-align: center;
   animation: enter 0.6s ease-out;
 }
 
@@ -204,6 +207,7 @@ h1 {
   margin: 10px 0 0;
   max-width: 72ch;
   color: var(--muted);
+  margin-inline: auto;
 }
 
 .hero-meta {
@@ -779,6 +783,102 @@ th {
 
 .session-control-card {
   gap: 14px;
+}
+
+.sim-card {
+  position: relative;
+  overflow: hidden;
+}
+
+.sim-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  background: linear-gradient(90deg, rgba(16, 163, 127, 0.72), rgba(84, 156, 232, 0.72));
+}
+
+.sim-card-agent {
+  background: linear-gradient(160deg, rgba(239, 250, 246, 0.85), var(--surface));
+}
+
+.sim-card-agent::before {
+  background: linear-gradient(90deg, rgba(20, 171, 139, 0.78), rgba(53, 189, 170, 0.7));
+}
+
+.sim-card-roundtable {
+  background: linear-gradient(160deg, rgba(248, 247, 236, 0.78), var(--surface));
+}
+
+.sim-card-roundtable::before {
+  background: linear-gradient(90deg, rgba(205, 154, 55, 0.74), rgba(160, 126, 58, 0.68));
+}
+
+.sim-card-session {
+  background: linear-gradient(160deg, rgba(233, 243, 255, 0.86), var(--surface));
+}
+
+.sim-card-session::before {
+  background: linear-gradient(90deg, rgba(58, 123, 208, 0.76), rgba(16, 163, 127, 0.68));
+}
+
+.sim-card-telemetry {
+  background: linear-gradient(160deg, rgba(233, 249, 248, 0.82), var(--surface));
+}
+
+.sim-card-telemetry::before {
+  background: linear-gradient(90deg, rgba(9, 165, 140, 0.74), rgba(87, 191, 209, 0.72));
+}
+
+.sim-card-news {
+  background: linear-gradient(160deg, rgba(236, 248, 255, 0.84), var(--surface));
+}
+
+.sim-card-news::before {
+  background: linear-gradient(90deg, rgba(70, 137, 222, 0.72), rgba(102, 173, 234, 0.66));
+}
+
+.sim-card-trades {
+  background: linear-gradient(160deg, rgba(236, 247, 239, 0.84), var(--surface));
+}
+
+.sim-card-trades::before {
+  background: linear-gradient(90deg, rgba(30, 167, 130, 0.72), rgba(87, 194, 123, 0.66));
+}
+
+.sim-card-commentary {
+  background: linear-gradient(160deg, rgba(246, 243, 255, 0.82), var(--surface));
+}
+
+.sim-card-commentary::before {
+  background: linear-gradient(90deg, rgba(107, 118, 214, 0.7), rgba(129, 169, 225, 0.68));
+}
+
+:root[data-theme="dark"] .sim-card-agent,
+:root[data-theme="dark"] .sim-card-roundtable,
+:root[data-theme="dark"] .sim-card-session,
+:root[data-theme="dark"] .sim-card-telemetry,
+:root[data-theme="dark"] .sim-card-news,
+:root[data-theme="dark"] .sim-card-trades,
+:root[data-theme="dark"] .sim-card-commentary {
+  background: linear-gradient(165deg, rgba(12, 30, 37, 0.84), rgba(9, 20, 27, 0.82));
+}
+
+.sim-panel-header {
+  align-items: flex-start;
+}
+
+.sim-header-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.sim-tip {
+  margin: -2px 0 0;
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  border-left: 3px solid rgba(16, 163, 127, 0.4);
+  padding-left: 8px;
 }
 
 .session-capital-spotlight {
@@ -1597,6 +1697,15 @@ pre {
   color: #b03945;
 }
 
+.sim-market-row .event-rail {
+  border-color: rgba(109, 149, 208, 0.34);
+  background: linear-gradient(160deg, rgba(239, 247, 255, 0.86), var(--surface));
+}
+
+:root[data-theme="dark"] .sim-market-row .event-rail {
+  background: linear-gradient(165deg, rgba(12, 27, 40, 0.86), rgba(8, 20, 27, 0.86));
+}
+
 time {
   font-size: 0.72rem;
   color: var(--muted);
@@ -1702,7 +1811,7 @@ time {
 @media (max-width: 980px) {
   .hero {
     flex-direction: column;
-    align-items: flex-start;
+    align-items: center;
   }
 
   .hero-meta {
@@ -1719,6 +1828,12 @@ time {
 
   .simulation-control-row .pill {
     margin-left: 0;
+  }
+
+  .sim-panel-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
   }
 
   .research-actions {

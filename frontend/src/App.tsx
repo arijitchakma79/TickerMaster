@@ -76,7 +76,7 @@ export default function App() {
       return "Perplexity Sonar + X + Reddit + prediction markets, summarized into high-signal narratives.";
     }
     if (tab === "simulation") {
-      return "Financial AI sandbox for learning trade execution, sentiment asymmetry, and real-time catalyst tracking.";
+      return "Test your strategy using a sandbox of AI agents reacting to live prices, news catalysts, and volatility.";
     }
     return "Real-time ticker monitor with valuation metrics, alerting, and live anomaly detection pipeline.";
   }, [tab]);
@@ -130,7 +130,7 @@ export default function App() {
       <div className="ambient ambient-1" />
       <div className="ambient ambient-2" />
 
-      <header className="hero glass-card">
+      <header className="hero">
         <div>
           <h1>{title}</h1>
           <p className="subtitle">{subtitle}</p>
@@ -157,7 +157,7 @@ export default function App() {
         >
           <span className="tab-inner">
             <span className="tab-icon arena" aria-hidden="true">
-              🛡️⚔️
+              🤖⚔️
             </span>
             <span>Simulation</span>
           </span>

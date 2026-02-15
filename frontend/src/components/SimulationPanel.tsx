@@ -943,10 +943,12 @@ export default function SimulationPanel({
 
   return (
     <section className="panel stack stagger">
-      <div className="glass-card stack">
-        <div className="panel-header">
-          <h3>Create Custom Agent</h3>
-          <span className="muted">Test your trading strategy prompt</span>
+      <div id="sim-agent" className="glass-card stack sim-card sim-card-agent">
+        <div className="panel-header sim-panel-header">
+          <div className="sim-header-copy">
+            <h3>Build Your Agent</h3>
+          </div>
+          <span className="muted">Prompt-based strategy builder</span>
         </div>
 
         <div className="custom-agent-grid">
@@ -1139,10 +1141,12 @@ export default function SimulationPanel({
         ) : null}
       </div>
 
-      <div className="glass-card stack">
-        <div className="panel-header">
-          <h3>AI Roundtable</h3>
-          <span className="muted">Character-card view of all participants</span>
+      <div id="sim-roundtable" className="glass-card stack sim-card sim-card-roundtable">
+        <div className="panel-header sim-panel-header">
+          <div className="sim-header-copy">
+            <h3>AI Roundtable</h3>
+          </div>
+          <span className="muted">Preview each trader before launch</span>
         </div>
         <div className="roundtable-grid">
           {displayedAgents.map((agent) => {
@@ -1198,9 +1202,11 @@ export default function SimulationPanel({
         </div>
       </div>
 
-      <div className="glass-card stack session-control-card">
-        <div className="panel-header">
-          <h3>Session Play</h3>
+      <div id="sim-session" className="glass-card stack session-control-card sim-card sim-card-session">
+        <div className="panel-header sim-panel-header">
+          <div className="sim-header-copy">
+            <h3>Session Play</h3>
+          </div>
           <span className={sandboxRunning ? "pill bullish" : "pill bearish"}>
             Sandbox {sandboxRunning ? "Running" : "Not Running"}
           </span>
@@ -1220,6 +1226,7 @@ export default function SimulationPanel({
           </label>
           <p className="session-capital-preview">{formatCurrency(normalizedStartingCapital)}</p>
         </div>
+        <p className="sim-tip">Tip: keep starting capital near 100,000 for easier strategy comparisons.</p>
         <p className="muted">Uses live quote + dynamic volatility.</p>
         {modalSandboxLoading ? <p className="muted">Launching Modal sandbox…</p> : null}
         {modalHealth?.status === "missing_dependency" && modalHealth.install_hint ? (
@@ -1265,10 +1272,12 @@ export default function SimulationPanel({
         )}
       </div>
 
-      <div className="telemetry-board-row">
-        <div className="glass-card">
-          <div className="panel-header">
-            <h3>Session Telemetry</h3>
+      <div id="sim-market" className="telemetry-board-row sim-market-row">
+        <div className="glass-card sim-card sim-card-telemetry">
+          <div className="panel-header sim-panel-header">
+            <div className="sim-header-copy">
+              <h3>Session Telemetry</h3>
+            </div>
             <span className={session?.crash_mode ? "pill bearish" : "pill neutral"}>
               {session?.crash_mode ? "Crash Regime" : "Normal Regime"}
             </span>
@@ -1309,17 +1318,27 @@ export default function SimulationPanel({
         />
       </div>
 
-      <div className="card-row-split">
-        <div className="glass-card">
-          <h3>Latest News</h3>
+      <div className="card-row-split sim-review-grid">
+        <div className="glass-card sim-card sim-card-news">
+          <div className="panel-header sim-panel-header">
+            <div className="sim-header-copy">
+              <h3>Latest News</h3>
+            </div>
+            <span className="muted">Catalysts that move behavior</span>
+          </div>
           <ul className="news-feed">
             {(session?.recent_news ?? []).slice(0, 8).map((news, idx) => <li key={`news-${idx}`}>{news}</li>)}
             {(session?.recent_news ?? []).length === 0 ? <li className="muted">No headlines yet.</li> : null}
           </ul>
         </div>
 
-        <div className="glass-card">
-          <h3>Trades</h3>
+        <div className="glass-card sim-card sim-card-trades">
+          <div className="panel-header sim-panel-header">
+            <div className="sim-header-copy">
+              <h3>Trades</h3>
+            </div>
+            <span className="muted">Execution log by ticker and agent</span>
+          </div>
           <div className="table-wrap trades-table-wrap">
             <table>
               <thead>
@@ -1347,9 +1366,11 @@ export default function SimulationPanel({
         </div>
       </div>
 
-      <div className="glass-card stack">
-        <div className="panel-header">
-          <h3>Post-Run Commentary</h3>
+      <div id="sim-review" className="glass-card stack sim-card sim-card-commentary">
+        <div className="panel-header sim-panel-header">
+          <div className="sim-header-copy">
+            <h3>Post-Run Commentary</h3>
+          </div>
           <span className="muted">Auto-generated when simulation ends</span>
         </div>
         {autoCommentaryLoading ? <p className="muted">Generating commentary…</p> : null}
