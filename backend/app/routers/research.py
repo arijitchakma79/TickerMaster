@@ -8,6 +8,7 @@ from app.services.market_data import (
     fetch_advanced_stock_data,
     fetch_candles,
     fetch_metric,
+    resolve_symbol_input,
     search_tickers,
 )
 from app.services.research_cache import get_cached_research, set_cached_research
@@ -24,7 +25,10 @@ async def analyze_research(payload: ResearchRequest, request: Request):
 
 @router.get("/candles/{ticker}")
 async def candles(ticker: str, period: str = "1mo", interval: str = "1d"):
-    symbol = ticker.upper()
+    try:
+        symbol = resolve_symbol_input(ticker)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     cache_key_hot = f"candles:{period}:{interval}:15m"
     cache_key_last = f"candles:{period}:{interval}:last"
     hot = get_cached_research(symbol, cache_key_hot)
@@ -32,6 +36,8 @@ async def candles(ticker: str, period: str = "1mo", interval: str = "1d"):
         return hot
     try:
         points = fetch_candles(symbol, period=period, interval=interval)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
         cached_last = get_cached_research(symbol, cache_key_last)
         if cached_last:
@@ -45,7 +51,10 @@ async def candles(ticker: str, period: str = "1mo", interval: str = "1d"):
 
 @router.get("/advanced/{ticker}")
 async def advanced(ticker: str):
-    return fetch_advanced_stock_data(ticker)
+    try:
+        return fetch_advanced_stock_data(ticker)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 @router.get("/x-sentiment/{ticker}")
@@ -62,7 +71,10 @@ async def deep_research(ticker: str, request: Request):
 
 @router.get("/quote/{ticker}")
 async def quote(ticker: str):
-    return fetch_metric(ticker).model_dump()
+    try:
+        return fetch_metric(ticker).model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 @router.get("/search/tickers")

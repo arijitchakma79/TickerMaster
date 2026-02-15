@@ -16,6 +16,21 @@ import type {
   TrackerSnapshot
 } from "./types";
 
+type AuthUser = {
+  id: string;
+  email?: string;
+};
+
+export type AuthSession = {
+  access_token: string;
+  refresh_token?: string;
+  user: AuthUser;
+};
+
+const AUTH_STORAGE_KEY = "tickermaster-auth-session";
+const SUPABASE_URL = trimTrailingSlashes(import.meta.env.VITE_SUPABASE_URL ?? "");
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY ?? "";
+
 function trimTrailingSlashes(value: string) {
   return value.replace(/\/+$/, "");
 }
@@ -27,7 +42,168 @@ const client = axios.create({
   timeout: 30000
 });
 
+function parseJwtUserId(token?: string): string | null {
+  if (!token) return null;
+  const chunks = token.split(".");
+  if (chunks.length < 2) return null;
+  try {
+    const payloadRaw = atob(chunks[1].replace(/-/g, "+").replace(/_/g, "/"));
+    const payload = JSON.parse(payloadRaw) as { sub?: string };
+    return typeof payload.sub === "string" ? payload.sub : null;
+  } catch {
+    return null;
+  }
+}
+
+function readSessionFromStorage(): AuthSession | null {
+  try {
+    const raw = window.localStorage.getItem(AUTH_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as AuthSession;
+    if (!parsed?.access_token || !parsed?.user?.id) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+let authSession: AuthSession | null = readSessionFromStorage();
+const authSubscribers = new Set<(session: AuthSession | null) => void>();
+
+function notifyAuthSubscribers() {
+  for (const subscriber of authSubscribers) {
+    try {
+      subscriber(authSession);
+    } catch {
+      // no-op
+    }
+  }
+}
+
+function setAuthSession(next: AuthSession | null) {
+  authSession = next;
+  try {
+    if (next) window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(next));
+    else window.localStorage.removeItem(AUTH_STORAGE_KEY);
+  } catch {
+    // no-op
+  }
+  notifyAuthSubscribers();
+}
+
+client.interceptors.request.use((config) => {
+  const token = authSession?.access_token;
+  const userId = authSession?.user?.id ?? parseJwtUserId(token ?? undefined);
+
+  if (typeof (config.headers as { set?: unknown } | undefined)?.set === "function") {
+    const headers = config.headers as { set: (key: string, value: string) => void };
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    if (userId) headers.set("x-user-id", userId);
+    return config;
+  }
+
+  const nextHeaders: Record<string, string> = {
+    ...((config.headers as Record<string, string>) ?? {})
+  };
+  if (token) {
+    nextHeaders.Authorization = `Bearer ${token}`;
+  }
+  if (userId) {
+    nextHeaders["x-user-id"] = userId;
+  }
+  config.headers = nextHeaders as typeof config.headers;
+  return config;
+});
+
 export const getApiUrl = () => API_URL;
+export const isAuthConfigured = () => Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+export const getAuthSession = () => authSession;
+export const subscribeAuthSession = (callback: (session: AuthSession | null) => void) => {
+  authSubscribers.add(callback);
+  return () => {
+    authSubscribers.delete(callback);
+  };
+};
+
+async function callSupabaseAuth(path: string, body: Record<string, unknown>) {
+  if (!isAuthConfigured()) {
+    throw new Error("Supabase auth is not configured in frontend env.");
+  }
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/${path}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message =
+      (typeof payload?.msg === "string" && payload.msg) ||
+      (typeof payload?.error_description === "string" && payload.error_description) ||
+      (typeof payload?.error === "string" && payload.error) ||
+      "Authentication request failed.";
+    throw new Error(message);
+  }
+  return payload as Record<string, unknown>;
+}
+
+function toAuthSession(payload: Record<string, unknown>): AuthSession | null {
+  const accessToken = typeof payload.access_token === "string" ? payload.access_token : "";
+  const refreshToken = typeof payload.refresh_token === "string" ? payload.refresh_token : undefined;
+  const userPayload = payload.user;
+  const userId =
+    (typeof (userPayload as { id?: unknown })?.id === "string" && (userPayload as { id: string }).id) ||
+    parseJwtUserId(accessToken) ||
+    "";
+  if (!accessToken || !userId) return null;
+  const email =
+    typeof (userPayload as { email?: unknown })?.email === "string"
+      ? (userPayload as { email: string }).email
+      : undefined;
+  return {
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    user: { id: userId, email }
+  };
+}
+
+export async function signInWithPassword(email: string, password: string): Promise<AuthSession> {
+  const payload = await callSupabaseAuth("token?grant_type=password", { email, password });
+  const session = toAuthSession(payload);
+  if (!session) throw new Error("Sign-in succeeded but no usable session was returned.");
+  setAuthSession(session);
+  return session;
+}
+
+export async function signUpWithPassword(email: string, password: string): Promise<AuthSession | null> {
+  const payload = await callSupabaseAuth("signup", { email, password });
+  const session = toAuthSession(payload);
+  if (session) setAuthSession(session);
+  return session;
+}
+
+export async function signOut(): Promise<void> {
+  const token = authSession?.access_token;
+  if (token && isAuthConfigured()) {
+    try {
+      await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        }
+      });
+    } catch {
+      // no-op
+    }
+  }
+  setAuthSession(null);
+}
 
 export const getWsUrl = () => {
   const explicit = import.meta.env.VITE_WS_URL;
@@ -121,6 +297,55 @@ export async function setWatchlist(tickers: string[]) {
 export async function getWatchlist() {
   const { data } = await client.get<{ watchlist: string[] }>("/tracker/watchlist");
   return data.watchlist;
+}
+
+export async function getFavoriteStocks(): Promise<string[]> {
+  const { data } = await client.get<{ favorites?: string[] }>("/api/user/favorites");
+  return Array.isArray(data.favorites) ? data.favorites : [];
+}
+
+export async function setFavoriteStocks(symbols: string[]): Promise<string[]> {
+  const { data } = await client.put<{ favorites?: string[] }>("/api/user/favorites", { symbols });
+  return Array.isArray(data.favorites) ? data.favorites : [];
+}
+
+export type UserProfilePayload = {
+  id?: string;
+  email?: string;
+  display_name?: string;
+  avatar_url?: string;
+  poke_enabled?: boolean;
+  tutorial_completed?: boolean;
+};
+
+export async function getUserProfile(): Promise<{
+  user_id: string | null;
+  profile: UserProfilePayload | null;
+  require_username_setup?: boolean;
+  username_locked?: boolean;
+}> {
+  const { data } = await client.get<{
+    user_id: string | null;
+    profile: UserProfilePayload | null;
+    require_username_setup?: boolean;
+    username_locked?: boolean;
+  }>("/api/user/profile");
+  return data;
+}
+
+export async function updateUserPreferences(payload: {
+  display_name?: string;
+  avatar_data_url?: string;
+  poke_enabled?: boolean;
+  tutorial_completed?: boolean;
+  watchlist?: string[];
+  favorites?: string[];
+}): Promise<{ ok: boolean; profile?: UserProfilePayload | null; require_username_setup?: boolean }> {
+  const { data } = await client.patch<{ ok: boolean; profile?: UserProfilePayload | null; require_username_setup?: boolean }>(
+    "/api/user/preferences",
+    payload,
+  );
+  return data;
 }
 
 export async function addAlert(payload: { ticker: string; threshold_percent: number; direction: "up" | "down" | "either" }) {
