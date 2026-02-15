@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { getMarketMovers } from "../lib/api";
 import { formatCurrency, formatPercent } from "../lib/format";
 import type { MarketMetric, WSMessage } from "../lib/types";
 
@@ -27,11 +28,38 @@ function parseTickers(raw: unknown): MarketMetric[] {
 export default function ResearchRail({ connected, activeTicker, onTickerSelect, trackerEvent }: Props) {
   const [tickers, setTickers] = useState<MarketMetric[]>([]);
   const [generatedAt, setGeneratedAt] = useState<string>("");
+  const [universeSize, setUniverseSize] = useState<number>(0);
 
   useEffect(() => {
-    if (!trackerEvent || trackerEvent.type !== "tracker_snapshot") return;
-    setTickers(parseTickers(trackerEvent.tickers));
-    setGeneratedAt(String(trackerEvent.generated_at ?? ""));
+    let active = true;
+
+    const loadMovers = async () => {
+      try {
+        const data = await getMarketMovers(5);
+        if (!active) return;
+        setTickers(parseTickers(data.tickers));
+        setGeneratedAt(String(data.generated_at ?? ""));
+        setUniverseSize(Number(data.universe_size ?? 0));
+      } catch {
+        if (!active) return;
+        if (trackerEvent && trackerEvent.type === "tracker_snapshot") {
+          const fallback = parseTickers(trackerEvent.tickers);
+          setTickers(fallback);
+          setGeneratedAt(String(trackerEvent.generated_at ?? ""));
+          setUniverseSize(fallback.length);
+        }
+      }
+    };
+
+    void loadMovers();
+    const interval = window.setInterval(() => {
+      void loadMovers();
+    }, 45000);
+
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
   }, [trackerEvent]);
 
   const winners = useMemo(
@@ -52,7 +80,6 @@ export default function ResearchRail({ connected, activeTicker, onTickerSelect, 
   );
 
   const queryTicker = activeTicker.trim().toUpperCase() || "SPY";
-  const perplexityUrl = `https://www.perplexity.ai/search?q=${encodeURIComponent(`${queryTicker} stock news catalyst today`)}`;
 
   return (
     <aside className="event-rail glass-card research-rail">
@@ -64,11 +91,11 @@ export default function ResearchRail({ connected, activeTicker, onTickerSelect, 
       </div>
 
       <div className="board-meta">
-        <span>US Equities</span>
+        <span>{universeSize > 0 ? `US Equities · ${universeSize} symbols` : "US Equities"}</span>
         <span>{generatedAt ? new Date(generatedAt).toLocaleTimeString() : "No snapshot"}</span>
       </div>
 
-      {tickers.length === 0 ? <p className="muted">Waiting for tracker snapshot to compute current movers.</p> : null}
+      {tickers.length === 0 ? <p className="muted">Waiting for market-movers snapshot.</p> : null}
 
       <section className="market-board-section">
         <h4>Top Winners</h4>
@@ -123,14 +150,6 @@ export default function ResearchRail({ connected, activeTicker, onTickerSelect, 
           )}
         </div>
       </section>
-
-      <div className="glass-card quick-news-card">
-        <h4>Perplexity News</h4>
-        <p className="muted">Open a live catalyst brief for {queryTicker}.</p>
-        <a href={perplexityUrl} target="_blank" rel="noreferrer">
-          Open Perplexity Search
-        </a>
-      </div>
     </aside>
   );
 }

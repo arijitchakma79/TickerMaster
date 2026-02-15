@@ -5,6 +5,7 @@ import math
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 import httpx
 try:
@@ -15,6 +16,7 @@ except Exception:  # pragma: no cover
 from app.config import Settings
 from app.schemas import ResearchRequest, ResearchResponse, SentimentBreakdown, SourceLink
 from app.services.agent_logger import log_agent_activity
+from app.services.market_data import search_tickers
 from app.services.prediction_markets import fetch_kalshi_markets, fetch_polymarket_markets
 from app.services.research_cache import get_cached_research, set_cached_research
 
@@ -46,6 +48,27 @@ NEGATIVE_WORDS = {
 
 _MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 _MARKDOWN_CITATION_PATTERN = re.compile(r"\s*\[(?:\d+(?:\s*,\s*\d+)*)\]")
+
+
+def _site_name_from_url(url: str) -> str:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return "Source"
+    if not host:
+        return "Source"
+    host = host.removeprefix("www.")
+    parts = [part for part in host.split(".") if part]
+    if not parts:
+        return "Source"
+    if len(parts) >= 2:
+        root = parts[-2]
+        if root in {"co", "com", "org", "net", "gov", "edu"} and len(parts) >= 3:
+            root = parts[-3]
+    else:
+        root = parts[0]
+    clean = root.replace("-", " ").strip()
+    return " ".join(token.capitalize() for token in clean.split()) or "Source"
 
 
 def _label(score: float) -> str:
@@ -85,23 +108,37 @@ def _sanitize_perplexity_text(text: str) -> str:
 
     cleaned_lines: List[str] = []
     for line in raw.splitlines():
-        clean = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
-        if not clean:
-            continue
+        clean = line.strip()
         clean = _MARKDOWN_LINK_PATTERN.sub(r"\1", clean)
-        clean = clean.replace("**", "").replace("__", "").replace("`", "")
         clean = _MARKDOWN_CITATION_PATTERN.sub("", clean)
+        clean = clean.replace("__", "**").replace("`", "")
         clean = re.sub(r"\s{2,}", " ", clean).strip()
-        if clean:
-            cleaned_lines.append(clean)
+        if not clean:
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
 
-    if cleaned_lines:
-        return " ".join(cleaned_lines)
+        heading_match = re.match(r"^\*\*([^*]+)\*\*:?\s*$", clean)
+        if heading_match:
+            cleaned_lines.append(f"**{heading_match.group(1).strip()}**:")
+            continue
 
-    compact = _MARKDOWN_LINK_PATTERN.sub(r"\1", raw)
-    compact = compact.replace("**", "").replace("__", "").replace("`", "")
-    compact = _MARKDOWN_CITATION_PATTERN.sub("", compact)
-    compact = re.sub(r"\s{2,}", " ", compact).strip()
+        bullet_match = re.match(r"^(?:[-*•]|\d+[.)])\s*(.+)$", clean)
+        if bullet_match:
+            cleaned_lines.append(f"- {bullet_match.group(1).strip()}")
+            continue
+
+        cleaned_lines.append(clean)
+
+    compact = "\n".join(cleaned_lines).strip()
+    if not compact:
+        return ""
+
+    if "- " not in compact:
+        sentences = [segment.strip(" .") for segment in re.split(r"(?<=[.!?])\s+", compact) if segment.strip()]
+        bullets = [f"- {sentence}" for sentence in sentences[:6]]
+        if bullets:
+            return "**Summary**:\n" + "\n".join(bullets)
     return compact
 
 
@@ -128,13 +165,23 @@ async def _perplexity_summary(ticker: str, settings: Settings) -> Dict[str, Any]
         "messages": [
             {
                 "role": "system",
-                "content": "You summarize market catalysts with concise bullets and include source URLs.",
+                "content": (
+                    "You are a sell-side equity research analyst. "
+                    "Return concise markdown only with section headers and bullet points. "
+                    "Use this exact shape:\n"
+                    "**Bullish Catalysts**:\n"
+                    "- ...\n"
+                    "**Bearish Catalysts**:\n"
+                    "- ...\n"
+                    "**What To Watch**:\n"
+                    "- ..."
+                ),
             },
             {
                 "role": "user",
                 "content": (
                     f"Explain the most important bullish and bearish catalysts for {ticker} over the last 7 days. "
-                    "Return short text only."
+                    "Include concrete data points and short actionable bullets."
                 ),
             },
         ],
@@ -154,7 +201,7 @@ async def _perplexity_summary(ticker: str, settings: Settings) -> Dict[str, Any]
             content = _sanitize_perplexity_text(data["choices"][0]["message"]["content"])
             citations = data.get("citations", [])
             links = [
-                SourceLink(source="Perplexity", title=f"Source {idx + 1}", url=url)
+                SourceLink(source="Perplexity", title=_site_name_from_url(url), url=url)
                 for idx, url in enumerate(citations[:6])
                 if isinstance(url, str)
             ]
@@ -369,11 +416,22 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
 
     prediction_markets = []
     if request.include_prediction_markets:
+        company_name = ""
+        try:
+            lookup = await search_tickers(ticker, limit=1)
+            if lookup:
+                company_name = str(lookup[0].name or "")
+        except Exception:
+            company_name = ""
         kalshi_markets, polymarket_markets = await asyncio.gather(
-            fetch_kalshi_markets(ticker, settings),
-            fetch_polymarket_markets(ticker, settings),
+            fetch_kalshi_markets(ticker, settings, company_name=company_name),
+            fetch_polymarket_markets(ticker, settings, company_name=company_name),
         )
-        prediction_markets = kalshi_markets + polymarket_markets
+        prediction_markets = sorted(
+            kalshi_markets + polymarket_markets,
+            key=lambda item: float(item.get("relevance_score", 0.0) or 0.0),
+            reverse=True,
+        )
 
     # Composite weighting from spec: Perplexity 45%, Reddit 30%, X 25%
     aggregate = float((breakdown[0].score * 0.45) + (breakdown[2].score * 0.30) + (breakdown[1].score * 0.25))

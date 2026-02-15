@@ -5,7 +5,6 @@ import SimulationPanel from "./components/SimulationPanel";
 import TrackerPrefsRail from "./components/TrackerPrefsRail";
 import TrackerPanel from "./components/TrackerPanel";
 import {
-  getApiUrl,
   getAuthSession,
   getFavoriteStocks,
   getUserProfile,
@@ -35,13 +34,14 @@ type UserProfile = {
   username_locked?: boolean;
 };
 const LANDING_VIDEO_SRC = "/videoplayback (1).mp4";
+const METADATA_LOGO_SRC = "/logo.png";
 
 function tabFromQuery(): Tab {
   const params = new URLSearchParams(window.location.search);
   const value = params.get("tab");
   if (value === "research" || value === "simulation" || value === "tracker")
     return value;
-  return "research";
+  return "simulation";
 }
 
 function tickerFromQuery() {
@@ -234,13 +234,23 @@ export default function App() {
       document.head.appendChild(favicon);
     }
     favicon.type = "image/png";
-    favicon.href = brandLogo;
+    favicon.href = METADATA_LOGO_SRC;
   }, []);
 
   const title = useMemo(() => {
     if (tab === "research") return "Research Workbench";
     if (tab === "simulation") return "Simulation Arena";
     return "Ticker Tracker";
+  }, [tab]);
+
+  const subtitle = useMemo(() => {
+    if (tab === "research") {
+      return "Public/latest sentiments summarized into high-signal narratives.";
+    }
+    if (tab === "simulation") {
+      return "Test your strategy using a sandbox of AI agents reacting to live prices, news catalysts, and volatility.";
+    }
+    return "Real-time ticker monitor with valuation metrics, alerting, and live anomaly detection pipeline.";
   }, [tab]);
 
   async function handleWatchlistChange(nextSymbols: string[]) {
@@ -515,37 +525,6 @@ export default function App() {
       </div>
       <div className="toggle-corner">
         <div className="top-nav-right">
-          {isAuthConfigured() ? (
-            authSession?.user?.id ? (
-              <div className="auth-chip profile-chip">
-                <button
-                  type="button"
-                  className="profile-trigger"
-                  onClick={() => {
-                    setProfileError("");
-                    resetAvatarCropEditor();
-                    setProfileModalOpen(true);
-                  }}
-                >
-                  {userProfile?.avatar_url ? (
-                    <img src={userProfile.avatar_url} alt="Profile" className="profile-avatar" />
-                  ) : (
-                    <span className="profile-avatar profile-avatar-fallback">{profileName.slice(0, 1).toUpperCase()}</span>
-                  )}
-                  <span className="profile-name">{profileName}</span>
-                </button>
-                <button className="secondary auth-btn" onClick={() => void signOut()}>
-                  Sign Out
-                </button>
-              </div>
-            ) : (
-              <button className="secondary auth-btn" onClick={openSignInModal}>
-                Sign In
-              </button>
-            )
-          ) : (
-            <span className="muted auth-config-hint">Set Supabase env vars to enable sign in.</span>
-          )}
           <div className="theme-switch-wrap">
             <button
               type="button"
@@ -565,24 +544,53 @@ export default function App() {
           </div>
         </div>
       </div>
+      {isAuthConfigured() ? (
+        authSession?.user?.id ? (
+          <div className="account-corner">
+            <div className="account-panel glass-card">
+              <button
+                type="button"
+                className="profile-trigger"
+                onClick={() => {
+                  setProfileError("");
+                  resetAvatarCropEditor();
+                  setProfileModalOpen(true);
+                }}
+              >
+                {userProfile?.avatar_url ? (
+                  <img src={userProfile.avatar_url} alt="Profile" className="profile-avatar" />
+                ) : (
+                  <span className="profile-avatar profile-avatar-fallback">{profileName.slice(0, 1).toUpperCase()}</span>
+                )}
+                <span className="profile-name">{profileName}</span>
+              </button>
+              <button className="secondary auth-btn account-signout" onClick={() => void signOut()}>
+                Sign Out
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="account-corner">
+            <button className="secondary auth-btn" onClick={openSignInModal}>
+              Sign In
+            </button>
+          </div>
+        )
+      ) : (
+        <div className="account-corner">
+          <span className="muted auth-config-hint auth-config-hint-left">Set Supabase env vars to enable sign in.</span>
+        </div>
+      )}
 
       <div className="ambient ambient-1" />
       <div className="ambient ambient-2" />
 
       {hasWorkbenchAccess ? (
         <>
-          <header className="hero glass-card">
+          <header className="hero">
             <div>
               <h1>{title}</h1>
-              <p className="subtitle">
-                Financial AI sandbox for learning trade execution, sentiment asymmetry, and real-time catalyst tracking.
-              </p>
-            </div>
-            <div className="hero-meta">
-              <span className={connected ? "dot dot-live" : "dot dot-offline"}>
-                {connected ? "Realtime Online" : "Socket Offline"}
-              </span>
-              <span className="muted">API: {getApiUrl()}</span>
+              <p className="subtitle">{subtitle}</p>
             </div>
           </header>
 
@@ -694,9 +702,9 @@ export default function App() {
             </div>
             <div className="tv-hero-inner">
               <p className="tv-kicker">TickerMaster Platform</p>
-              <h2 className="tv-title">Professional Market Intelligence For Modern Traders</h2>
+              <h2 className="tv-title">Bloomberg Terminal For Retail Traders</h2>
               <p className="tv-subtitle">
-                Research, simulation, and personalized tracking in one integrated workflow.
+                Public/latest sentiments summarized into high-signal narratives.
               </p>
               <button className="tv-cta" onClick={openSignInModal}>
                 Try Now

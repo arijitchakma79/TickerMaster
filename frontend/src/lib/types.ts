@@ -158,6 +158,14 @@ export interface MarketMetric {
   market_cap?: number | null;
 }
 
+export interface MarketMoversResponse {
+  generated_at: string;
+  universe_size: number;
+  winners: MarketMetric[];
+  losers: MarketMetric[];
+  tickers: MarketMetric[];
+}
+
 export interface TickerLookup {
   ticker: string;
   name: string;

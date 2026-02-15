@@ -155,53 +155,181 @@ const DEFAULT_INDICATORS: Record<IndicatorKey, boolean> = {
   atr14: false,
 };
 
+function siteNameFromUrl(url: string): string {
+  try {
+    const host = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+    if (!host) return "Source";
+    const parts = host.split(".").filter(Boolean);
+    if (parts.length === 0) return "Source";
+    let root = parts.length >= 2 ? parts[parts.length - 2] : parts[0];
+    if (["co", "com", "org", "net", "gov", "edu"].includes(root) && parts.length >= 3) {
+      root = parts[parts.length - 3];
+    }
+    return root
+      .split("-")
+      .map((token) => token.charAt(0).toUpperCase() + token.slice(1))
+      .join(" ");
+  } catch {
+    return "Source";
+  }
+}
+
+function displayLinkLabel(title: string | undefined, url: string): string {
+  const normalized = (title ?? "").trim();
+  if (!normalized) return siteNameFromUrl(url);
+  if (/^source(\s+\d+)?$/i.test(normalized)) return siteNameFromUrl(url);
+  if (/^open source$/i.test(normalized)) return siteNameFromUrl(url);
+  return normalized;
+}
+
+function stripMarkdownFormatting(value: string): string {
+  return value
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeSummaryLine(value: string): string {
+  return stripMarkdownFormatting(value)
+    .replace(/^[\-*•]\s+/, "")
+    .replace(/^\d+[.)]\s+/, "")
+    .trim();
+}
+
 function parseSummarySections(raw: string): SummarySection[] {
-  const summary = raw.trim();
-  if (!summary) return [];
+  const cleaned = raw.trim();
+  if (!cleaned) return [];
 
-  const headingRegex = /\*\*([^*]+)\*\*:\s*/g;
-  const matches = Array.from(summary.matchAll(headingRegex));
-  const normalize = (value: string) =>
-    value
-      .replace(/\[\[(.*?)\]\]/g, "[$1]")
-      .replace(/\s+/g, " ")
-      .trim();
+  const lines = cleaned
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line) => line.length > 0);
 
-  const extractBullets = (block: string) => {
-    const normalized = normalize(block);
-    const chunks = normalized.split(/\s+-\s+/).map((item) => item.trim()).filter(Boolean);
-    if (chunks.length <= 1) return [];
-    return chunks.map((item, idx) => (idx === 0 ? item.replace(/^[^-]+?:\s*/, "") : item));
+  const sections: SummarySection[] = [];
+  let current: SummarySection = { heading: "Summary", bullets: [], text: "" };
+
+  const pushCurrent = () => {
+    const next: SummarySection = {
+      heading: current.heading || "Summary",
+      bullets: current.bullets.filter(Boolean),
+      text: current.text.trim(),
+    };
+    if (next.bullets.length > 0 || next.text) {
+      sections.push(next);
+    }
+    current = { heading: "Summary", bullets: [], text: "" };
   };
 
-  if (matches.length === 0) {
-    const bullets = extractBullets(summary);
+  for (const line of lines) {
+    const plainLine = normalizeSummaryLine(line);
+    if (!plainLine) continue;
+
+    const markdownHeading = line.match(/^\*\*([^*]+)\*\*:?\s*$/);
+    if (markdownHeading) {
+      pushCurrent();
+      current.heading = stripMarkdownFormatting(markdownHeading[1]);
+      continue;
+    }
+
+    const plainHeadingCandidate = stripMarkdownFormatting(line.replace(/:$/, ""));
+    const looksLikePlainHeading =
+      !line.includes(":") &&
+      !/^(?:[-*•]|\d+[.)])\s+/.test(line) &&
+      !/[.!?]$/.test(plainHeadingCandidate) &&
+      plainHeadingCandidate.split(/\s+/).length <= 8 &&
+      /^[A-Za-z][A-Za-z0-9/&()'\-\s]{2,80}$/.test(plainHeadingCandidate);
+    if (looksLikePlainHeading) {
+      pushCurrent();
+      current.heading = plainHeadingCandidate;
+      continue;
+    }
+
+    const boldLabelBullet = line.match(/^\*\*([^*]+)\*\*:?\s*(.+)$/);
+    if (boldLabelBullet) {
+      const label = stripMarkdownFormatting(boldLabelBullet[1]);
+      const detail = stripMarkdownFormatting(boldLabelBullet[2]);
+      current.bullets.push(detail ? `${label}: ${detail}` : label);
+      continue;
+    }
+
+    const bulletMatch = line.match(/^(?:[-*•]|\d+[.)])\s+(.+)$/);
+    if (bulletMatch) {
+      current.bullets.push(stripMarkdownFormatting(bulletMatch[1]));
+      continue;
+    }
+
+    const labeledLine = plainLine.match(/^([^:]{3,90}):\s*(.+)$/);
+    if (labeledLine) {
+      const label = stripMarkdownFormatting(labeledLine[1]);
+      const detail = stripMarkdownFormatting(labeledLine[2]);
+      const labelWordCount = label.split(/\s+/).length;
+      if (labelWordCount <= 14) {
+        current.bullets.push(detail ? `${label}: ${detail}` : label);
+        continue;
+      }
+    }
+
+    if (current.text) current.text += " ";
+    current.text += plainLine;
+  }
+  pushCurrent();
+
+  const normalizedSections = sections
+    .map((section) => ({
+      heading: stripMarkdownFormatting(section.heading || "Summary") || "Summary",
+      bullets: section.bullets
+        .map((bullet) => stripMarkdownFormatting(bullet))
+        .filter(Boolean),
+      text: stripMarkdownFormatting(section.text),
+    }))
+    .filter((section) => section.bullets.length > 0 || section.text);
+
+  if (normalizedSections.length === 0) {
+    const fallbackText = stripMarkdownFormatting(cleaned);
+    const bullets = fallbackText
+      .split(/(?<=[.!?])\s+/)
+      .map((sentence) => sentence.trim())
+      .filter(Boolean)
+      .slice(0, 6);
     return [
       {
         heading: "Summary",
-        bullets,
-        text: bullets.length > 0 ? "" : normalize(summary.replace(/\*\*/g, "")),
+        bullets: bullets.length > 1 ? bullets : [],
+        text: bullets.length <= 1 ? fallbackText : "",
       },
     ];
   }
 
-  const sections: SummarySection[] = [];
-  for (let idx = 0; idx < matches.length; idx += 1) {
-    const current = matches[idx];
-    const next = matches[idx + 1];
-    const heading = (current[1] ?? "Summary").trim();
-    const start = (current.index ?? 0) + current[0].length;
-    const end = next?.index ?? summary.length;
-    const block = summary.slice(start, end).trim().replace(/\*\*/g, "");
-    const bullets = extractBullets(block);
-    const cleanedHeading = heading.replace(/^summary\s*:/i, "").replace(/^summary$/i, "Summary").trim();
-    sections.push({
-      heading: cleanedHeading || "Summary",
-      bullets,
-      text: bullets.length > 0 ? "" : normalize(block),
-    });
-  }
-  return sections;
+  return normalizedSections;
+}
+
+function formatSummaryBulletText(text: string): string {
+  return text.replace(/^[\-*•]\s*/, "").trim();
+}
+
+function formatSummaryParagraph(text: string): string {
+  return text.replace(/(^|\s)\*\*/g, "$1").trim();
+}
+
+function renderSummarySection(section: SummarySection, sourceKey: string, sectionIdx: number) {
+  return (
+    <section key={`${sourceKey}-${section.heading}-${sectionIdx}`} className="source-summary-section">
+      <h5 className="source-summary-heading">{section.heading}</h5>
+      {section.bullets.length > 0 ? (
+        <ul className="source-summary-list">
+          {section.bullets.map((point, pointIdx) => (
+            <li key={`${sourceKey}-${section.heading}-${pointIdx}`}>{formatSummaryBulletText(point)}</li>
+          ))}
+        </ul>
+      ) : (
+        <p>{formatSummaryParagraph(section.text)}</p>
+      )}
+    </section>
+  );
 }
 
 function formatIndicatorValue(snapshot: IndicatorSnapshot, key: IndicatorKey): string {
@@ -219,7 +347,6 @@ function formatIndicatorValue(snapshot: IndicatorSnapshot, key: IndicatorKey): s
 }
 
 export default function ResearchPanel({ activeTicker, onTickerChange, connected, events }: Props) {
-  const [infoOpen, setInfoOpen] = useState(false);
   const [indicatorInfoOpen, setIndicatorInfoOpen] = useState(false);
   const [insiderPage, setInsiderPage] = useState(1);
   const [tickerInput, setTickerInput] = useState(activeTicker);
@@ -232,6 +359,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
   const [candles, setCandles] = useState<CandlePoint[]>([]);
   const [advanced, setAdvanced] = useState<AdvancedStockData | null>(null);
   const [deepResearch, setDeepResearch] = useState<DeepResearchResponse | null>(null);
+  const [showDeepResearch, setShowDeepResearch] = useState(false);
   const [deepLoading, setDeepLoading] = useState(false);
   const [agentProgress, setAgentProgress] = useState(0);
   const [chartMode, setChartMode] = useState<"candles" | "line">("candles");
@@ -410,6 +538,8 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
   }, [normalizedTicker]);
 
   async function handleAnalyze(rawInput?: string) {
+    setShowDeepResearch(false);
+    setDeepResearch(null);
     setLoading(true);
     setError("");
     const seed = rawInput ?? tickerInput;
@@ -450,6 +580,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
   }
 
   async function handleDeepResearch() {
+    setShowDeepResearch(true);
     setLoading(true);
     setDeepLoading(true);
     setError("");
@@ -484,6 +615,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
       if (deepResult.status === "fulfilled") {
         setDeepResearch(deepResult.value);
       } else {
+        setError(deepResult.reason instanceof Error ? deepResult.reason.message : "Deep research request failed");
         setDeepResearch(null);
       }
     } catch (err) {
@@ -500,7 +632,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
   const sourceRows = research?.source_breakdown ?? [];
   const perplexityEntry = sourceRows.find((entry) => entry.source === "Perplexity Sonar") ?? null;
   const xEntry = sourceRows.find((entry) => entry.source === "X API") ?? null;
-  const redditEntry = sourceRows.find((entry) => entry.source === "Reddit Subreddit Scrape") ?? null;
+  const redditEntry = sourceRows.find((entry) => entry.source === "Reddit API") ?? null;
   const agentRunning = loading || deepLoading;
   const runNonceRef = useRef(0);
 
@@ -548,7 +680,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
         prompt,
         ticker: seedTicker || undefined,
         timeframe,
-        include_deep: true,
+        include_deep: false,
         auto_fetch_if_missing: true,
       });
       setChatLog((prev) => [
@@ -584,34 +716,6 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
 
   return (
     <section className="panel stack stagger">
-      <header className="panel-header">
-        <div className="panel-title-row">
-          <h2>Research</h2>
-          <button type="button" className="panel-info-btn" onClick={() => setInfoOpen(true)} aria-label="Research panel info">
-            i
-          </button>
-        </div>
-        <div className="research-stack-badges" aria-label="Research data stack">
-          <span className="research-stack-badge">Perplexity Sonar</span>
-          <span className="research-stack-badge">X Signals</span>
-          <span className="research-stack-badge">Reddit Flow</span>
-          <span className="research-stack-badge">Prediction Markets</span>
-        </div>
-      </header>
-      {infoOpen ? (
-        <div className="panel-info-backdrop" onClick={() => setInfoOpen(false)}>
-          <div className="panel-info-modal" onClick={(event) => event.stopPropagation()}>
-            <h3>Research Workbench</h3>
-            <p>Use this panel to run AI synthesis across Perplexity, X, Reddit, and prediction markets.</p>
-            <ul>
-              <li>Enter ticker or company, then run research.</li>
-              <li>Review source breakdown, market signals, and insider data.</li>
-              <li>Use Deep Research when you need extended context.</li>
-            </ul>
-            <button className="secondary" onClick={() => setInfoOpen(false)}>Close</button>
-          </div>
-        </div>
-      ) : null}
       {indicatorInfoOpen ? (
         <div className="panel-info-backdrop" onClick={() => setIndicatorInfoOpen(false)}>
           <div className="panel-info-modal" onClick={(event) => event.stopPropagation()}>
@@ -1010,34 +1114,22 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
           <div className="stack small-gap">
             {perplexityEntry ? (
               <article className="source-item">
-                <div className="source-title source-title-top">
-                  <strong>{perplexityEntry.source}</strong>
+                <div className="source-title source-title-top source-score-row">
                   <span className={`pill ${sentimentToneClass(perplexityEntry.score)}`}>
                     {sentimentLabelDetailed(perplexityEntry.score)} · {sentimentScore100(perplexityEntry.score)}/100
                   </span>
                 </div>
                 <div className="source-ai-summary">
-                  {parseSummarySections(perplexityEntry.summary).map((section, sectionIdx) => (
-                    <section key={`${perplexityEntry.source}-${section.heading}-${sectionIdx}`} className="source-summary-section">
-                      <h5 className="source-summary-heading">{section.heading}</h5>
-                      {section.bullets.length > 0 ? (
-                        <ul className="source-summary-list">
-                          {section.bullets.map((point, pointIdx) => (
-                            <li key={`${perplexityEntry.source}-${section.heading}-${pointIdx}`}>{point}</li>
-                          ))}
-                        </ul>
-                      ) : (
-                        <p>{section.text}</p>
-                      )}
-                    </section>
-                  ))}
+                  {parseSummarySections(perplexityEntry.summary).map((section, sectionIdx) =>
+                    renderSummarySection(section, perplexityEntry.source, sectionIdx)
+                  )}
                 </div>
                 {perplexityEntry.links.length > 0 ? (
                   <div className="source-citations">
                     <span className="muted">Sources:</span>
                     {perplexityEntry.links.slice(0, 8).map((link) => (
                       <a key={`${perplexityEntry.source}-cite-${link.url}`} href={link.url} target="_blank" rel="noreferrer">
-                        {link.title}
+                        {displayLinkLabel(link.title, link.url)}
                       </a>
                     ))}
                   </div>
@@ -1065,7 +1157,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                   <div className="source-citations">
                     {entry.links.slice(0, 4).map((link) => (
                       <a key={`${entry.source}-right-${link.url}`} href={link.url} target="_blank" rel="noreferrer">
-                        {link.title}
+                        {displayLinkLabel(link.title, link.url)}
                       </a>
                     ))}
                   </div>
@@ -1108,7 +1200,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                 {(research?.prediction_markets ?? []).slice(0, 3).map((market, idx) => (
                   typeof market.link === "string" && market.link ? (
                     <a key={`prediction-link-${idx}`} href={market.link} target="_blank" rel="noreferrer">
-                      Open market {idx + 1}
+                      {siteNameFromUrl(market.link)}
                     </a>
                   ) : null
                 ))}
@@ -1118,18 +1210,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
         </div>
       </div>
 
-      <div className="glass-card">
-        <h3>Research Destinations</h3>
-        <div className="inline-links wrap">
-          {(research?.tool_links ?? []).map((link) => (
-            <a key={`${link.source}-${link.url}`} href={link.url} target="_blank" rel="noreferrer">
-              {link.source}
-            </a>
-          ))}
-        </div>
-      </div>
-
-      {deepResearch ? (
+      {showDeepResearch && deepResearch ? (
         <div className="glass-card">
           <div className="panel-header">
             <h3>Deep Research</h3>
@@ -1252,7 +1333,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                 <div key={`deep-news-${idx}`}>
                   <p><strong>{item.headline ?? "-"}</strong></p>
                   <div className="source-citations">
-                    {item.url ? <a href={item.url} target="_blank" rel="noreferrer">Open source</a> : null}
+                    {item.url ? <a href={item.url} target="_blank" rel="noreferrer">{siteNameFromUrl(item.url)}</a> : null}
                     <span className="muted">{item.source ?? "unknown source"}</span>
                   </div>
                   {item.summary ? <p className="muted">{item.summary}</p> : null}
@@ -1266,8 +1347,19 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
           ) : null}
         </div>
       ) : null}
+      {showDeepResearch && !deepResearch && !deepLoading ? (
+        <div className="glass-card">
+          <div className="panel-header">
+            <h3>Deep Research</h3>
+            <span className="muted">No deep-research payload returned.</span>
+          </div>
+          <p className="muted">
+            Check Browserbase credentials and backend route availability, then run Deep Research again.
+          </p>
+        </div>
+      ) : null}
 
-      <div className="glass-card">
+      <div className="glass-card section-title-gap">
         <div className="panel-header">
           <h3>Insider Trading</h3>
           <span className="muted">
@@ -1331,7 +1423,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
         ) : null}
       </div>
 
-      <div className="glass-card live-wire-log">
+      <div className="glass-card live-wire-log section-title-gap">
         <div className="panel-header">
           <h3>Live Wire</h3>
           <span className={connected ? "dot dot-live" : "dot dot-offline"}>

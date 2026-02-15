@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.schemas import ResearchRequest
@@ -15,6 +18,16 @@ from app.services.research_cache import get_cached_research, set_cached_research
 from app.services.sentiment import get_x_sentiment, run_research
 
 router = APIRouter(prefix="/research", tags=["research"])
+
+_GENERAL_MOVER_UNIVERSE = [
+    "SPY", "QQQ", "IWM", "DIA",
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO",
+    "AMD", "NFLX", "ORCL", "CRM", "ADBE", "INTC", "QCOM", "PLTR",
+    "JPM", "BAC", "WFC", "GS", "V", "MA",
+    "XOM", "CVX", "COP", "SLB",
+    "UNH", "JNJ", "LLY", "PFE", "MRK", "ABBV",
+    "WMT", "COST", "HD", "LOW", "MCD", "NKE", "DIS", "UBER", "SHOP", "COIN",
+]
 
 
 @router.post("/analyze")
@@ -84,3 +97,41 @@ async def ticker_lookup(
 ):
     results = await search_tickers(query, limit=limit)
     return {"query": query, "results": [item.model_dump() for item in results]}
+
+
+@router.get("/movers")
+async def market_movers(limit: int = Query(5, ge=3, le=15)):
+    cache_key = f"movers:{limit}:5m"
+    cached = get_cached_research("GLOBAL", cache_key)
+    if cached:
+        return cached
+
+    async def load_metric(symbol: str):
+        try:
+            metric = await asyncio.to_thread(fetch_metric, symbol)
+            return metric.model_dump()
+        except Exception:
+            return None
+
+    metrics = [
+        item for item in await asyncio.gather(*[load_metric(symbol) for symbol in _GENERAL_MOVER_UNIVERSE]) if item
+    ]
+    winners = sorted(
+        [item for item in metrics if float(item.get("change_percent", 0.0)) > 0],
+        key=lambda item: float(item.get("change_percent", 0.0)),
+        reverse=True,
+    )[:limit]
+    losers = sorted(
+        [item for item in metrics if float(item.get("change_percent", 0.0)) < 0],
+        key=lambda item: float(item.get("change_percent", 0.0)),
+    )[:limit]
+
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "universe_size": len(metrics),
+        "winners": winners,
+        "losers": losers,
+        "tickers": metrics,
+    }
+    set_cached_research("GLOBAL", cache_key, payload, ttl_minutes=5)
+    return payload

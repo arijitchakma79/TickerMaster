@@ -129,6 +129,18 @@ a {
   pointer-events: auto;
 }
 
+.account-corner {
+  position: fixed;
+  left: 18px;
+  bottom: 18px;
+  z-index: 55;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: min(280px, calc(100vw - 30px));
+}
+
 .brand-corner {
   top: 12px;
   left: 16px;
@@ -304,6 +316,10 @@ a {
   text-align: right;
 }
 
+.auth-config-hint-left {
+  text-align: left;
+}
+
 .auth-panel {
   display: flex;
   align-items: center;
@@ -333,6 +349,24 @@ a {
   background: transparent;
   color: inherit;
   padding: 0;
+}
+
+.account-panel {
+  min-width: 220px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.account-panel .profile-trigger {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.account-signout {
+  width: 100%;
 }
 
 .profile-avatar {
@@ -1009,11 +1043,10 @@ h1 {
   margin: 14px 0 24px;
   animation: enter 0.85s ease-out;
   width: 100%;
-  padding: 6px;
-  border-radius: 14px;
-  border: 1px solid var(--line);
-  background: var(--tab-rail-bg);
-  backdrop-filter: blur(10px);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  backdrop-filter: none;
 }
 
 .tab {
@@ -1145,6 +1178,10 @@ h1 {
   justify-content: space-between;
   align-items: center;
   gap: 14px;
+}
+
+.section-title-gap > .panel-header {
+  margin-bottom: 10px;
 }
 
 .row-actions {
@@ -1463,7 +1500,11 @@ h1 {
 }
 
 .research-resource-row {
-  align-items: start;
+  align-items: stretch;
+}
+
+.research-resource-row > .glass-card {
+  height: 100%;
 }
 
 .prediction-resource-box {
@@ -1829,6 +1870,11 @@ button:disabled {
 
 .source-title-top {
   align-items: flex-start;
+}
+
+.source-score-row {
+  justify-content: flex-end;
+  margin-bottom: 8px;
 }
 
 .source-primary-link {
@@ -3081,14 +3127,14 @@ pre {
   gap: 12px;
 }
 
-.quick-news-card {
-  margin-top: 4px;
-  border-radius: 12px;
-  padding: 12px;
-}
-
-.quick-news-card h4 {
-  margin: 0 0 8px;
+.research-rail {
+  position: sticky;
+  top: 14px;
+  align-self: start;
+  max-height: calc(100vh - 28px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .tracker-prefs-rail label {
@@ -3317,6 +3363,13 @@ time {
   .event-rail {
     max-height: none;
   }
+
+  .research-rail {
+    position: static;
+    top: auto;
+    max-height: none;
+    overflow: visible;
+  }
 }
 
 @media (max-width: 980px) {
@@ -3507,6 +3560,18 @@ time {
   .auth-chip {
     width: 100%;
     justify-content: space-between;
+  }
+
+  .account-corner {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    max-width: none;
+  }
+
+  .account-panel {
+    width: 100%;
+    min-width: 0;
   }
 
   .landing-shell {

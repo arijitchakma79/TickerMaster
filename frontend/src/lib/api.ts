@@ -8,6 +8,7 @@ import type {
   DeepResearchResponse,
   IndicatorSnapshot,
   MarketMetric,
+  MarketMoversResponse,
   ModalCronHealthResponse,
   ModalSandboxResponse,
   ResearchChatResponse,
@@ -45,6 +46,54 @@ const client = axios.create({
   baseURL: API_URL,
   timeout: 30000
 });
+
+function normalizeResearchResponse(input: unknown, ticker: string): ResearchResponse {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  const recommendationRaw = String(raw.recommendation ?? "hold");
+  const recommendation =
+    recommendationRaw === "strong_buy" ||
+    recommendationRaw === "buy" ||
+    recommendationRaw === "hold" ||
+    recommendationRaw === "sell" ||
+    recommendationRaw === "strong_sell"
+      ? recommendationRaw
+      : "hold";
+
+  const narratives = Array.isArray(raw.narratives)
+    ? raw.narratives.map((item) => String(item)).filter(Boolean)
+    : typeof raw.summary === "string"
+      ? raw.summary.split(/\n+/).map((item) => item.trim()).filter(Boolean)
+      : [];
+
+  const source_breakdown = Array.isArray(raw.source_breakdown)
+    ? (raw.source_breakdown as ResearchResponse["source_breakdown"])
+    : [];
+
+  const prediction_markets = Array.isArray(raw.prediction_markets) ? raw.prediction_markets : [];
+
+  const tool_links = Array.isArray(raw.tool_links)
+    ? (raw.tool_links as ResearchResponse["tool_links"])
+    : Array.isArray(raw.citations)
+      ? (raw.citations as ResearchResponse["tool_links"])
+      : [];
+
+  return {
+    ticker: String(raw.ticker ?? ticker).toUpperCase(),
+    generated_at: String(raw.generated_at ?? new Date().toISOString()),
+    aggregate_sentiment: Number(raw.aggregate_sentiment ?? 0),
+    recommendation,
+    narratives,
+    source_breakdown,
+    prediction_markets,
+    tool_links
+  };
+}
+
+function networkErrorMessage(feature: string): Error {
+  return new Error(
+    `${feature} could not reach backend at ${API_URL}. Ensure backend is running and FRONTEND_ORIGINS includes your frontend URL.`
+  );
+}
 
 function parseJwtUserId(token?: string): string | null {
   if (!token) return null;
@@ -217,12 +266,43 @@ export const getWsUrl = () => {
 };
 
 export async function runResearch(ticker: string, timeframe = "7d"): Promise<ResearchResponse> {
-  const { data } = await client.post<ResearchResponse>("/research/analyze", {
-    ticker,
-    timeframe,
-    include_prediction_markets: true
-  });
-  return data;
+  const symbol = ticker.trim().toUpperCase();
+  const payload = { ticker: symbol, timeframe, include_prediction_markets: true };
+  const endpoints = ["/research/analyze", "/api/research/analyze"];
+  let lastError: unknown = null;
+
+  for (const endpoint of endpoints) {
+    try {
+      const { data } = await client.post<ResearchResponse>(endpoint, payload);
+      return normalizeResearchResponse(data, symbol);
+    } catch (error) {
+      lastError = error;
+      if (axios.isAxiosError(error) && error.response?.status === 404) continue;
+      if (axios.isAxiosError(error) && !error.response) continue;
+      break;
+    }
+  }
+
+  try {
+    const { data } = await client.get<{ research?: ResearchResponse }>(`/api/ticker/${symbol}`, { params: { timeframe } });
+    if (data?.research) {
+      return normalizeResearchResponse(data.research, symbol);
+    }
+  } catch (error) {
+    lastError = error;
+  }
+
+  try {
+    const { data } = await client.get(`/api/ticker/${symbol}/ai-research`, { params: { timeframe } });
+    return normalizeResearchResponse(data, symbol);
+  } catch (error) {
+    lastError = error;
+  }
+
+  if (axios.isAxiosError(lastError) && !lastError.response) {
+    throw networkErrorMessage("Research");
+  }
+  throw lastError instanceof Error ? lastError : new Error("Research request failed.");
 }
 
 export async function fetchCandles(ticker: string, period = "3mo", interval = "1d", refresh = false) {
@@ -397,8 +477,45 @@ export async function getModalCronHealth(): Promise<ModalCronHealthResponse> {
 }
 
 export async function runDeepResearch(ticker: string): Promise<DeepResearchResponse> {
-  const { data } = await client.post<DeepResearchResponse>(`/research/deep/${ticker}`);
-  return data;
+  const symbol = ticker.trim().toUpperCase();
+  const endpoints = [`/research/deep/${symbol}`, `/api/research/deep/${symbol}`];
+  let lastError: unknown = null;
+
+  for (const endpoint of endpoints) {
+    try {
+      const { data } = await client.post<DeepResearchResponse>(endpoint);
+      return data;
+    } catch (error) {
+      lastError = error;
+      if (axios.isAxiosError(error) && error.response?.status === 404) continue;
+      if (axios.isAxiosError(error) && !error.response) continue;
+      break;
+    }
+  }
+
+  if (axios.isAxiosError(lastError) && !lastError.response) {
+    throw networkErrorMessage("Deep research");
+  }
+  throw lastError instanceof Error ? lastError : new Error("Deep research request failed.");
+}
+
+export async function getMarketMovers(limit = 5): Promise<MarketMoversResponse> {
+  const endpoints = ["/research/movers", "/api/research/movers"];
+  let lastError: unknown = null;
+
+  for (const endpoint of endpoints) {
+    try {
+      const { data } = await client.get<MarketMoversResponse>(endpoint, { params: { limit } });
+      return data;
+    } catch (error) {
+      lastError = error;
+      if (axios.isAxiosError(error) && error.response?.status === 404) continue;
+      if (axios.isAxiosError(error) && !error.response) continue;
+      break;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Market movers request failed.");
 }
 
 export async function askResearchQuery(payload: {
@@ -417,32 +534,26 @@ export async function askResearchQuery(payload: {
   try {
     const url = new URL(API_URL);
     const basePath = trimTrailingSlashes(url.pathname || "");
-    const altPort = url.port === "8000" ? "8010" : url.port === "8010" ? "8000" : "";
-    const origins = new Set<string>([url.origin]);
-    if (altPort) {
-      origins.add(`${url.protocol}//${url.hostname}:${altPort}`);
-    }
+    const origin = url.origin;
 
     if (basePath && basePath !== "/") {
-      for (const origin of origins) {
-        candidates.add(`${origin}${basePath}/api/research/chat`);
-        candidates.add(`${origin}${basePath}/research/chat`);
-        candidates.add(`${origin}${basePath}/chat/research-query`);
-        candidates.add(`${origin}${basePath}/api/chat/research-query`);
-      }
+      candidates.add(`${origin}${basePath}/api/research/chat`);
+      candidates.add(`${origin}${basePath}/research/chat`);
+      candidates.add(`${origin}${basePath}/chat/research-query`);
+      candidates.add(`${origin}${basePath}/api/chat/research-query`);
     }
-    for (const origin of origins) {
-      candidates.add(`${origin}/api/research/chat`);
-      candidates.add(`${origin}/research/chat`);
-      candidates.add(`${origin}/chat/research-query`);
-      candidates.add(`${origin}/api/chat/research-query`);
-    }
+    candidates.add(`${origin}/api/research/chat`);
+    candidates.add(`${origin}/research/chat`);
+    candidates.add(`${origin}/chat/research-query`);
+    candidates.add(`${origin}/api/chat/research-query`);
   } catch {
     // API_URL can be relative in some setups.
   }
 
   const attempted: string[] = [];
   let last404: unknown = null;
+  let lastNetwork: unknown = null;
+  let lastError: unknown = null;
 
   for (const endpoint of candidates) {
     attempted.push(endpoint);
@@ -450,45 +561,67 @@ export async function askResearchQuery(payload: {
       const { data } = await client.post<ResearchChatResponse>(endpoint, payload);
       return data;
     } catch (err) {
-      if (axios.isAxiosError(err) && err.response?.status === 404) {
-        last404 = err;
-        continue;
+      lastError = err;
+      if (axios.isAxiosError(err)) {
+        if (err.response?.status === 404 || err.response?.status === 405) {
+          last404 = err;
+          continue;
+        }
+        if (!err.response) {
+          lastNetwork = err;
+          continue;
+        }
       }
       throw err;
     }
   }
 
-  if (last404) {
-    // Final fallback: use existing research endpoints so chat never hard-fails on route mismatches.
-    const ticker = (payload.ticker || "AAPL").toUpperCase().trim();
-    const timeframe = payload.timeframe || "7d";
-    try {
-      const { data } = await client.get<{
-        ticker?: string;
-        summary?: string;
-        recommendation?: string;
-      }>(`/api/ticker/${ticker}/ai-research`, { params: { timeframe } });
-      const summary = (data.summary || "").trim();
-      const recommendation = data.recommendation ? `Recommendation: ${data.recommendation}.` : "";
-      return {
-        ticker: ticker,
-        response:
-          summary ||
-          `I couldn't reach the dedicated chat endpoint, but I pulled the latest ${ticker} research context. ${recommendation}`,
-        model: "research-fallback",
-        generated_at: new Date().toISOString(),
-        context_refreshed: true,
-        sources: ["fallback_ai_research_endpoint"],
-      };
-    } catch {
+  // Fallback: synthesize a chat answer from the standard research pipeline.
+  const ticker = (payload.ticker || "AAPL").toUpperCase().trim();
+  const timeframe = payload.timeframe || "7d";
+  try {
+    const analysis = await runResearch(ticker, timeframe);
+    const recommendation = analysis.recommendation ? `Recommendation: ${analysis.recommendation}.` : "";
+    const narratives = analysis.narratives
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(0, 6)
+      .map((line) => `- ${line}`)
+      .join("\n");
+    const sources = analysis.source_breakdown
+      .map((entry) => `${entry.source}: ${entry.summary}`.trim())
+      .filter(Boolean)
+      .slice(0, 3)
+      .map((line) => `- ${line}`)
+      .join("\n");
+    const fallbackBody = narratives || sources || "No additional structured context available.";
+    return {
+      ticker,
+      response:
+        `Dedicated chat endpoint is unavailable, but I pulled the latest ${ticker} research context.\n` +
+        `${recommendation ? `${recommendation}\n` : ""}` +
+        `${fallbackBody}`,
+      model: "research-fallback",
+      generated_at: new Date().toISOString(),
+      context_refreshed: true,
+      sources: ["fallback_run_research"],
+    };
+  } catch (fallbackError) {
+    if (last404) {
       throw new Error(
-        `Research chat endpoint returned 404 for all known routes. Tried: ${attempted.join(", ")}. ` +
-        "Backend route mismatch is still present."
+        `Research chat route mismatch. Tried: ${attempted.join(", ")}. ` +
+        "No compatible chat endpoint is available on this backend."
       );
     }
+    if (lastNetwork || (axios.isAxiosError(fallbackError) && !fallbackError.response)) {
+      throw networkErrorMessage("Research chat");
+    }
+    throw fallbackError instanceof Error
+      ? fallbackError
+      : lastError instanceof Error
+        ? lastError
+        : new Error("Research chat request failed.");
   }
-
-  throw new Error("Research chat request failed.");
 }
 
 export async function createTrackerAgent(payload: {
