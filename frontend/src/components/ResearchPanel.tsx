@@ -9,7 +9,7 @@ import {
   runResearch,
   searchTickerDirectory
 } from "../lib/api";
-import { formatCompactNumber, formatPercent } from "../lib/format";
+import { formatCompactNumber, formatPercent, formatToCents } from "../lib/format";
 import { resolveTickerCandidate } from "../lib/tickerInput";
 import type { AgentActivity, AdvancedStockData, CandlePoint, DeepResearchResponse, IndicatorSnapshot, ResearchResponse, TickerLookup, WSMessage } from "../lib/types";
 import StockChart, { type ChartOverlayIndicator } from "./StockChart";
@@ -991,10 +991,10 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
           </div>
           <div className="kpi-grid">
             <div><p className="muted">Market Cap</p><h3>{formatCompactNumber(advanced.market_cap)}</h3></div>
-            <div><p className="muted">Trailing P/E</p><h3>{advanced.trailing_pe ?? "-"}</h3></div>
-            <div><p className="muted">Forward P/E</p><h3>{advanced.forward_pe ?? "-"}</h3></div>
-            <div><p className="muted">EPS (TTM)</p><h3>{advanced.eps_trailing ?? "-"}</h3></div>
-            <div><p className="muted">Target Price</p><h3>{advanced.target_mean_price ?? "-"}</h3></div>
+            <div><p className="muted">Trailing P/E</p><h3>{formatToCents(advanced.trailing_pe)}</h3></div>
+            <div><p className="muted">Forward P/E</p><h3>{formatToCents(advanced.forward_pe)}</h3></div>
+            <div><p className="muted">EPS (TTM)</p><h3>{formatToCents(advanced.eps_trailing)}</h3></div>
+            <div><p className="muted">Target Price</p><h3>{formatToCents(advanced.target_mean_price)}</h3></div>
             <div><p className="muted">Recommendation</p><h3>{advanced.recommendation ?? "-"}</h3></div>
           </div>
           <p className="muted" style={{ marginTop: "0.75rem" }}>
@@ -1180,9 +1180,9 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
             <article className="source-item">
               <h4>Price Targets</h4>
               <div className="kpi-grid">
-                <div><p className="muted">Mean</p><h3>{deepResearch.price_target?.target_mean ?? "-"}</h3></div>
-                <div><p className="muted">High</p><h3>{deepResearch.price_target?.target_high ?? "-"}</h3></div>
-                <div><p className="muted">Low</p><h3>{deepResearch.price_target?.target_low ?? "-"}</h3></div>
+                <div><p className="muted">Mean</p><h3>{formatToCents(deepResearch.price_target?.target_mean)}</h3></div>
+                <div><p className="muted">High</p><h3>{formatToCents(deepResearch.price_target?.target_high)}</h3></div>
+                <div><p className="muted">Low</p><h3>{formatToCents(deepResearch.price_target?.target_low)}</h3></div>
               </div>
               {deepResearch.price_target?.last_updated ? (
                 <p className="muted">Updated: {deepResearch.price_target.last_updated}</p>
@@ -1216,7 +1216,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                           <td>{row.name ?? "-"}</td>
                           <td>{row.code ?? "-"}</td>
                           <td>{formatCompactNumber(row.shares)}</td>
-                          <td>{row.price ?? "-"}</td>
+                          <td>{formatToCents(row.price)}</td>
                           <td>{formatCompactNumber(row.value_estimate)}</td>
                         </tr>
                       ))}
