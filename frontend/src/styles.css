@@ -3433,7 +3433,9 @@ pre {
 
 .tracker-pref-check {
   display: flex;
+  flex-direction: row;
   align-items: center;
+  justify-content: flex-start;
   gap: 8px;
   font-family: "Manrope", "SF Pro Display", "Helvetica Neue", sans-serif;
   color: var(--ink-soft);

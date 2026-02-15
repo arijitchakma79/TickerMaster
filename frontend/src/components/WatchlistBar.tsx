@@ -11,6 +11,8 @@ export default function WatchlistBar({
   onSelectTicker,
   onRemoveTicker
 }: Props) {
+  if (watchlist.length === 0) return null;
+
   return (
     <section className="integration-row watchlist-row">
       {watchlist.map((symbol) => (

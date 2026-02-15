@@ -7,8 +7,7 @@ import {
   interactWithTrackerAgent,
   listTrackerAgents,
   queryTrackerAgentContext,
-  searchTickerDirectory,
-  triggerTrackerPoll
+  searchTickerDirectory
 } from "../lib/api";
 import { formatCompactNumber, formatCurrency, formatPercent } from "../lib/format";
 import { resolveTickerCandidate } from "../lib/tickerInput";
@@ -111,17 +110,27 @@ export default function TrackerPanel({
 
   useEffect(() => {
     if (!trackerEvent || trackerEvent.type !== "tracker_snapshot") return;
-    setSnapshot({
-      generated_at: String(trackerEvent.generated_at ?? new Date().toISOString()),
-      tickers: Array.isArray(trackerEvent.tickers) ? (trackerEvent.tickers as TrackerSnapshot["tickers"]) : [],
-      alerts_triggered: Array.isArray(trackerEvent.alerts) ? (trackerEvent.alerts as TrackerSnapshot["alerts_triggered"]) : []
-    });
+    let active = true;
+    void getTrackerSnapshot()
+      .then((next) => {
+        if (!active) return;
+        setSnapshot(next);
+      })
+      .catch(() => null);
+    return () => {
+      active = false;
+    };
   }, [trackerEvent]);
 
-  const sorted = useMemo(
-    () => [...(snapshot?.tickers ?? [])].sort((a, b) => Math.abs(b.change_percent) - Math.abs(a.change_percent)),
-    [snapshot]
-  );
+  const marketGridTickers = useMemo(() => {
+    const tickers = snapshot?.tickers ?? [];
+    if (watchlist.length === 0) return tickers;
+
+    const bySymbol = new Map(tickers.map((item) => [item.ticker, item] as const));
+    return watchlist
+      .map((symbol) => bySymbol.get(symbol))
+      .filter((item): item is TrackerSnapshot["tickers"][number] => Boolean(item));
+  }, [snapshot, watchlist]);
 
   useEffect(() => {
     const query = watchlistInput.trim();
@@ -221,7 +230,7 @@ export default function TrackerPanel({
     setLoading(true);
     try {
       await onWatchlistChange([...watchlist, resolvedTicker]);
-      const refreshed = await triggerTrackerPoll();
+      const refreshed = await getTrackerSnapshot();
       setSnapshot(refreshed);
       onTickerChange(resolvedTicker);
       setWatchlistInput("");
@@ -234,7 +243,7 @@ export default function TrackerPanel({
   async function handlePoll() {
     setLoading(true);
     try {
-      const refreshed = await triggerTrackerPoll();
+      const refreshed = await getTrackerSnapshot();
       setSnapshot(refreshed);
     } finally {
       setLoading(false);
@@ -345,7 +354,7 @@ export default function TrackerPanel({
           : undefined;
       const delivered = Boolean(twilioInfo?.delivered);
       const twilioError = typeof twilioInfo?.error === "string" ? twilioInfo.error : "";
-      const [freshAgents, refreshed] = await Promise.all([listTrackerAgents(), triggerTrackerPoll().catch(() => null)]);
+      const [freshAgents, refreshed] = await Promise.all([listTrackerAgents(), getTrackerSnapshot().catch(() => null)]);
       setAgents(freshAgents);
       if (refreshed) setSnapshot(refreshed);
       setCreateModalOpen(false);
@@ -414,7 +423,7 @@ export default function TrackerPanel({
       }));
       setInstructionDraft("");
       setInstructionModalAgentId(null);
-      const refreshed = await triggerTrackerPoll().catch(() => null);
+      const refreshed = await getTrackerSnapshot().catch(() => null);
       if (refreshed) setSnapshot(refreshed);
     } catch (error) {
       setInstructionError(error instanceof Error ? error.message : "Manager interaction failed.");
@@ -506,8 +515,15 @@ export default function TrackerPanel({
     }
   }
 
-  function handleRemoveWatchlistTicker(symbol: string) {
-    void onWatchlistChange(watchlist.filter((tickerSymbol) => tickerSymbol !== symbol));
+  async function handleRemoveWatchlistTicker(symbol: string) {
+    setLoading(true);
+    try {
+      await onWatchlistChange(watchlist.filter((tickerSymbol) => tickerSymbol !== symbol));
+      const refreshed = await getTrackerSnapshot();
+      setSnapshot(refreshed);
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
@@ -656,10 +672,10 @@ export default function TrackerPanel({
           <span className="muted">{snapshot?.generated_at ? new Date(snapshot.generated_at).toLocaleTimeString() : "No data"}</span>
         </div>
         <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Ticker</th>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Ticker</th>
                 <th>Price</th>
                 <th>Change</th>
                 <th>P/E</th>
@@ -668,14 +684,14 @@ export default function TrackerPanel({
                 <th>Mkt Cap</th>
                 <th>Signal</th>
               </tr>
-            </thead>
-            <tbody>
-              {sorted.map((item) => {
-                const signal = item.change_percent > 1.5 ? "Momentum" : item.change_percent < -1.5 ? "Risk" : "Neutral";
-                return (
-                  <tr
-                    key={item.ticker}
-                    className={item.ticker === activeTicker ? "selected-row" : ""}
+                </thead>
+                <tbody>
+                  {marketGridTickers.map((item) => {
+                    const signal = item.change_percent > 1.5 ? "Momentum" : item.change_percent < -1.5 ? "Risk" : "Neutral";
+                    return (
+                      <tr
+                        key={item.ticker}
+                        className={item.ticker === activeTicker ? "selected-row" : ""}
                     onClick={() => onTickerChange(item.ticker)}
                     role="button"
                   >
