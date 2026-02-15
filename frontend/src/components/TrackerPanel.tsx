@@ -10,7 +10,9 @@ interface Props {
   onTickerChange: (ticker: string) => void;
   trackerEvent?: WSMessage;
   watchlist: string[];
+  favorites: string[];
   onWatchlistChange: (tickers: string[]) => Promise<string[]>;
+  onToggleFavorite: (ticker: string) => Promise<void>;
 }
 
 export default function TrackerPanel({
@@ -18,7 +20,9 @@ export default function TrackerPanel({
   onTickerChange,
   trackerEvent,
   watchlist,
-  onWatchlistChange
+  favorites,
+  onWatchlistChange,
+  onToggleFavorite
 }: Props) {
   const [watchlistInput, setWatchlistInput] = useState("");
   const [watchlistInputFocused, setWatchlistInputFocused] = useState(false);
@@ -143,6 +147,8 @@ export default function TrackerPanel({
         activeTicker={activeTicker}
         onSelectTicker={onTickerChange}
         onRemoveTicker={handleRemoveWatchlistTicker}
+        favorites={favorites}
+        onToggleFavorite={(ticker) => void onToggleFavorite(ticker)}
       />
 
       <div className="glass-card card-row tracker-actions tracker-watchlist-card">

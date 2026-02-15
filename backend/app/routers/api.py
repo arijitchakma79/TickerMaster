@@ -12,12 +12,16 @@ from app.services.agent_logger import get_recent_activity, log_agent_activity
 from app.services.browserbase_scraper import run_deep_research
 from app.services.llm import parse_tracker_instruction, tracker_agent_chat_response
 from app.services.macro import get_macro_indicators
-from app.services.market_data import fetch_candles, fetch_metric
+from app.services.market_data import fetch_candles, fetch_metric, resolve_symbol_input
 from app.services.prediction_markets import fetch_kalshi_markets, fetch_polymarket_markets
 from app.services.research_cache import get_cached_research, set_cached_research
 from app.services.sentiment import get_x_sentiment, run_research
 from app.services.tracker_repository import tracker_repo
 from app.services.user_context import get_user_id_from_request
+from app.services.user_preferences import get_favorites as get_user_favorites
+from app.services.user_preferences import get_watchlist as get_user_watchlist
+from app.services.user_preferences import set_favorites as set_user_favorites
+from app.services.user_preferences import set_watchlist as set_user_watchlist
 from app.schemas import SimulationStartRequest
 
 router = APIRouter(prefix="/api", tags=["api"])
@@ -143,21 +147,26 @@ async def api_health() -> dict[str, str]:
 
 @router.get("/ticker/{symbol}/quote")
 async def ticker_quote(symbol: str) -> dict[str, Any]:
+    try:
+        resolved_symbol = resolve_symbol_input(symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
     key = "quote:5m"
     last_key = "quote:last"
-    cached = get_cached_research(symbol, key)
+    cached = get_cached_research(resolved_symbol, key)
     if cached:
         return cached
     try:
-        metric = await asyncio.to_thread(fetch_metric, symbol)
+        metric = await asyncio.to_thread(fetch_metric, resolved_symbol)
     except Exception as exc:
-        last = get_cached_research(symbol, last_key)
+        last = get_cached_research(resolved_symbol, last_key)
         if last:
             return {**last, "stale": True, "provider_error": str(exc)}
-        raise HTTPException(status_code=502, detail=f"Market data provider unavailable for {symbol.upper()}: {exc}")
+        raise HTTPException(status_code=502, detail=f"Market data provider unavailable for {resolved_symbol.upper()}: {exc}")
     payload = metric.model_dump()
-    set_cached_research(symbol, key, payload, ttl_minutes=5)
-    set_cached_research(symbol, last_key, payload, ttl_minutes=24 * 60)
+    set_cached_research(resolved_symbol, key, payload, ttl_minutes=5)
+    set_cached_research(resolved_symbol, last_key, payload, ttl_minutes=24 * 60)
     return payload
 
 
@@ -605,24 +614,49 @@ async def get_profile(request: Request) -> dict[str, Any]:
 
     profile = None
     watchlist: list[str] = []
+    favorites: list[str] = []
     try:
         profile = client.table("profiles").select("*").eq("id", user_id).single().execute().data
     except Exception:
         profile = None
-    try:
-        rows = client.table("watchlist").select("symbol").eq("user_id", user_id).execute().data or []
-        watchlist = [str(row.get("symbol")) for row in rows if row.get("symbol")]
-    except Exception:
-        watchlist = []
+    watchlist = get_user_watchlist(user_id)
+    favorites = get_user_favorites(user_id)
 
-    return {"user_id": user_id, "profile": profile, "watchlist": watchlist}
+    username_locked = False
+    require_username_setup = True
+    if isinstance(profile, dict):
+        display_name = str(profile.get("display_name") or "").strip()
+        email = str(profile.get("email") or "").strip()
+        require_username_setup = _needs_username_setup(profile)
+        username_locked = bool(display_name and (not email or display_name.lower() != email.lower()))
+
+    return {
+        "user_id": user_id,
+        "profile": profile,
+        "watchlist": watchlist,
+        "favorites": favorites,
+        "require_username_setup": require_username_setup,
+        "username_locked": username_locked,
+    }
 
 
 class UserPrefsRequest(BaseModel):
     display_name: str | None = None
+    avatar_data_url: str | None = None
     poke_enabled: bool | None = None
     tutorial_completed: bool | None = None
     watchlist: list[str] | None = None
+    favorites: list[str] | None = None
+
+
+def _needs_username_setup(profile: dict[str, Any] | None) -> bool:
+    if not isinstance(profile, dict):
+        return True
+    display_name = str(profile.get("display_name") or "").strip()
+    email = str(profile.get("email") or "").strip()
+    if not display_name:
+        return True
+    return bool(email and display_name.lower() == email.lower())
 
 
 @router.patch("/user/preferences")
@@ -639,6 +673,42 @@ async def patch_preferences(payload: UserPrefsRequest, request: Request) -> dict
 
     updates = payload.model_dump(exclude_none=True)
     watchlist = updates.pop("watchlist", None)
+    favorites = updates.pop("favorites", None)
+    avatar_data_url = updates.pop("avatar_data_url", None)
+    requested_display_name = updates.get("display_name")
+
+    existing_profile: dict[str, Any] | None = None
+    try:
+        existing_profile = client.table("profiles").select("id,email,display_name,avatar_url").eq("id", user_id).single().execute().data
+    except Exception:
+        existing_profile = None
+
+    if isinstance(requested_display_name, str):
+        normalized_display_name = requested_display_name.strip()
+        if not normalized_display_name:
+            raise HTTPException(status_code=422, detail="Username cannot be empty.")
+        if len(normalized_display_name) < 3:
+            raise HTTPException(status_code=422, detail="Username must be at least 3 characters.")
+        if len(normalized_display_name) > 24:
+            raise HTTPException(status_code=422, detail="Username must be 24 characters or fewer.")
+        existing_display_name = str((existing_profile or {}).get("display_name") or "").strip()
+        existing_email = str((existing_profile or {}).get("email") or "").strip()
+        username_locked = bool(
+            existing_display_name
+            and (not existing_email or existing_display_name.lower() != existing_email.lower())
+        )
+        if username_locked and normalized_display_name != existing_display_name:
+            raise HTTPException(status_code=409, detail="Username is locked and cannot be changed.")
+        updates["display_name"] = normalized_display_name
+
+    if isinstance(avatar_data_url, str):
+        normalized_avatar = avatar_data_url.strip()
+        if normalized_avatar:
+            if not normalized_avatar.startswith("data:image/"):
+                raise HTTPException(status_code=422, detail="Avatar payload must be an image data URL.")
+            if len(normalized_avatar) > 2_000_000:
+                raise HTTPException(status_code=422, detail="Avatar image is too large.")
+            updates["avatar_url"] = normalized_avatar
 
     profile = None
     if updates:
@@ -648,15 +718,41 @@ async def patch_preferences(payload: UserPrefsRequest, request: Request) -> dict
             profile = None
 
     if isinstance(watchlist, list):
-        try:
-            client.table("watchlist").delete().eq("user_id", user_id).execute()
-            inserts = [{"user_id": user_id, "symbol": str(symbol).upper().strip()} for symbol in watchlist if str(symbol).strip()]
-            if inserts:
-                client.table("watchlist").insert(inserts).execute()
-        except Exception:
-            pass
+        set_user_watchlist(user_id, watchlist)
+    if isinstance(favorites, list):
+        set_user_favorites(user_id, favorites)
 
-    return {"ok": True, "profile": profile}
+    final_profile = None
+    try:
+        final_profile = client.table("profiles").select("*").eq("id", user_id).single().execute().data
+    except Exception:
+        final_profile = None
+    return {
+        "ok": True,
+        "profile": final_profile or profile,
+        "require_username_setup": _needs_username_setup(final_profile if isinstance(final_profile, dict) else existing_profile),
+    }
+
+
+class FavoriteStocksRequest(BaseModel):
+    symbols: list[str]
+
+
+@router.get("/user/favorites")
+async def get_favorite_stocks(request: Request) -> dict[str, Any]:
+    user_id = get_user_id_from_request(request)
+    if not user_id:
+        return {"user_id": None, "favorites": [], "note": "Sign in to persist favorites."}
+    return {"user_id": user_id, "favorites": get_user_favorites(user_id)}
+
+
+@router.put("/user/favorites")
+async def put_favorite_stocks(payload: FavoriteStocksRequest, request: Request) -> dict[str, Any]:
+    user_id = get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    favorites = set_user_favorites(user_id, payload.symbols)
+    return {"user_id": user_id, "favorites": favorites}
 
 
 @router.get("/user/trades")

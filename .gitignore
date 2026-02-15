@@ -32,3 +32,9 @@ build/
 # IDE
 .idea/
 .vscode/
+
+frontend/*.mp4
+.cursor/worktrees.json
+
+frontend/*.mp4
+.cursor/worktrees.json
