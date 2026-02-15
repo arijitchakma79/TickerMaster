@@ -15,12 +15,20 @@ from app.schemas import CandlestickPoint, MarketMetric, TickerLookup
 
 _LAST_METRIC_CACHE: dict[str, MarketMetric] = {}
 _LAST_CANDLES_CACHE: dict[str, List[CandlestickPoint]] = {}
+_LAST_ADVANCED_CACHE: dict[str, tuple[float, Dict[str, Any]]] = {}
+_ADVANCED_CACHE_TTL_SECONDS = 15 * 60
 
 
 def _safe_float(value: Any) -> float | None:
     try:
         if value is None:
             return None
+        if isinstance(value, str):
+            clean = value.strip()
+            if not clean:
+                return None
+            clean = clean.replace(",", "").replace("$", "").replace("%", "")
+            value = clean
         return float(value)
     except (TypeError, ValueError):
         return None
@@ -258,6 +266,41 @@ def _twelvedata_get(path: str, params: dict[str, Any] | None = None) -> Any:
             return payload
     except Exception:
         return None
+
+
+def _twelvedata_statistics(symbol: str) -> dict[str, Any]:
+    payload = _twelvedata_get("/statistics", {"symbol": symbol})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _yahoo_quote(symbol: str) -> dict[str, Any]:
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_0) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/121.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        with httpx.Client(timeout=12.0, headers=headers) as client:
+            resp = client.get(url, params={"symbols": symbol})
+            if resp.status_code in {401, 403, 404, 429}:
+                return {}
+            resp.raise_for_status()
+            payload = resp.json()
+            rows = (
+                payload.get("quoteResponse", {}).get("result", [])
+                if isinstance(payload, dict)
+                else []
+            )
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                return rows[0]
+    except Exception:
+        return {}
+    return {}
 
 
 def _parse_twelvedata_datetime(raw: Any) -> str | None:
@@ -919,22 +962,30 @@ def _recommendation_label(row: dict[str, Any]) -> str | None:
 
 def fetch_advanced_stock_data(ticker: str) -> Dict[str, Any]:
     symbol = resolve_symbol_input(ticker)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = _LAST_ADVANCED_CACHE.get(symbol)
+    if cached and (now_ts - cached[0]) <= _ADVANCED_CACHE_TTL_SECONDS:
+        return cached[1]
 
     profile = _finnhub_profile(symbol)
     basic = _finnhub_basic_metrics(symbol)
     recommendation_row = _finnhub_recommendation(symbol)
     price_target = _finnhub_price_target(symbol)
+    tw_stats = _twelvedata_statistics(symbol)
+    yahoo_quote = _yahoo_quote(symbol)
 
     try:
         metric = fetch_metric(symbol)
     except Exception:
+        quote = _finnhub_quote(symbol) or {}
+        quote_price = _safe_float(quote.get("price"))
         metric = MarketMetric(
             ticker=symbol,
-            price=0.0,
-            change_percent=0.0,
+            price=round(quote_price, 2) if quote_price is not None else 0.0,
+            change_percent=round(float(_safe_float(quote.get("change_percent")) or 0.0), 2),
             pe_ratio=None,
             beta=None,
-            volume=None,
+            volume=_safe_int(quote.get("volume")),
             market_cap=None,
         )
 
@@ -942,40 +993,96 @@ def fetch_advanced_stock_data(ticker: str) -> Dict[str, Any]:
     if not insider:
         insider = _sec_form4_fallback(symbol)
 
-    trailing_pe = _safe_float(basic.get("peTTM")) or _safe_float(basic.get("peBasicExclExtraTTM"))
-    forward_pe = _safe_float(basic.get("peForward"))
-    eps_trailing = _safe_float(basic.get("epsTTM"))
-    eps_forward = _safe_float(basic.get("epsForward"))
+    trailing_pe = (
+        _safe_float(basic.get("peTTM"))
+        or _safe_float(basic.get("peBasicExclExtraTTM"))
+        or metric.pe_ratio
+        or _safe_float(tw_stats.get("pe_ratio"))
+        or _safe_float(tw_stats.get("trailing_pe"))
+        or _safe_float(yahoo_quote.get("trailingPE"))
+    )
+    forward_pe = (
+        _safe_float(basic.get("peForward"))
+        or _safe_float(tw_stats.get("forward_pe"))
+        or _safe_float(yahoo_quote.get("forwardPE"))
+    )
+    eps_trailing = (
+        _safe_float(basic.get("epsTTM"))
+        or _safe_float(tw_stats.get("eps"))
+        or _safe_float(tw_stats.get("eps_ttm"))
+        or _safe_float(yahoo_quote.get("epsTrailingTwelveMonths"))
+    )
+    eps_forward = _safe_float(basic.get("epsForward")) or _safe_float(yahoo_quote.get("epsForward"))
     dividend_yield = _safe_float(basic.get("dividendYieldIndicatedAnnual"))
-    fifty_two_week_high = _safe_float(basic.get("52WeekHigh"))
-    fifty_two_week_low = _safe_float(basic.get("52WeekLow"))
+    fifty_two_week_high = _safe_float(basic.get("52WeekHigh")) or _safe_float(yahoo_quote.get("fiftyTwoWeekHigh"))
+    fifty_two_week_low = _safe_float(basic.get("52WeekLow")) or _safe_float(yahoo_quote.get("fiftyTwoWeekLow"))
     avg_volume = _safe_float(basic.get("10DayAverageTradingVolume")) or _safe_float(
         basic.get("3MonthAverageTradingVolume")
-    )
+    ) or _safe_float(yahoo_quote.get("averageDailyVolume3Month"))
 
-    return {
+    sec_shares_outstanding = _sec_latest_shares_outstanding(symbol)
+    sec_eps = _sec_latest_eps_diluted(symbol)
+
+    market_cap_value = (
+        metric.market_cap
+        or _normalize_market_cap(profile.get("marketCapitalization"))
+        or _safe_float(tw_stats.get("market_capitalization"))
+        or _safe_float(yahoo_quote.get("marketCap"))
+    )
+    if market_cap_value is None and sec_shares_outstanding is not None and metric.price and metric.price > 0:
+        market_cap_value = float(sec_shares_outstanding) * float(metric.price)
+
+    eps_trailing_value = eps_trailing or sec_eps
+    trailing_pe_value = trailing_pe
+    if trailing_pe_value is None and eps_trailing_value is not None and eps_trailing_value > 0 and metric.price and metric.price > 0:
+        trailing_pe_value = float(metric.price) / float(eps_trailing_value)
+
+    out = {
         "ticker": symbol,
-        "company_name": (profile.get("name") or symbol),
-        "exchange": profile.get("exchange") or profile.get("mic"),
+        "current_price": metric.price if metric.price and metric.price > 0 else None,
+        "change_percent": metric.change_percent if metric.price and metric.price > 0 else None,
+        "company_name": (profile.get("name") or yahoo_quote.get("longName") or yahoo_quote.get("shortName") or symbol),
+        "exchange": profile.get("exchange") or profile.get("mic") or yahoo_quote.get("fullExchangeName") or yahoo_quote.get("exchange"),
         "sector": profile.get("finnhubIndustry"),
         "industry": profile.get("finnhubIndustry"),
         "website": profile.get("weburl"),
         "description": profile.get("description"),
-        "market_cap": metric.market_cap or _normalize_market_cap(profile.get("marketCapitalization")),
-        "beta": metric.beta if metric.beta is not None else _safe_float(basic.get("beta")),
-        "trailing_pe": trailing_pe,
+        "market_cap": market_cap_value,
+        "beta": (
+            metric.beta
+            if metric.beta is not None
+            else (_safe_float(basic.get("beta")) or _safe_float(yahoo_quote.get("beta")))
+        ),
+        "trailing_pe": trailing_pe_value,
         "forward_pe": forward_pe,
-        "eps_trailing": eps_trailing,
+        "eps_trailing": eps_trailing_value,
         "eps_forward": eps_forward,
         "dividend_yield": dividend_yield,
         "fifty_two_week_high": fifty_two_week_high,
         "fifty_two_week_low": fifty_two_week_low,
         "avg_volume": avg_volume,
-        "volume": metric.volume,
-        "recommendation": _recommendation_label(recommendation_row),
-        "target_mean_price": _safe_float(price_target.get("targetMean")),
+        "volume": metric.volume if metric.volume is not None else _safe_int(yahoo_quote.get("regularMarketVolume")),
+        "recommendation": _recommendation_label(recommendation_row) or str(yahoo_quote.get("recommendationKey") or "").strip().lower() or None,
+        "target_mean_price": (
+            _safe_float(price_target.get("targetMean"))
+            or _safe_float(tw_stats.get("target_price"))
+            or _safe_float(yahoo_quote.get("targetMeanPrice"))
+        ),
         "insider_transactions": insider,
     }
+    key_fields = [
+        out.get("market_cap"),
+        out.get("trailing_pe"),
+        out.get("forward_pe"),
+        out.get("eps_trailing"),
+        out.get("target_mean_price"),
+    ]
+    if any(value is not None for value in key_fields):
+        _LAST_ADVANCED_CACHE[symbol] = (now_ts, out)
+        return out
+    if cached:
+        return cached[1]
+    return out
 
 
 def _sec_form4_fallback(symbol: str) -> list[dict[str, Any]]:
@@ -1017,3 +1124,81 @@ def _sec_form4_fallback(symbol: str) -> list[dict[str, Any]]:
             return out
     except Exception:
         return []
+
+
+def _sec_cik_for_symbol(symbol: str) -> str | None:
+    ua = {"User-Agent": "TickerMaster/1.0 (research@treehacks.dev)"}
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            tickers = client.get("https://www.sec.gov/files/company_tickers.json", headers=ua).json()
+            if not isinstance(tickers, dict):
+                return None
+            for value in tickers.values():
+                if not isinstance(value, dict):
+                    continue
+                if str(value.get("ticker", "")).upper() != symbol:
+                    continue
+                cik_num = value.get("cik_str")
+                if cik_num is None:
+                    return None
+                return f"{int(cik_num):010d}"
+    except Exception:
+        return None
+    return None
+
+
+def _sec_company_facts(cik: str) -> dict[str, Any]:
+    ua = {"User-Agent": "TickerMaster/1.0 (research@treehacks.dev)"}
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            payload = client.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json", headers=ua).json()
+            return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _sec_latest_numeric_fact(facts: dict[str, Any], taxonomy: str, tag: str, units: list[str]) -> float | None:
+    taxonomy_block = facts.get("facts", {}).get(taxonomy, {})
+    tag_block = taxonomy_block.get(tag, {}) if isinstance(taxonomy_block, dict) else {}
+    units_block = tag_block.get("units", {}) if isinstance(tag_block, dict) else {}
+    if not isinstance(units_block, dict):
+        return None
+
+    latest_value: float | None = None
+    latest_sort_key = ""
+    for unit in units:
+        rows = units_block.get(unit)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            value = _safe_float(row.get("val"))
+            if value is None:
+                continue
+            filed = str(row.get("filed") or "")
+            end = str(row.get("end") or "")
+            sort_key = f"{filed}|{end}"
+            if sort_key >= latest_sort_key:
+                latest_sort_key = sort_key
+                latest_value = value
+    return latest_value
+
+
+def _sec_latest_shares_outstanding(symbol: str) -> float | None:
+    cik = _sec_cik_for_symbol(symbol)
+    if not cik:
+        return None
+    facts = _sec_company_facts(cik)
+    return (
+        _sec_latest_numeric_fact(facts, "dei", "EntityCommonStockSharesOutstanding", ["shares"])
+        or _sec_latest_numeric_fact(facts, "us-gaap", "CommonStockSharesOutstanding", ["shares"])
+    )
+
+
+def _sec_latest_eps_diluted(symbol: str) -> float | None:
+    cik = _sec_cik_for_symbol(symbol)
+    if not cik:
+        return None
+    facts = _sec_company_facts(cik)
+    return _sec_latest_numeric_fact(facts, "us-gaap", "EarningsPerShareDiluted", ["USD/shares"])

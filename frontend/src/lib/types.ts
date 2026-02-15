@@ -126,6 +126,8 @@ export interface InsiderTransaction {
 
 export interface AdvancedStockData {
   ticker: string;
+  current_price?: number | null;
+  change_percent?: number | null;
   company_name?: string | null;
   exchange?: string | null;
   sector?: string | null;

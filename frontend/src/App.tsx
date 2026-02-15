@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useState, type ChangeEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import ResearchRail from "./components/ResearchRail";
 import ResearchPanel from "./components/ResearchPanel";
 import SimulationPanel from "./components/SimulationPanel";
@@ -95,6 +102,10 @@ async function cropAvatarToDataUrl(
   return canvas.toDataURL("image/jpeg", 0.9);
 }
 
+function clampAvatarOffset(value: number) {
+  return Math.max(-180, Math.min(180, value));
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>(tabFromQuery());
   const [ticker, setTicker] = useState("");
@@ -134,6 +145,14 @@ export default function App() {
   const [avatarZoom, setAvatarZoom] = useState(1);
   const [avatarOffsetX, setAvatarOffsetX] = useState(0);
   const [avatarOffsetY, setAvatarOffsetY] = useState(0);
+  const [avatarDragging, setAvatarDragging] = useState(false);
+  const avatarDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
 
   useEffect(() => {
     const unsubscribe = subscribeAuthSession((session) => {
@@ -177,9 +196,8 @@ export default function App() {
           setTicker("");
         } else {
           setWatchlist(synced);
-          if (!synced.includes(ticker)) {
-            setTicker(synced[0]);
-          }
+          // Keep research empty on startup/login until user picks a ticker.
+          setTicker("");
         }
         setFavoriteStocksState(normalizeWatchlist(favoriteSymbols));
         if (profilePayload?.profile) {
@@ -410,6 +428,8 @@ export default function App() {
     setAvatarZoom(1);
     setAvatarOffsetX(0);
     setAvatarOffsetY(0);
+    setAvatarDragging(false);
+    avatarDragRef.current = null;
   }
 
   function handleAvatarFileSelected(event: ChangeEvent<HTMLInputElement>) {
@@ -421,6 +441,41 @@ export default function App() {
     setAvatarOffsetX(0);
     setAvatarOffsetY(0);
     setProfileError("");
+    event.target.value = "";
+  }
+
+  function handleAvatarPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!avatarCropSource) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    avatarDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: avatarOffsetX,
+      originY: avatarOffsetY,
+    };
+    setAvatarDragging(true);
+  }
+
+  function handleAvatarPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const activeDrag = avatarDragRef.current;
+    if (!activeDrag || activeDrag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const deltaX = event.clientX - activeDrag.startX;
+    const deltaY = event.clientY - activeDrag.startY;
+    setAvatarOffsetX(clampAvatarOffset(activeDrag.originX + deltaX));
+    setAvatarOffsetY(clampAvatarOffset(activeDrag.originY + deltaY));
+  }
+
+  function handleAvatarPointerUp(event: ReactPointerEvent<HTMLDivElement>) {
+    const activeDrag = avatarDragRef.current;
+    if (!activeDrag || activeDrag.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    avatarDragRef.current = null;
+    setAvatarDragging(false);
   }
 
   async function buildAvatarDataUrlIfNeeded() {
@@ -567,33 +622,33 @@ export default function App() {
         </>
       ) : null}
 
-      <div className="brand-corner">
-        <div className="brand-lockup" aria-label="TickerMaster">
-          <img
-            src={brandLogo}
-            alt="TickerMaster"
-            className="brand-logo-image"
-          />
-        </div>
-      </div>
-      <div className="toggle-corner">
-        <div className="top-nav-right">
-          <div className="theme-switch-wrap">
-            <button
-              type="button"
-              className={`theme-switch ${theme}`}
-              onClick={() =>
-                setTheme((prev) => (prev === "light" ? "dark" : "light"))
-              }
-              aria-label={`Switch to ${theme === "light" ? "dark" : "light"} mode`}
-              aria-pressed={theme === "dark"}
-              title={theme === "light" ? "Light mode" : "Dark mode"}
-            >
-              <span className="theme-switch-track" />
-              <span className="theme-switch-thumb">
-                <img src={theme === "light" ? sunIcon : moonIcon} alt="" />
-              </span>
-            </button>
+      <div className="top-fixed-controls">
+        <div className="top-fixed-controls-inner">
+          <div className="brand-lockup" aria-label="TickerMaster">
+            <img
+              src={brandLogo}
+              alt="TickerMaster"
+              className="brand-logo-image"
+            />
+          </div>
+          <div className="top-nav-right">
+            <div className="theme-switch-wrap">
+              <button
+                type="button"
+                className={`theme-switch ${theme}`}
+                onClick={() =>
+                  setTheme((prev) => (prev === "light" ? "dark" : "light"))
+                }
+                aria-label={`Switch to ${theme === "light" ? "dark" : "light"} mode`}
+                aria-pressed={theme === "dark"}
+                title={theme === "light" ? "Light mode" : "Dark mode"}
+              >
+                <span className="theme-switch-track" />
+                <span className="theme-switch-thumb">
+                  <img src={theme === "light" ? sunIcon : moonIcon} alt="" />
+                </span>
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -975,8 +1030,12 @@ export default function App() {
             {avatarCropSource ? (
               <div className="avatar-crop-stack">
                 <div
-                  className="avatar-crop-frame"
+                  className={`avatar-crop-frame${avatarDragging ? " dragging" : ""}`}
                   aria-label="Avatar crop preview"
+                  onPointerDown={handleAvatarPointerDown}
+                  onPointerMove={handleAvatarPointerMove}
+                  onPointerUp={handleAvatarPointerUp}
+                  onPointerCancel={handleAvatarPointerUp}
                 >
                   <img
                     src={avatarCropSource}
@@ -1068,8 +1127,12 @@ export default function App() {
             {avatarCropSource ? (
               <div className="avatar-crop-stack">
                 <div
-                  className="avatar-crop-frame"
+                  className={`avatar-crop-frame${avatarDragging ? " dragging" : ""}`}
                   aria-label="Avatar crop preview"
+                  onPointerDown={handleAvatarPointerDown}
+                  onPointerMove={handleAvatarPointerMove}
+                  onPointerUp={handleAvatarPointerUp}
+                  onPointerCancel={handleAvatarPointerUp}
                 >
                   <img
                     src={avatarCropSource}

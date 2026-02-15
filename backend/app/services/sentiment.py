@@ -45,6 +45,130 @@ NEGATIVE_WORDS = {
     "decline",
     "recession",
 }
+REDDIT_FOCUS_SUBREDDITS = [
+    "wallstreetbets",
+    "stocks",
+    "investing",
+    "options",
+    "stockmarket",
+    "securityanalysis",
+    "valueinvesting",
+    "pennystocks",
+]
+REDDIT_FOCUS_SUBREDDITS_SET = {name.lower() for name in REDDIT_FOCUS_SUBREDDITS}
+_COMPANY_NAME_STOPWORDS = {
+    "inc",
+    "inc.",
+    "corp",
+    "corp.",
+    "corporation",
+    "company",
+    "co",
+    "co.",
+    "holdings",
+    "group",
+    "plc",
+    "ltd",
+    "limited",
+    "class",
+    "common",
+    "stock",
+    "the",
+    "and",
+}
+_REDDIT_TOKEN_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "this",
+    "that",
+    "from",
+    "have",
+    "about",
+    "into",
+    "more",
+    "than",
+    "will",
+    "would",
+    "could",
+    "should",
+    "they",
+    "them",
+    "their",
+    "what",
+    "when",
+    "where",
+    "while",
+    "been",
+    "being",
+    "over",
+    "under",
+    "just",
+    "your",
+    "yours",
+    "also",
+    "very",
+    "after",
+    "before",
+    "because",
+    "still",
+    "only",
+    "much",
+    "many",
+    "some",
+    "such",
+    "then",
+    "than",
+    "into",
+    "onto",
+    "across",
+    "through",
+    "was",
+    "were",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "does",
+    "did",
+    "doing",
+    "said",
+    "says",
+    "theyre",
+    "dont",
+    "cant",
+    "wont",
+    "im",
+    "ive",
+    "youre",
+    "hes",
+    "shes",
+    "its",
+    "weve",
+    "theyd",
+    "him",
+    "her",
+    "his",
+    "hers",
+    "our",
+    "ours",
+    "who",
+    "whom",
+    "whose",
+    "which",
+    "why",
+    "how",
+    "discussion",
+    "thread",
+    "post",
+    "posts",
+    "stock",
+    "stocks",
+    "market",
+    "markets",
+}
 
 _MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 _MARKDOWN_CITATION_PATTERN = re.compile(r"\s*\[(?:\d+(?:\s*,\s*\d+)*)\]")
@@ -140,6 +264,69 @@ def _sanitize_perplexity_text(text: str) -> str:
         if bullets:
             return "**Summary**:\n" + "\n".join(bullets)
     return compact
+
+
+def _mentions_symbol(text: str, ticker: str) -> bool:
+    clean = str(text or "")
+    if not clean:
+        return False
+    escaped = re.escape(ticker)
+    cashtag_pattern = rf"\${escaped}\b"
+    token_pattern = rf"(?<![A-Z0-9-]){escaped}(?![A-Z0-9-])"
+    return bool(
+        re.search(cashtag_pattern, clean, flags=re.IGNORECASE)
+        or re.search(token_pattern, clean, flags=re.IGNORECASE)
+    )
+
+
+def _company_alias_tokens(company_name: str) -> List[str]:
+    if not company_name:
+        return []
+    parts = re.findall(r"[A-Za-z][A-Za-z&.-]{1,}", company_name.lower())
+    out: List[str] = []
+    for token in parts:
+        normalized = token.strip(".").replace("&", "")
+        if len(normalized) < 3:
+            continue
+        if normalized in _COMPANY_NAME_STOPWORDS:
+            continue
+        out.append(normalized)
+    return list(dict.fromkeys(out))
+
+
+def _macro_queries_for_context(ticker: str, company_name: str | None = None) -> List[str]:
+    base = [
+        "fed rates",
+        "rate cuts",
+        "cpi inflation",
+        "jobs report unemployment",
+        "recession probability",
+        "gdp growth",
+    ]
+
+    name = (company_name or "").lower()
+    if any(token in name for token in ["uber", "lyft", "airline", "travel", "booking", "expedia"]):
+        base.extend(["consumer spending", "oil prices", "gas prices"])
+    if any(token in name for token in ["tesla", "ford", "gm", "automotive", "ev"]):
+        base.extend(["battery metals", "oil prices", "consumer auto demand"])
+    if any(token in name for token in ["apple", "microsoft", "nvidia", "meta", "amazon", "alphabet", "software", "semiconductor"]):
+        base.extend(["ai spending", "tech earnings", "nasdaq"])
+    if any(token in name for token in ["bank", "jpmorgan", "goldman", "wells fargo", "financial"]):
+        base.extend(["yield curve", "bank stress", "credit spreads"])
+    if any(token in name for token in ["xom", "chevron", "oil", "energy", "exxon"]):
+        base.extend(["crude oil", "opec", "energy demand"])
+
+    # Include ticker-level query as a final attempt in case direct market listings are sparse.
+    base.append(ticker.upper())
+    seen: set[str] = set()
+    out: List[str] = []
+    for item in base:
+        key = item.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
 
 async def _perplexity_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
@@ -316,25 +503,193 @@ async def _x_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
 
 async def _reddit_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
     headers = {"User-Agent": settings.reddit_user_agent or "TickerMaster/1.0"}
-    params = {
-        "q": ticker,
-        "restrict_sr": "false",
-        "sort": "new",
+    company_aliases: List[str] = []
+    try:
+        lookup = await search_tickers(ticker, limit=1)
+        if lookup:
+            company_aliases = _company_alias_tokens(str(lookup[0].name or ""))
+    except Exception:
+        company_aliases = []
+    base_params = {
+        "q": f'"{ticker}" OR ${ticker} stock',
+        "sort": "top",
         "t": "week",
-        "limit": 20,
+        "limit": 15,
     }
-
-    # Public JSON search works for lightweight use and avoids auth complexity for MVP.
-    url = "https://www.reddit.com/search.json"
     posts: List[Dict[str, Any]] = []
     error_msg = ""
 
+    async def fetch_json(client: httpx.AsyncClient, url: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        children = resp.json().get("data", {}).get("children", [])
+        return [child.get("data", {}) for child in children if isinstance(child, dict)]
+
+    def normalize_permalink(post: Dict[str, Any]) -> str:
+        permalink = str(post.get("permalink") or "").strip()
+        if permalink.startswith("http://") or permalink.startswith("https://"):
+            return permalink
+        if permalink.startswith("/"):
+            return f"https://www.reddit.com{permalink}"
+        return f"https://www.reddit.com/search/?q={ticker}"
+
+    def post_blob(post: Dict[str, Any]) -> str:
+        title = str(post.get("title") or "")
+        selftext = str(post.get("selftext") or "")
+        return f"{title} {selftext}".strip()
+
+    def is_allowed_subreddit(post: Dict[str, Any]) -> bool:
+        subreddit = str(post.get("subreddit") or "").strip().lower()
+        return subreddit in REDDIT_FOCUS_SUBREDDITS_SET
+
+    def alias_hits(text: str) -> int:
+        lower = text.lower()
+        return sum(1 for token in company_aliases if re.search(rf"\b{re.escape(token)}\b", lower))
+
+    def is_ticker_relevant(post: Dict[str, Any]) -> bool:
+        title = str(post.get("title") or "")
+        selftext = str(post.get("selftext") or "")
+        text = f"{title} {selftext}".strip()
+        if not text:
+            return False
+
+        title_has_ticker = _mentions_symbol(title, ticker)
+        text_has_ticker = title_has_ticker or _mentions_symbol(text, ticker)
+        alias_match_count = alias_hits(text)
+
+        # Drop cross-ticker threads when our target is not explicitly discussed.
+        other_cashtags = {
+            match.upper()
+            for match in re.findall(r"\$([A-Za-z]{1,5})\b", text)
+            if match.upper() != ticker
+        }
+        if not text_has_ticker and alias_match_count < 2:
+            return False
+        if other_cashtags and not text_has_ticker and alias_match_count < 3:
+            return False
+        return True
+
+    def post_relevance(post: Dict[str, Any]) -> float:
+        if not is_ticker_relevant(post):
+            return -1_000_000.0
+        title = str(post.get("title") or "")
+        text = post_blob(post)
+        lower = text.lower()
+        ticker_lower = ticker.lower()
+        mentions = lower.count(ticker_lower)
+        cashtag_mentions = lower.count(f"${ticker_lower}")
+        alias_match_count = alias_hits(text)
+        score = float(post.get("score") or 0.0)
+        comments = float(post.get("num_comments") or 0.0)
+        # Weight relevance to ticker plus crowd engagement.
+        return (
+            (mentions * 6.0)
+            + (cashtag_mentions * 8.0)
+            + (alias_match_count * 3.0)
+            + (score * 0.015)
+            + (comments * 0.04)
+            + (6.0 if _mentions_symbol(title, ticker) else 0.0)
+        )
+
+    def top_terms(items: List[Dict[str, Any]], top_k: int = 4) -> List[str]:
+        token_weights: Dict[str, float] = {}
+        ticker_lower = ticker.lower()
+        for post in items:
+            text = post_blob(post).lower()
+            post_weight = 1.0 + (float(post.get("score") or 0.0) / 300.0)
+            for token in re.findall(r"[a-z]{3,}", text):
+                if token in _REDDIT_TOKEN_STOPWORDS or token == ticker_lower:
+                    continue
+                if token in company_aliases:
+                    continue
+                if len(token) <= 3:
+                    continue
+                token_weights[token] = token_weights.get(token, 0.0) + post_weight
+        ranked = sorted(token_weights.items(), key=lambda pair: pair[1], reverse=True)
+        return [token for token, _ in ranked[:top_k]]
+
+    def build_reddit_summary(items: List[Dict[str, Any]], net_score: float) -> str:
+        if not items:
+            return f"No notable Reddit discussions captured for {ticker}."
+
+        bullish_count = 0
+        bearish_count = 0
+        for post in items:
+            score = _sentiment_score_from_text(post_blob(post))
+            if score >= 0.15:
+                bullish_count += 1
+            elif score <= -0.15:
+                bearish_count += 1
+
+        communities = sorted(
+            {
+                f"r/{str(post.get('subreddit') or '').strip()}"
+                for post in items
+                if str(post.get("subreddit") or "").strip()
+            }
+        )
+        communities_str = ", ".join(communities[:4]) if communities else "core stock subreddits"
+
+        featured = sorted(items, key=post_relevance, reverse=True)[:3]
+        top_thread_lines: List[str] = []
+        for post in featured:
+            subreddit = str(post.get("subreddit") or "unknown")
+            title = re.sub(r"\s+", " ", str(post.get("title") or "")).strip()
+            if len(title) > 120:
+                title = title[:117].rstrip() + "..."
+            ups = int(post.get("score") or 0)
+            comments = int(post.get("num_comments") or 0)
+            local_score = _sentiment_score_from_text(post_blob(post))
+            top_thread_lines.append(
+                f"- r/{subreddit}: \"{title}\" ({ups} upvotes, {comments} comments, {_label(local_score)} tone)."
+            )
+
+        themes = top_terms(items)
+        theme_line = ", ".join(themes) if themes else "earnings, positioning, and momentum"
+
+        return "\n".join(
+            [
+                "**Coverage**:",
+                f"- Reviewed {len(items)} high-engagement Reddit threads for {ticker} from {communities_str}.",
+                f"- Net sentiment is {_label(net_score)} with {bullish_count} bullish vs {bearish_count} bearish threads.",
+                "**Top Threads**:",
+                *top_thread_lines,
+                "**What Retail Is Watching**:",
+                f"- Most repeated discussion themes: {theme_line}.",
+                "- Watch whether highly-upvoted threads shift from catalyst-driven DD to short-term hype; that often precedes volatility.",
+            ]
+        )
+
     try:
         async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            children = resp.json().get("data", {}).get("children", [])
-            posts = [child.get("data", {}) for child in children]
+            scoped_calls = [
+                fetch_json(
+                    client,
+                    f"https://www.reddit.com/r/{subreddit}/search.json",
+                    {**base_params, "restrict_sr": "on"},
+                )
+                for subreddit in REDDIT_FOCUS_SUBREDDITS
+            ]
+            scoped_results = await asyncio.gather(*scoped_calls)
+
+            merged: Dict[str, Dict[str, Any]] = {}
+            for batch in scoped_results:
+                for post in batch:
+                    if not isinstance(post, dict):
+                        continue
+                    if not is_allowed_subreddit(post):
+                        continue
+                    key = str(post.get("name") or post.get("id") or "")
+                    if not key:
+                        continue
+                    existing = merged.get(key)
+                    if not existing:
+                        merged[key] = post
+                        continue
+                    # Keep the richer record if one has longer body text.
+                    if len(str(post.get("selftext") or "")) > len(str(existing.get("selftext") or "")):
+                        merged[key] = post
+            posts = list(merged.values())
     except Exception as exc:
         error_msg = f"Reddit fetch failed: {exc}"
 
@@ -342,15 +697,34 @@ async def _reddit_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
         summary = error_msg or f"No notable Reddit discussions captured for {ticker}."
         score = 0.0
     else:
-        joined = " ".join(post.get("title", "") + " " + post.get("selftext", "") for post in posts)
-        score = _sentiment_score_from_text(joined)
-        summary = f"Reddit chatter sampled from {len(posts)} posts. Sentiment skew is {_label(score)}."
+        relevant = [post for post in posts if is_ticker_relevant(post)]
+        ranked = sorted(relevant, key=post_relevance, reverse=True)[:20] if relevant else []
+        if not ranked:
+            summary = f"No sufficiently ticker-relevant Reddit threads found for {ticker} in core stock subreddits."
+            score = 0.0
+            posts = []
+        else:
+            posts = ranked
+            joined = " ".join(post_blob(post) for post in ranked)
+            score = _sentiment_score_from_text(joined)
+            summary = build_reddit_summary(ranked, score)
 
     result = {
         "summary": summary,
-        "links": [
-            SourceLink(source="Reddit", title=f"{ticker} search", url=f"https://www.reddit.com/search/?q={ticker}")
-        ],
+        "links": (
+            [
+                SourceLink(source="Reddit", title=f"{ticker} search", url=f"https://www.reddit.com/search/?q={ticker}")
+            ]
+            if not posts
+            else [
+                SourceLink(
+                    source="Reddit",
+                    title=re.sub(r"\s+", " ", str(post.get("title") or "")).strip()[:72] or f"{ticker} thread",
+                    url=normalize_permalink(post),
+                )
+                for post in sorted(posts, key=post_relevance, reverse=True)[:6]
+            ]
+        ),
         "score": score,
         "posts": posts[:20],
     }
@@ -379,7 +753,7 @@ def _build_narratives(items: List[SentimentBreakdown]) -> List[str]:
 
 async def run_research(request: ResearchRequest, settings: Settings) -> ResearchResponse:
     ticker = request.ticker.upper().strip()
-    cache_key = f"research:{request.timeframe}:{int(request.include_prediction_markets)}"
+    cache_key = f"research:v4:{request.timeframe}:{int(request.include_prediction_markets)}"
     cached = get_cached_research(ticker, cache_key)
     if cached:
         return ResearchResponse(**cached)
@@ -432,6 +806,44 @@ async def run_research(request: ResearchRequest, settings: Settings) -> Research
             key=lambda item: float(item.get("relevance_score", 0.0) or 0.0),
             reverse=True,
         )
+
+        # Fallback: if no direct ticker markets exist, return macro/company-adjacent lines
+        # (Fed rates, CPI, jobs, etc.) so prediction panel is still actionable.
+        if len(prediction_markets) == 0:
+            fallback_queries = _macro_queries_for_context(ticker, company_name=company_name)
+            fallback_batches = await asyncio.gather(
+                *[
+                    asyncio.gather(
+                        fetch_kalshi_markets(query, settings, company_name=company_name),
+                        fetch_polymarket_markets(query, settings, company_name=company_name),
+                    )
+                    for query in fallback_queries
+                ]
+            )
+            merged: Dict[str, Dict[str, Any]] = {}
+            for query, (kalshi_batch, poly_batch) in zip(fallback_queries, fallback_batches):
+                for item in [*(kalshi_batch or []), *(poly_batch or [])]:
+                    if not isinstance(item, dict):
+                        continue
+                    link = str(item.get("link") or "")
+                    market = str(item.get("market") or "")
+                    if not link and not market:
+                        continue
+                    key = f"{item.get('source','')}|{link}|{market}".lower()
+                    existing = merged.get(key)
+                    candidate = dict(item)
+                    # Keep macro fallback visible but below direct ticker contracts.
+                    base_score = float(candidate.get("relevance_score", 0.0) or 0.0)
+                    candidate["relevance_score"] = round(max(0.15, base_score * 0.55), 3)
+                    candidate["context"] = "macro-adjacent"
+                    candidate["query"] = query
+                    if existing is None or float(candidate.get("relevance_score", 0.0) or 0.0) > float(existing.get("relevance_score", 0.0) or 0.0):
+                        merged[key] = candidate
+            prediction_markets = sorted(
+                merged.values(),
+                key=lambda item: float(item.get("relevance_score", 0.0) or 0.0),
+                reverse=True,
+            )[:6]
 
     # Composite weighting from spec: Perplexity 45%, Reddit 30%, X 25%
     aggregate = float((breakdown[0].score * 0.45) + (breakdown[2].score * 0.30) + (breakdown[1].score * 0.25))

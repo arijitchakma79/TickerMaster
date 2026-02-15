@@ -713,9 +713,25 @@ async def patch_preferences(payload: UserPrefsRequest, request: Request) -> dict
     profile = None
     if updates:
         try:
-            profile = client.table("profiles").update(updates).eq("id", user_id).execute().data
-        except Exception:
-            profile = None
+            updated_rows = (
+                client.table("profiles")
+                .update(updates)
+                .eq("id", user_id)
+                .execute()
+                .data
+                or []
+            )
+            if not updated_rows:
+                profile = (
+                    client.table("profiles")
+                    .insert({"id": user_id, **updates})
+                    .execute()
+                    .data
+                )
+            else:
+                profile = updated_rows
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="Could not save profile preferences.") from exc
 
     if isinstance(watchlist, list):
         set_user_watchlist(user_id, watchlist)

@@ -4,6 +4,7 @@ import {
   fetchAdvancedStockData,
   fetchCandles,
   fetchIndicatorSnapshot,
+  fetchRealtimeQuote,
   getAgentActivity,
   runDeepResearch,
   runResearch,
@@ -20,6 +21,8 @@ interface Props {
   connected: boolean;
   events: WSMessage[];
 }
+
+const ADVANCED_CACHE_STORAGE_KEY = "tickermaster-advanced-cache-v1";
 
 function normalizeSymbol(value: string) {
   return value.trim().toUpperCase().replace(/\./g, "-");
@@ -346,6 +349,105 @@ function formatIndicatorValue(snapshot: IndicatorSnapshot, key: IndicatorKey): s
   return typeof value === "number" ? value.toFixed(2) : "-";
 }
 
+async function fetchAdvancedSnapshotWithQuoteFallback(
+  ticker: string,
+): Promise<AdvancedStockData> {
+  const advanced = await fetchAdvancedStockData(ticker);
+  if (
+    advanced.current_price != null &&
+    advanced.change_percent != null
+  ) {
+    return advanced;
+  }
+
+  try {
+    const quote = await fetchRealtimeQuote(ticker);
+    return {
+      ...advanced,
+      current_price: advanced.current_price ?? quote.price ?? null,
+      change_percent: advanced.change_percent ?? quote.change_percent ?? null,
+      market_cap: advanced.market_cap ?? quote.market_cap ?? null,
+      beta: advanced.beta ?? quote.beta ?? null,
+      trailing_pe: advanced.trailing_pe ?? quote.pe_ratio ?? null,
+      volume: advanced.volume ?? quote.volume ?? null,
+    };
+  } catch {
+    return advanced;
+  }
+}
+
+function mergeAdvancedSnapshot(
+  incoming: AdvancedStockData,
+  previous: AdvancedStockData | null,
+  cached: AdvancedStockData | null,
+): AdvancedStockData {
+  const fallback = (previous?.ticker === incoming.ticker ? previous : null) ?? cached;
+  if (!fallback) return incoming;
+
+  const keepIncoming = new Set(["current_price", "change_percent", "volume"]);
+  const keys: Array<keyof AdvancedStockData> = [
+    "company_name",
+    "exchange",
+    "sector",
+    "industry",
+    "website",
+    "description",
+    "market_cap",
+    "beta",
+    "trailing_pe",
+    "forward_pe",
+    "eps_trailing",
+    "eps_forward",
+    "dividend_yield",
+    "fifty_two_week_high",
+    "fifty_two_week_low",
+    "avg_volume",
+    "recommendation",
+    "target_mean_price",
+  ];
+
+  const merged: AdvancedStockData = { ...incoming };
+  for (const key of keys) {
+    const next = incoming[key];
+    if (next !== null && next !== undefined && next !== "") continue;
+    const prior = fallback[key];
+    if (prior !== null && prior !== undefined && prior !== "") {
+      merged[key] = prior as never;
+    }
+  }
+
+  if (Array.isArray(incoming.insider_transactions) && incoming.insider_transactions.length > 0) {
+    return merged;
+  }
+  if (Array.isArray(fallback.insider_transactions) && fallback.insider_transactions.length > 0 && !keepIncoming.has("insider_transactions")) {
+    merged.insider_transactions = fallback.insider_transactions;
+  }
+  return merged;
+}
+
+function readAdvancedCache(symbol: string): AdvancedStockData | null {
+  try {
+    const raw = window.localStorage.getItem(ADVANCED_CACHE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Record<string, AdvancedStockData>;
+    const item = parsed[symbol];
+    return item && typeof item === "object" ? item : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeAdvancedCache(snapshot: AdvancedStockData) {
+  try {
+    const raw = window.localStorage.getItem(ADVANCED_CACHE_STORAGE_KEY);
+    const parsed = raw ? (JSON.parse(raw) as Record<string, AdvancedStockData>) : {};
+    parsed[snapshot.ticker] = snapshot;
+    window.localStorage.setItem(ADVANCED_CACHE_STORAGE_KEY, JSON.stringify(parsed));
+  } catch {
+    // no-op
+  }
+}
+
 export default function ResearchPanel({ activeTicker, onTickerChange, connected, events }: Props) {
   const [indicatorInfoOpen, setIndicatorInfoOpen] = useState(false);
   const [insiderPage, setInsiderPage] = useState(1);
@@ -498,10 +600,15 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
     if (!ticker) return;
     let active = true;
 
-    void fetchAdvancedStockData(ticker)
+    void fetchAdvancedSnapshotWithQuoteFallback(ticker)
       .then((snapshot) => {
         if (!active) return;
-        setAdvanced(snapshot);
+        const cached = readAdvancedCache(ticker);
+        setAdvanced((prev) => {
+          const merged = mergeAdvancedSnapshot(snapshot, prev, cached);
+          writeAdvancedCache(merged);
+          return merged;
+        });
       })
       .catch(() => {
         if (!active) return;
@@ -558,7 +665,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
       const [analysisResult, chartResult, advancedResult, indicatorResult] = await Promise.allSettled([
         runResearch(ticker, timeframe),
         fetchCandles(ticker, chartPeriod, chartInterval, true),
-        fetchAdvancedStockData(ticker),
+        fetchAdvancedSnapshotWithQuoteFallback(ticker),
         fetchIndicatorSnapshot(ticker, chartPeriod, chartInterval),
       ]);
       if (runNonce !== runNonceRef.current) return;
@@ -567,7 +674,14 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
       }
       setResearch(analysisResult.value);
       if (chartResult.status === "fulfilled") setCandles(chartResult.value);
-      if (advancedResult.status === "fulfilled") setAdvanced(advancedResult.value);
+      if (advancedResult.status === "fulfilled") {
+        const cached = readAdvancedCache(ticker);
+        setAdvanced((prev) => {
+          const merged = mergeAdvancedSnapshot(advancedResult.value, prev, cached);
+          writeAdvancedCache(merged);
+          return merged;
+        });
+      }
       if (indicatorResult.status === "fulfilled") setIndicatorSnapshot(indicatorResult.value);
     } catch (err) {
       if (runNonce !== runNonceRef.current) return;
@@ -600,7 +714,7 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
       const [analysisResult, chartResult, advancedResult, indicatorResult, deepResult] = await Promise.allSettled([
         runResearch(ticker, timeframe),
         fetchCandles(ticker, chartPeriod, chartInterval, true),
-        fetchAdvancedStockData(ticker),
+        fetchAdvancedSnapshotWithQuoteFallback(ticker),
         fetchIndicatorSnapshot(ticker, chartPeriod, chartInterval),
         runDeepResearch(ticker),
       ]);
@@ -610,7 +724,14 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
       }
       setResearch(analysisResult.value);
       if (chartResult.status === "fulfilled") setCandles(chartResult.value);
-      if (advancedResult.status === "fulfilled") setAdvanced(advancedResult.value);
+      if (advancedResult.status === "fulfilled") {
+        const cached = readAdvancedCache(ticker);
+        setAdvanced((prev) => {
+          const merged = mergeAdvancedSnapshot(advancedResult.value, prev, cached);
+          writeAdvancedCache(merged);
+          return merged;
+        });
+      }
       if (indicatorResult.status === "fulfilled") setIndicatorSnapshot(indicatorResult.value);
       if (deepResult.status === "fulfilled") {
         setDeepResearch(deepResult.value);
@@ -1102,6 +1223,8 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
             <span className="muted">{advanced.exchange ?? "-"}</span>
           </div>
           <div className="kpi-grid">
+            <div><p className="muted">Current Price</p><h3>{formatToCents(advanced.current_price)}</h3></div>
+            <div><p className="muted">1D Change</p><h3>{formatPercent(advanced.change_percent)}</h3></div>
             <div><p className="muted">Market Cap</p><h3>{formatCompactNumber(advanced.market_cap)}</h3></div>
             <div><p className="muted">Trailing P/E</p><h3>{formatToCents(advanced.trailing_pe)}</h3></div>
             <div><p className="muted">Forward P/E</p><h3>{formatToCents(advanced.forward_pe)}</h3></div>
@@ -1160,7 +1283,15 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                     {sentimentLabelDetailed(entry.score)} · {sentimentScore100(entry.score)}/100
                   </span>
                 </div>
-                <p>{entry.summary}</p>
+                <div className="source-ai-summary">
+                  {(() => {
+                    const sections = parseSummarySections(entry.summary);
+                    if (sections.length === 0) return <p>{entry.summary}</p>;
+                    return sections.map((section, sectionIdx) =>
+                      renderSummarySection(section, entry.source, sectionIdx)
+                    );
+                  })()}
+                </div>
                 {entry.links.length > 0 ? (
                   <div className="source-citations">
                     {entry.links.slice(0, 4).map((link) => (

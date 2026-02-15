@@ -118,15 +118,25 @@ a {
 .app-shell {
   width: min(1400px, 94vw);
   margin: 22px auto 40px;
+  padding-top: 0;
   position: relative;
   z-index: 1;
 }
 
-.brand-corner,
-.toggle-corner {
-  position: fixed;
-  z-index: 50;
-  pointer-events: auto;
+.top-fixed-controls {
+  position: absolute;
+  top: 12px;
+  left: 0;
+  right: 0;
+  z-index: 10;
+}
+
+.top-fixed-controls-inner {
+  width: min(1400px, 94vw);
+  margin: 0 auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
 }
 
 .account-corner {
@@ -139,16 +149,6 @@ a {
   align-items: flex-start;
   gap: 8px;
   max-width: min(280px, calc(100vw - 30px));
-}
-
-.brand-corner {
-  top: 12px;
-  left: 16px;
-}
-
-.toggle-corner {
-  top: 26px;
-  right: 28px;
 }
 
 .brand-lockup {
@@ -308,6 +308,11 @@ a {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.top-fixed-controls .top-nav-right {
+  width: auto;
+  justify-content: flex-end;
 }
 
 .auth-config-hint {
@@ -477,6 +482,13 @@ a {
   border: 1px solid var(--line);
   background: #0f1d26;
   position: relative;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.avatar-crop-frame.dragging {
+  cursor: grabbing;
 }
 
 .avatar-crop-image {
@@ -1525,6 +1537,10 @@ h1 {
 
 .research-resource-row > .glass-card {
   height: 100%;
+}
+
+.research-resource-row > .glass-card > h3 {
+  margin: 0 0 14px;
 }
 
 .prediction-resource-box {
@@ -3507,6 +3523,14 @@ time {
     width: min(96vw, 100%);
     margin: 8px auto 24px;
     padding-top: 0;
+  }
+
+  .top-fixed-controls {
+    top: 8px;
+  }
+
+  .top-fixed-controls-inner {
+    width: min(96vw, 100%);
   }
 
   .glass-card,
