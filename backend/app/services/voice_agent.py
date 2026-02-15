@@ -13,15 +13,23 @@ from app.config import Settings
 VOICE_SYSTEM_PROMPT = (
     "You are a broker-style voice assistant for TickerMaster. You have access to real market data, "
     "research, sentiment, user profile, watchlist, tracker agents, and simulations via tool calls. "
-    "Always use the appropriate tool to answer; do not invent data. For stock symbols use the exact ticker "
-    "(e.g. AAPL, NVDA). If the user says a company name, call search_tickers first. Keep answers concise "
-    "and natural for voice: 1-3 short sentences unless the user asks for detail. Do not give financial advice; "
-    "frame everything as educational or informational. If a tool fails, say so simply and suggest retrying or rephrasing."
+    "Always use the appropriate tool to answer; do not invent data. You must infer user intent from context and call "
+    "the right tool(s) for broad or specific questions. For stock symbols use the exact ticker (e.g. AAPL, NVDA). "
+    "If the user says a company name, call search_tickers first. If the request is broad (for example market overview, "
+    "macro context, or what changed today), use suitable non-ticker tools such as get_live_commentary, "
+    "get_prediction_markets, get_agents_activity, or get_agent_orchestration_context. "
+    "If a required parameter is missing (for example symbol, session_id, or agent_id), ask one short clarifying question "
+    "instead of guessing. For follow-up questions, use prior conversation context before asking for clarification. "
+    "Keep answers concise and natural for voice: 1-3 short sentences unless the user asks for detail. "
+    "Do not give financial advice; frame everything as educational or informational. "
+    "For requests about agent coordination, compare/choose across multiple agents, or overall strategy status, call "
+    "get_agent_orchestration_context first. If a tool fails, say so simply and suggest retrying or rephrasing."
 )
 
 TIMEFRAME_ENUM = ["24h", "7d", "30d", "90d", "180d", "1y", "2y", "5y", "10y", "max"]
 MAX_TOOL_ROUNDS = 8
 MAX_HISTORY_MESSAGES = 16
+FALLBACK_ELEVEN_LABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 
 
 class VoiceAgentConfigError(RuntimeError):
@@ -30,6 +38,13 @@ class VoiceAgentConfigError(RuntimeError):
 
 class VoiceAgentRuntimeError(RuntimeError):
     pass
+
+
+class _ElevenLabsTTSError(VoiceAgentRuntimeError):
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"ElevenLabs TTS failed: {status_code} ({detail})")
 
 
 def _tool(
@@ -186,6 +201,18 @@ VOICE_AGENT_TOOLS: list[dict[str, Any]] = [
         {
             "agent_id": {"type": "string"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        },
+    ),
+    _tool(
+        "get_agent_orchestration_context",
+        "Fetch a cross-agent snapshot across tracker agents, simulation sessions, and recent activity, then focus on the most relevant agents.",
+        {
+            "query": {"type": "string", "description": "Optional user question or topic for focus ranking."},
+            "include_tracker_details": {"type": "boolean"},
+            "include_simulation_states": {"type": "boolean"},
+            "max_tracker_agents": {"type": "integer", "minimum": 1, "maximum": 8},
+            "max_sessions": {"type": "integer", "minimum": 1, "maximum": 5},
+            "activity_limit": {"type": "integer", "minimum": 1, "maximum": 100},
         },
     ),
     _tool(
@@ -360,6 +387,53 @@ def _output_format_to_mime(output_format: str) -> str:
     return "audio/mpeg"
 
 
+def _extract_response_detail(raw_bytes: bytes) -> str:
+    if not raw_bytes:
+        return "no detail"
+    text = raw_bytes.decode("utf-8", errors="ignore").strip()
+    if not text:
+        return "no detail"
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            detail = payload.get("detail") or payload.get("message") or payload.get("error")
+            if isinstance(detail, str) and detail.strip():
+                return detail.strip()
+    except Exception:
+        pass
+    return text[:200]
+
+
+def _word_tokens(value: str) -> set[str]:
+    cleaned = value.strip().upper().replace(".", "-")
+    if not cleaned:
+        return set()
+    tokens = [token for token in cleaned.replace("/", " ").replace("-", " ").split() if token]
+    return set(tokens)
+
+
+def _focus_score(query_tokens: set[str], *candidates: str) -> int:
+    if not query_tokens:
+        return 0
+    score = 0
+    for candidate in candidates:
+        if not candidate:
+            continue
+        tokens = _word_tokens(candidate)
+        score += len(tokens.intersection(query_tokens))
+        upper_candidate = candidate.upper()
+        if any(token in upper_candidate for token in query_tokens):
+            score += 1
+    return score
+
+
+def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    parsed = _to_int(value, default)
+    if parsed is None:
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
 async def _call_backend_json(
     client: httpx.AsyncClient,
     method: str,
@@ -382,6 +456,163 @@ async def _call_backend_json(
     if "application/json" in content_type:
         return response.json()
     return {"raw": response.text}
+
+
+async def _build_agent_orchestration_context(
+    args: dict[str, Any],
+    backend_client: httpx.AsyncClient,
+    user_headers: dict[str, str],
+) -> dict[str, Any]:
+    query = str(args.get("query") or "").strip()
+    include_tracker_details = bool(args.get("include_tracker_details", True))
+    include_simulation_states = bool(args.get("include_simulation_states", True))
+    max_tracker_agents = _clamp_int(args.get("max_tracker_agents"), 3, 1, 8)
+    max_sessions = _clamp_int(args.get("max_sessions"), 2, 1, 5)
+    activity_limit = _clamp_int(args.get("activity_limit"), 20, 1, 100)
+    headers = user_headers or None
+
+    result: dict[str, Any] = {
+        "query": query,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "tracker_agents_total": 0,
+        "tracker_agents": [],
+        "focused_tracker_agents": [],
+        "simulation_sessions_total": 0,
+        "simulation_sessions": [],
+        "focused_simulation_sessions": [],
+        "recent_activity": [],
+        "errors": [],
+    }
+
+    tracker_agents: list[dict[str, Any]] = []
+    sessions: list[dict[str, Any]] = []
+
+    try:
+        tracker_raw = await _call_backend_json(backend_client, "GET", "/api/tracker/agents", headers=headers)
+        if isinstance(tracker_raw, list):
+            tracker_agents = [row for row in tracker_raw if isinstance(row, dict)]
+        result["tracker_agents_total"] = len(tracker_agents)
+        result["tracker_agents"] = [
+            {
+                "id": row.get("id"),
+                "name": row.get("name"),
+                "symbol": row.get("symbol"),
+                "status": row.get("status"),
+                "auto_simulate": row.get("auto_simulate"),
+            }
+            for row in tracker_agents
+        ]
+    except Exception as exc:
+        result["errors"].append(f"list_tracker_agents: {exc}")
+
+    try:
+        sessions_raw = await _call_backend_json(backend_client, "GET", "/simulation/sessions", headers=headers)
+        if isinstance(sessions_raw, dict):
+            sessions_value = sessions_raw.get("sessions")
+            if isinstance(sessions_value, list):
+                sessions = [row for row in sessions_value if isinstance(row, dict)]
+        elif isinstance(sessions_raw, list):
+            sessions = [row for row in sessions_raw if isinstance(row, dict)]
+        result["simulation_sessions_total"] = len(sessions)
+        result["simulation_sessions"] = [
+            {
+                "session_id": row.get("session_id"),
+                "ticker": row.get("ticker"),
+                "running": row.get("running"),
+                "paused": row.get("paused"),
+                "tick": row.get("tick"),
+                "current_price": row.get("current_price"),
+            }
+            for row in sessions
+        ]
+    except Exception as exc:
+        result["errors"].append(f"list_simulation_sessions: {exc}")
+
+    try:
+        activity_raw = await _call_backend_json(
+            backend_client,
+            "GET",
+            "/api/agents/activity",
+            params={"limit": activity_limit},
+            headers=headers,
+        )
+        if isinstance(activity_raw, dict):
+            items = activity_raw.get("items")
+            if isinstance(items, list):
+                result["recent_activity"] = [item for item in items if isinstance(item, dict)]
+    except Exception as exc:
+        result["errors"].append(f"get_agents_activity: {exc}")
+
+    query_tokens = _word_tokens(query)
+    if tracker_agents:
+        ranked_tracker = sorted(
+            tracker_agents,
+            key=lambda row: (
+                _focus_score(query_tokens, str(row.get("symbol") or ""), str(row.get("name") or "")),
+                1 if str(row.get("status") or "").lower() == "active" else 0,
+            ),
+            reverse=True,
+        )
+        selected_tracker = ranked_tracker[:max_tracker_agents]
+        if include_tracker_details:
+            focused_tracker: list[dict[str, Any]] = []
+            for row in selected_tracker:
+                agent_id = str(row.get("id") or "").strip()
+                if not agent_id:
+                    continue
+                try:
+                    detail = await _call_backend_json(
+                        backend_client,
+                        "GET",
+                        f"/api/tracker/agents/{quote(agent_id, safe='')}/detail",
+                        headers=headers,
+                    )
+                    if isinstance(detail, dict):
+                        focused_tracker.append(detail)
+                except Exception:
+                    try:
+                        fallback = await _call_backend_json(
+                            backend_client,
+                            "GET",
+                            f"/api/tracker/agents/{quote(agent_id, safe='')}",
+                            headers=headers,
+                        )
+                        focused_tracker.append({"agent": fallback} if isinstance(fallback, dict) else {"agent": row})
+                    except Exception as exc:
+                        result["errors"].append(f"get_tracker_agent({agent_id}): {exc}")
+            result["focused_tracker_agents"] = focused_tracker
+
+    if sessions:
+        ranked_sessions = sorted(
+            sessions,
+            key=lambda row: _focus_score(
+                query_tokens,
+                str(row.get("ticker") or ""),
+                str(row.get("session_id") or ""),
+            ),
+            reverse=True,
+        )
+        selected_sessions = ranked_sessions[:max_sessions]
+        if include_simulation_states:
+            focused_sessions: list[dict[str, Any]] = []
+            for row in selected_sessions:
+                session_id = str(row.get("session_id") or "").strip()
+                if not session_id:
+                    continue
+                try:
+                    state = await _call_backend_json(
+                        backend_client,
+                        "GET",
+                        f"/simulation/state/{quote(session_id, safe='')}",
+                        headers=headers,
+                    )
+                    if isinstance(state, dict):
+                        focused_sessions.append(state)
+                except Exception as exc:
+                    result["errors"].append(f"get_simulation_state({session_id}): {exc}")
+            result["focused_simulation_sessions"] = focused_sessions
+
+    return result
 
 
 async def _execute_tool(
@@ -627,6 +858,9 @@ async def _execute_tool(
                 params=params or None,
                 headers=headers,
             )
+
+        if name == "get_agent_orchestration_context":
+            return await _build_agent_orchestration_context(args, backend_client, user_headers)
 
         if name == "start_simulation":
             body: dict[str, Any] = {}
@@ -939,7 +1173,6 @@ async def synthesize_speech_with_elevenlabs(
         raise VoiceAgentRuntimeError("Cannot synthesize empty response")
 
     output_format = settings.eleven_labs_tts_output_format
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{quote(settings.eleven_labs_voice_id, safe='')}/stream"
     headers = {
         "xi-api-key": settings.eleven_labs_api_key,
         "Content-Type": "application/json",
@@ -949,25 +1182,52 @@ async def synthesize_speech_with_elevenlabs(
         "model_id": settings.eleven_labs_tts_model,
     }
 
-    chunks: list[bytes] = []
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        async with client.stream(
-            "POST",
-            url,
-            params={"output_format": output_format},
-            json=payload,
-            headers=headers,
-        ) as response:
-            if response.is_error:
-                raise VoiceAgentRuntimeError(f"ElevenLabs TTS failed: {response.status_code}")
-            async for chunk in response.aiter_bytes():
-                if chunk:
-                    chunks.append(chunk)
+    configured_voice = (settings.eleven_labs_voice_id or "").strip()
+    voices_to_try: list[str] = []
+    if configured_voice:
+        voices_to_try.append(configured_voice)
+    if FALLBACK_ELEVEN_LABS_VOICE_ID not in voices_to_try:
+        voices_to_try.append(FALLBACK_ELEVEN_LABS_VOICE_ID)
 
-    audio_bytes = b"".join(chunks)
-    if not audio_bytes:
-        raise VoiceAgentRuntimeError("ElevenLabs TTS returned empty audio")
-    return audio_bytes, _output_format_to_mime(output_format)
+    last_error: Exception | None = None
+    for index, voice_id in enumerate(voices_to_try):
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{quote(voice_id, safe='')}/stream"
+        chunks: list[bytes] = []
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                async with client.stream(
+                    "POST",
+                    url,
+                    params={"output_format": output_format},
+                    json=payload,
+                    headers=headers,
+                ) as response:
+                    if response.is_error:
+                        detail = _extract_response_detail(await response.aread())
+                        raise _ElevenLabsTTSError(response.status_code, detail)
+                    async for chunk in response.aiter_bytes():
+                        if chunk:
+                            chunks.append(chunk)
+        except _ElevenLabsTTSError as exc:
+            last_error = exc
+            is_last = index == len(voices_to_try) - 1
+            # Fallback on voice-specific failures for non-final attempts.
+            if not is_last and exc.status_code in {400, 402, 403, 404, 422}:
+                continue
+            raise VoiceAgentRuntimeError(str(exc))
+        except Exception as exc:
+            last_error = exc
+            raise VoiceAgentRuntimeError(f"ElevenLabs TTS request error: {exc}") from exc
+
+        audio_bytes = b"".join(chunks)
+        if not audio_bytes:
+            last_error = VoiceAgentRuntimeError("ElevenLabs TTS returned empty audio")
+            continue
+        return audio_bytes, _output_format_to_mime(output_format)
+
+    if last_error:
+        raise VoiceAgentRuntimeError(str(last_error))
+    raise VoiceAgentRuntimeError("ElevenLabs TTS failed: unknown error")
 
 
 async def run_voice_agent_turn(

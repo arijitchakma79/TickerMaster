@@ -104,6 +104,10 @@ class Settings:
     twilio_auth_token: str = ""
     twilio_phone_number: str = ""
     twilio_phone_number_sid: str = ""
+    twilio_broker_greeting_text: str = (
+        "TickerMaster trading desk here. Ask me anything about markets, research, trackers, or simulations. "
+        "When you are done speaking, pause for a second."
+    )
 
     perplexity_api_key: str = ""
     perplexity_model: str = "sonar"
@@ -180,6 +184,11 @@ def get_settings() -> Settings:
         twilio_auth_token=_env("TWILIO_AUTH_TOKEN"),
         twilio_phone_number=_env("TWILIO_PHONE_NUMBER"),
         twilio_phone_number_sid=_env("TWILIO_PHONE_NUMBER_SID"),
+        twilio_broker_greeting_text=_env(
+            "TWILIO_BROKER_GREETING_TEXT",
+            "TickerMaster trading desk here. Ask me anything about markets, research, trackers, or simulations. "
+            "When you are done speaking, pause for a second.",
+        ),
         perplexity_api_key=_env("PERPLEXITY_API_KEY"),
         perplexity_model=_env("PERPLEXITY_MODEL", "sonar"),
         x_api_bearer_token=_env("X_API_BEARER_TOKEN") or _env("X_BEARER_TOKEN"),
