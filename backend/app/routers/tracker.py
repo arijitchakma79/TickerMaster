@@ -98,8 +98,27 @@ def _sanitize_tracker_triggers(raw: dict[str, Any] | None) -> dict[str, Any]:
 
 
 @router.get("/snapshot")
-async def snapshot(request: Request):
+async def snapshot(request: Request, tickers: str | None = None):
+    explicit: list[str] = []
+    if isinstance(tickers, str) and tickers.strip():
+        seen: set[str] = set()
+        for raw in tickers.split(","):
+            symbol = raw.strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            explicit.append(symbol)
+        explicit = explicit[:120]
+
     user_id = get_user_id_from_request(request)
+    if explicit:
+        metrics = await asyncio.to_thread(fetch_watchlist_metrics, explicit)
+        alerts = tracker_repo.list_alerts(user_id=user_id, limit=8) if user_id else []
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "tickers": [item.model_dump() for item in metrics],
+            "alerts_triggered": alerts,
+        }
     if user_id:
         watchlist = get_persisted_watchlist(user_id)
         metrics = await asyncio.to_thread(fetch_watchlist_metrics, watchlist) if watchlist else []

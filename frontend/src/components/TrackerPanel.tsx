@@ -102,16 +102,28 @@ export default function TrackerPanel({
   const [contextLoadingAgentId, setContextLoadingAgentId] = useState<string | null>(null);
 
   useEffect(() => {
-    getTrackerSnapshot().then(setSnapshot).catch(() => null);
     void listTrackerAgents()
       .then((items) => setAgents(items))
       .catch(() => setAgents([]));
   }, []);
 
   useEffect(() => {
+    let active = true;
+    void getTrackerSnapshot(watchlist)
+      .then((next) => {
+        if (!active) return;
+        setSnapshot(next);
+      })
+      .catch(() => null);
+    return () => {
+      active = false;
+    };
+  }, [watchlist]);
+
+  useEffect(() => {
     if (!trackerEvent || trackerEvent.type !== "tracker_snapshot") return;
     let active = true;
-    void getTrackerSnapshot()
+    void getTrackerSnapshot(watchlist)
       .then((next) => {
         if (!active) return;
         setSnapshot(next);
@@ -229,8 +241,8 @@ export default function TrackerPanel({
 
     setLoading(true);
     try {
-      await onWatchlistChange([...watchlist, resolvedTicker]);
-      const refreshed = await getTrackerSnapshot();
+      const updatedWatchlist = await onWatchlistChange([...watchlist, resolvedTicker]);
+      const refreshed = await getTrackerSnapshot(updatedWatchlist);
       setSnapshot(refreshed);
       onTickerChange(resolvedTicker);
       setWatchlistInput("");
@@ -243,7 +255,7 @@ export default function TrackerPanel({
   async function handlePoll() {
     setLoading(true);
     try {
-      const refreshed = await getTrackerSnapshot();
+      const refreshed = await getTrackerSnapshot(watchlist);
       setSnapshot(refreshed);
     } finally {
       setLoading(false);
@@ -354,7 +366,7 @@ export default function TrackerPanel({
           : undefined;
       const delivered = Boolean(twilioInfo?.delivered);
       const twilioError = typeof twilioInfo?.error === "string" ? twilioInfo.error : "";
-      const [freshAgents, refreshed] = await Promise.all([listTrackerAgents(), getTrackerSnapshot().catch(() => null)]);
+      const [freshAgents, refreshed] = await Promise.all([listTrackerAgents(), getTrackerSnapshot(watchlist).catch(() => null)]);
       setAgents(freshAgents);
       if (refreshed) setSnapshot(refreshed);
       setCreateModalOpen(false);
@@ -423,7 +435,7 @@ export default function TrackerPanel({
       }));
       setInstructionDraft("");
       setInstructionModalAgentId(null);
-      const refreshed = await getTrackerSnapshot().catch(() => null);
+      const refreshed = await getTrackerSnapshot(watchlist).catch(() => null);
       if (refreshed) setSnapshot(refreshed);
     } catch (error) {
       setInstructionError(error instanceof Error ? error.message : "Manager interaction failed.");
@@ -518,8 +530,8 @@ export default function TrackerPanel({
   async function handleRemoveWatchlistTicker(symbol: string) {
     setLoading(true);
     try {
-      await onWatchlistChange(watchlist.filter((tickerSymbol) => tickerSymbol !== symbol));
-      const refreshed = await getTrackerSnapshot();
+      const updatedWatchlist = await onWatchlistChange(watchlist.filter((tickerSymbol) => tickerSymbol !== symbol));
+      const refreshed = await getTrackerSnapshot(updatedWatchlist);
       setSnapshot(refreshed);
     } finally {
       setLoading(false);

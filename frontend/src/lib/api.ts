@@ -413,8 +413,9 @@ export async function triggerTrackerPoll(): Promise<TrackerSnapshot> {
   return data;
 }
 
-export async function getTrackerSnapshot(): Promise<TrackerSnapshot> {
-  const { data } = await client.get<TrackerSnapshot>("/tracker/snapshot");
+export async function getTrackerSnapshot(tickers?: string[]): Promise<TrackerSnapshot> {
+  const params = Array.isArray(tickers) && tickers.length > 0 ? { tickers: tickers.join(",") } : undefined;
+  const { data } = await client.get<TrackerSnapshot>("/tracker/snapshot", { params });
   return data;
 }
 
