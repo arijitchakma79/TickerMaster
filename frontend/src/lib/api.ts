@@ -39,6 +39,9 @@ export type AuthSession = {
 const AUTH_STORAGE_KEY = "tickermaster-auth-session";
 const SUPABASE_URL = trimTrailingSlashes(import.meta.env.VITE_SUPABASE_URL ?? "");
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY ?? "";
+const DEMO_AUTH_BYPASS = (import.meta.env.VITE_DEMO_AUTH_BYPASS ?? "true").toLowerCase() !== "false";
+const DEMO_USER_ID = "00000000-0000-4000-8000-000000000001";
+const DEMO_ACCESS_TOKEN = "demo-auth-token";
 
 function trimTrailingSlashes(value: string) {
   return value.replace(/\/+$/, "");
@@ -189,7 +192,7 @@ client.interceptors.request.use((config) => {
 });
 
 export const getApiUrl = () => API_URL;
-export const isAuthConfigured = () => Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+export const isAuthConfigured = () => DEMO_AUTH_BYPASS || Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 export const getAuthSession = () => authSession;
 export const subscribeAuthSession = (callback: (session: AuthSession | null) => void) => {
   authSubscribers.add(callback);
@@ -244,7 +247,24 @@ function toAuthSession(payload: Record<string, unknown>): AuthSession | null {
   };
 }
 
+function demoSession(email: string): AuthSession {
+  const normalizedEmail = email.trim() || "demo@tickermaster.local";
+  return {
+    access_token: DEMO_ACCESS_TOKEN,
+    refresh_token: undefined,
+    user: {
+      id: DEMO_USER_ID,
+      email: normalizedEmail
+    }
+  };
+}
+
 export async function signInWithPassword(email: string, password: string): Promise<AuthSession> {
+  if (DEMO_AUTH_BYPASS) {
+    const session = demoSession(email);
+    setAuthSession(session);
+    return session;
+  }
   const payload = await callSupabaseAuth("token?grant_type=password", { email, password });
   const session = toAuthSession(payload);
   if (!session) throw new Error("Sign-in succeeded but no usable session was returned.");
@@ -253,6 +273,11 @@ export async function signInWithPassword(email: string, password: string): Promi
 }
 
 export async function signUpWithPassword(email: string, password: string): Promise<AuthSession | null> {
+  if (DEMO_AUTH_BYPASS) {
+    const session = demoSession(email);
+    setAuthSession(session);
+    return session;
+  }
   const payload = await callSupabaseAuth("signup", { email, password });
   const session = toAuthSession(payload);
   if (session) setAuthSession(session);
