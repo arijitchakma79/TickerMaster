@@ -226,6 +226,20 @@ export interface TrackerAgentInteractResponse {
   };
 }
 
+export interface VoiceHistoryMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface VoiceTurnResponse {
+  transcript: string;
+  response: string;
+  audio_base64: string;
+  audio_mime_type: string;
+  model: string;
+  generated_at: string;
+}
+
 export interface AgentConfig {
   name: string;
   personality: "quant_momentum" | "fundamental_value" | "retail_reactive";

@@ -17,6 +17,8 @@ import type {
   TrackerAgentDetail,
   TrackerAgentInteractResponse,
   SimulationState,
+  VoiceHistoryMessage,
+  VoiceTurnResponse,
   TickerLookup,
   TrackerSnapshot
 } from "./types";
@@ -622,6 +624,17 @@ export async function askResearchQuery(payload: {
         ? lastError
         : new Error("Research chat request failed.");
   }
+}
+
+export async function runVoiceTurn(audio: Blob, history: VoiceHistoryMessage[]): Promise<VoiceTurnResponse> {
+  const payload = new FormData();
+  payload.append("audio", audio, "utterance.webm");
+  payload.append("history", JSON.stringify(history));
+
+  const { data } = await client.post<VoiceTurnResponse>("/api/voice/turn", payload, {
+    timeout: 120000,
+  });
+  return data;
 }
 
 export async function createTrackerAgent(payload: {

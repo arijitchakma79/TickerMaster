@@ -11,6 +11,7 @@ import ResearchPanel from "./components/ResearchPanel";
 import SimulationPanel from "./components/SimulationPanel";
 import TrackerPrefsRail from "./components/TrackerPrefsRail";
 import TrackerPanel from "./components/TrackerPanel";
+import VoiceBrokerPanel from "./components/VoiceBrokerPanel";
 import {
   getAuthSession,
   getFavoriteStocks,
@@ -900,6 +901,8 @@ export default function App() {
         </main>
       )}
 
+      {hasWorkbenchAccess ? <VoiceBrokerPanel activeTicker={ticker} /> : null}
+
       {workspaceLoading ? (
         <div className="app-loading-overlay" role="status" aria-live="polite">
           <div className="app-loading-card">Loading your workspace...</div>
@@ -999,7 +1002,6 @@ export default function App() {
           </div>
         </div>
       ) : null}
-
       {usernameSetupOpen ? (
         <div className="auth-modal-backdrop">
           <div

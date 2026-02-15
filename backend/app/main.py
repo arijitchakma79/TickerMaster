@@ -8,7 +8,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import api, chat, research, simulation, system, tracker
+from app.routers import api, chat, research, simulation, system, tracker, twilio, voice
 from app.services.activity_stream import set_ws_manager
 from app.services.simulation import SimulationOrchestrator
 from app.services.tracker import TrackerService
@@ -53,6 +53,8 @@ app.include_router(research.router)
 app.include_router(simulation.router)
 app.include_router(tracker.router)
 app.include_router(chat.router)
+app.include_router(voice.router)
+app.include_router(twilio.router)
 
 
 @app.websocket("/ws/stream")
