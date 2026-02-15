@@ -171,11 +171,28 @@ async def research_chat(payload: ResearchChatRequest, request: Request):
 
     ticker = (resolved_ticker or "AAPL").upper().strip()
 
-    research_payload = await run_research(
-        ResearchRequest(ticker=ticker, timeframe=timeframe, include_prediction_markets=True),
-        settings,
-    )
-    deep_payload = await run_deep_research(ticker, settings) if payload.include_deep else None
+    # Try to use cached research first for faster responses
+    cache_key = f"research:v8:{timeframe}:1"
+    cached = get_cached_research(ticker, cache_key)
+    research_payload = None
+    context_refreshed = False
+
+    if cached:
+        # Use cached research data
+        from app.schemas import ResearchResponse
+        research_payload = ResearchResponse(**cached)
+    else:
+        # No cache - run research (but skip prediction markets for chat to be faster)
+        research_payload = await run_research(
+            ResearchRequest(ticker=ticker, timeframe=timeframe, include_prediction_markets=False),
+            settings,
+        )
+        context_refreshed = True
+
+    # Only run deep research if explicitly requested
+    deep_payload = None
+    if payload.include_deep:
+        deep_payload = await run_deep_research(ticker, settings)
 
     context = {
         "ticker": ticker,
@@ -206,7 +223,7 @@ async def research_chat(payload: ResearchChatRequest, request: Request):
             response=str(out.get("response") or "").strip() or f"No response generated for {ticker}.",
             model=str(out.get("model") or "gpt-4o-mini"),
             generated_at=str(out.get("generated_at") or datetime.now(timezone.utc).isoformat()),
-            context_refreshed=True,
+            context_refreshed=context_refreshed,
             sources=list(dict.fromkeys(source_labels)),
         )
 
@@ -216,7 +233,7 @@ async def research_chat(payload: ResearchChatRequest, request: Request):
         response=fallback_text,
         model="research-context-template",
         generated_at=datetime.now(timezone.utc).isoformat(),
-        context_refreshed=True,
+        context_refreshed=context_refreshed,
         sources=source_labels,
     )
 

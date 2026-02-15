@@ -493,9 +493,15 @@ export async function runDeepResearch(ticker: string): Promise<DeepResearchRespo
   const endpoints = [`/research/deep/${symbol}`, `/api/research/deep/${symbol}`];
   let lastError: unknown = null;
 
+  // Deep research can take longer - use extended timeout (2 minutes)
+  const deepResearchClient = axios.create({
+    baseURL: API_URL,
+    timeout: 120000,
+  });
+
   for (const endpoint of endpoints) {
     try {
-      const { data } = await client.post<DeepResearchResponse>(endpoint);
+      const { data } = await deepResearchClient.post<DeepResearchResponse>(endpoint);
       return data;
     } catch (error) {
       lastError = error;

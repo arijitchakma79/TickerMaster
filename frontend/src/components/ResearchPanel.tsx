@@ -36,6 +36,8 @@ interface Props {
 }
 
 const ADVANCED_CACHE_STORAGE_KEY = "tickermaster-advanced-cache-v1";
+const RESEARCH_CACHE_STORAGE_KEY = "tickermaster-research-cache-v1";
+const RESEARCH_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
 function normalizeSymbol(value: string) {
   return value.trim().toUpperCase().replace(/\./g, "-");
@@ -565,6 +567,51 @@ function writeAdvancedCache(snapshot: AdvancedStockData) {
   }
 }
 
+interface CachedResearch {
+  data: ResearchResponse;
+  timestamp: number;
+  timeframe: string;
+}
+
+function readResearchCache(
+  symbol: string,
+  timeframe: string,
+): ResearchResponse | null {
+  try {
+    const raw = window.localStorage.getItem(RESEARCH_CACHE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Record<string, CachedResearch>;
+    const item = parsed[symbol];
+    if (!item || typeof item !== "object") return null;
+    // Check if cache is still valid (same timeframe and not expired)
+    if (item.timeframe !== timeframe) return null;
+    if (Date.now() - item.timestamp > RESEARCH_CACHE_TTL_MS) return null;
+    return item.data;
+  } catch {
+    return null;
+  }
+}
+
+function writeResearchCache(
+  symbol: string,
+  timeframe: string,
+  data: ResearchResponse,
+) {
+  try {
+    const raw = window.localStorage.getItem(RESEARCH_CACHE_STORAGE_KEY);
+    const parsed = raw
+      ? (JSON.parse(raw) as Record<string, CachedResearch>)
+      : {};
+    parsed[symbol] = { data, timestamp: Date.now(), timeframe };
+    window.localStorage.setItem(
+      RESEARCH_CACHE_STORAGE_KEY,
+      JSON.stringify(parsed),
+    );
+  } catch {
+    // no-op
+  }
+}
+
 export default function ResearchPanel({
   activeTicker,
   onTickerChange,
@@ -694,6 +741,16 @@ export default function ResearchPanel({
     setInsiderPage(1);
   }, [activeTicker]);
 
+  // Load cached research immediately on mount/ticker change for instant display
+  useEffect(() => {
+    const normalized = activeTicker.trim().toUpperCase();
+    if (!normalized) return;
+    const cachedResearch = readResearchCache(normalized, timeframe);
+    if (cachedResearch) {
+      setResearch(cachedResearch);
+    }
+  }, [activeTicker, timeframe]);
+
   useEffect(() => {
     const normalized = activeTicker.trim().toUpperCase();
     if (!normalized) return;
@@ -792,10 +849,9 @@ export default function ResearchPanel({
     };
   }, [normalizedTicker]);
 
-  async function handleAnalyze(rawInput?: string) {
+  async function handleAnalyze(rawInput?: string, forceRefresh = false) {
     setShowDeepResearch(false);
     setDeepResearch(null);
-    setLoading(true);
     setError("");
     const seed = rawInput ?? tickerInput;
     const ticker = resolveTickerCandidate(seed, tickerSuggestions);
@@ -808,6 +864,44 @@ export default function ResearchPanel({
     setTickerInputFocused(false);
     autoAnalyzedTickerRef.current = ticker;
     onTickerChange(ticker);
+
+    // Check cache first (unless force refresh requested)
+    if (!forceRefresh) {
+      const cachedResearch = readResearchCache(ticker, timeframe);
+      if (cachedResearch) {
+        setResearch(cachedResearch);
+        // Still fetch other data (candles, advanced, indicators) but don't re-run research
+        setLoading(true);
+        try {
+          const [chartResult, advancedResult, indicatorResult] =
+            await Promise.allSettled([
+              fetchCandles(ticker, chartPeriod, chartInterval, true),
+              fetchAdvancedSnapshotWithQuoteFallback(ticker),
+              fetchIndicatorSnapshot(ticker, chartPeriod, chartInterval),
+            ]);
+          if (chartResult.status === "fulfilled") setCandles(chartResult.value);
+          if (advancedResult.status === "fulfilled") {
+            const cached = readAdvancedCache(ticker);
+            setAdvanced((prev) => {
+              const merged = mergeAdvancedSnapshot(
+                advancedResult.value,
+                prev,
+                cached,
+              );
+              writeAdvancedCache(merged);
+              return merged;
+            });
+          }
+          if (indicatorResult.status === "fulfilled")
+            setIndicatorSnapshot(indicatorResult.value);
+        } finally {
+          setLoading(false);
+        }
+        return;
+      }
+    }
+
+    setLoading(true);
     const runNonce = runNonceRef.current + 1;
     runNonceRef.current = runNonce;
     try {
@@ -823,6 +917,8 @@ export default function ResearchPanel({
         throw analysisResult.reason;
       }
       setResearch(analysisResult.value);
+      // Write to cache
+      writeResearchCache(ticker, timeframe, analysisResult.value);
       if (chartResult.status === "fulfilled") setCandles(chartResult.value);
       if (advancedResult.status === "fulfilled") {
         const cached = readAdvancedCache(ticker);
@@ -865,25 +961,29 @@ export default function ResearchPanel({
     onTickerChange(ticker);
     const runNonce = runNonceRef.current + 1;
     runNonceRef.current = runNonce;
+
+    // Use cached research if available (deep research endpoint also runs research internally)
+    const cachedResearch = readResearchCache(ticker, timeframe);
+    if (cachedResearch) {
+      setResearch(cachedResearch);
+    }
+
     try {
+      // Don't run regular research here - deep research endpoint does it internally
+      // This prevents running research twice and speeds up the process
       const [
-        analysisResult,
         chartResult,
         advancedResult,
         indicatorResult,
         deepResult,
       ] = await Promise.allSettled([
-        runResearch(ticker, timeframe),
         fetchCandles(ticker, chartPeriod, chartInterval, true),
         fetchAdvancedSnapshotWithQuoteFallback(ticker),
         fetchIndicatorSnapshot(ticker, chartPeriod, chartInterval),
         runDeepResearch(ticker),
       ]);
       if (runNonce !== runNonceRef.current) return;
-      if (analysisResult.status === "rejected") {
-        throw analysisResult.reason;
-      }
-      setResearch(analysisResult.value);
+
       if (chartResult.status === "fulfilled") setCandles(chartResult.value);
       if (advancedResult.status === "fulfilled") {
         const cached = readAdvancedCache(ticker);
@@ -901,6 +1001,17 @@ export default function ResearchPanel({
         setIndicatorSnapshot(indicatorResult.value);
       if (deepResult.status === "fulfilled") {
         setDeepResearch(deepResult.value);
+        // If we didn't have cached research, run it now (but deep research already did it internally)
+        if (!cachedResearch) {
+          // Fetch fresh research since deep research ran it
+          try {
+            const freshResearch = await runResearch(ticker, timeframe);
+            setResearch(freshResearch);
+            writeResearchCache(ticker, timeframe, freshResearch);
+          } catch {
+            // Ignore - we still have deep research results
+          }
+        }
       } else {
         setError(
           deepResult.reason instanceof Error
@@ -1467,7 +1578,7 @@ export default function ResearchPanel({
           </div>
         </label>
         <div className="research-action-buttons">
-          <button onClick={() => void handleAnalyze()} disabled={loading}>
+          <button onClick={() => void handleAnalyze(undefined, true)} disabled={loading}>
             {loading ? "Analyzing…" : "Run Research"}
           </button>
           <button

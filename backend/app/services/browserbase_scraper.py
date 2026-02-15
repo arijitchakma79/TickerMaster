@@ -10,6 +10,7 @@ from app.config import Settings
 from app.schemas import ResearchRequest
 from app.services.agent_logger import log_agent_activity
 from app.services.market_data import fetch_advanced_stock_data
+from app.services.research_cache import get_cached_research
 from app.services.sentiment import run_research
 
 
@@ -276,10 +277,21 @@ async def run_deep_research(symbol: str, settings: Settings) -> Dict[str, Any]:
     target_task = asyncio.to_thread(_price_target, settings, ticker)
     news_task = asyncio.to_thread(_company_news, settings, ticker)
     reddit_task = _reddit_highlights(ticker, settings.reddit_user_agent)
-    research_task = run_research(
-        ResearchRequest(ticker=ticker, timeframe="30d", include_prediction_markets=True),
-        settings,
-    )
+
+    # Check for cached research first to speed up deep research
+    cache_key = "research:v8:30d:1"
+    cached_research = get_cached_research(ticker, cache_key)
+
+    async def get_research():
+        if cached_research:
+            from app.schemas import ResearchResponse
+            return ResearchResponse(**cached_research)
+        return await run_research(
+            ResearchRequest(ticker=ticker, timeframe="30d", include_prediction_markets=True),
+            settings,
+        )
+
+    research_task = get_research()
 
     advanced_res, timeline_res, target_res, news_res, reddit_res, research_res = await asyncio.gather(
         advanced_task,
