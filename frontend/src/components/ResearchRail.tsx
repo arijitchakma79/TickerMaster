@@ -54,7 +54,7 @@ export default function ResearchRail({ connected, activeTicker, onTickerSelect, 
     void loadMovers();
     const interval = window.setInterval(() => {
       void loadMovers();
-    }, 45000);
+    }, 60 * 60 * 1000);
 
     return () => {
       active = false;

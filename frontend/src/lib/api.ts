@@ -4,6 +4,7 @@ import type {
   AgentActivity,
   AdvancedStockData,
   AgentConfig,
+  SimulationAgentEntry,
   CandlePoint,
   DeepResearchResponse,
   IndicatorSnapshot,
@@ -370,6 +371,22 @@ export async function getSimulationState(sessionId: string): Promise<SimulationS
 export async function getSimulationSessions() {
   const { data } = await client.get<{ sessions: SimulationState[] }>("/simulation/sessions");
   return data.sessions;
+}
+
+export async function getSimulationAgents(): Promise<SimulationAgentEntry[]> {
+  const { data } = await client.get<{ agents?: SimulationAgentEntry[] }>("/simulation/agents");
+  return Array.isArray(data.agents) ? data.agents : [];
+}
+
+export async function setSimulationAgents(agents: SimulationAgentEntry[]): Promise<SimulationAgentEntry[]> {
+  const { data } = await client.put<{ agents?: SimulationAgentEntry[] }>("/simulation/agents", { agents });
+  return Array.isArray(data.agents) ? data.agents : [];
+}
+
+export async function deleteSimulationAgent(agentName: string): Promise<SimulationAgentEntry[]> {
+  const safeName = encodeURIComponent(agentName);
+  const { data } = await client.delete<{ agents?: SimulationAgentEntry[] }>(`/simulation/agents/${safeName}`);
+  return Array.isArray(data.agents) ? data.agents : [];
 }
 
 export async function triggerTrackerPoll(): Promise<TrackerSnapshot> {
