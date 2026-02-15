@@ -23,7 +23,6 @@ import { useSocket } from "./hooks/useSocket";
 import brandLogo from "./images/TickerMaster.png";
 import moonIcon from "./images/moon.png";
 import sunIcon from "./images/sun.png";
-import wallStreetVideo from "../videoplayback (1).mp4";
 
 type Tab = "research" | "simulation" | "tracker";
 type Theme = "light" | "dark";
@@ -35,6 +34,8 @@ type UserProfile = {
   require_username_setup?: boolean;
   username_locked?: boolean;
 };
+const LANDING_VIDEO_SRC = "/videoplayback (1).mp4";
+
 function tabFromQuery(): Tab {
   const params = new URLSearchParams(window.location.search);
   const value = params.get("tab");
@@ -498,7 +499,7 @@ export default function App() {
               preload="auto"
             >
               <source
-                src={wallStreetVideo}
+                src={LANDING_VIDEO_SRC}
                 type="video/mp4"
               />
             </video>
