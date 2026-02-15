@@ -438,6 +438,7 @@ export default function SimulationPanel({
   const [modalSandboxError, setModalSandboxError] = useState("");
   const [promptInferredTickers, setPromptInferredTickers] = useState<string[]>([]);
   const [sessionStartError, setSessionStartError] = useState("");
+  const activeSessionId = session?.session_id ?? null;
 
   useEffect(() => {
     const symbol = activeTicker.trim().toUpperCase();
@@ -487,23 +488,23 @@ export default function SimulationPanel({
 
   useEffect(() => {
     if (!simulationEvent || simulationEvent.type !== "tick") return;
-    if (!session || simulationEvent.session_id !== session.session_id) return;
+    if (!activeSessionId || simulationEvent.session_id !== activeSessionId) return;
 
-    const nextTick = Number(simulationEvent.tick ?? session.tick);
-    const nextPrice = Number(simulationEvent.price ?? session.current_price);
+    const nextTick = Number(simulationEvent.tick ?? 0);
+    const nextPrice = Number(simulationEvent.price ?? 0);
 
     setPriceSeries((prev) => [...prev, { tick: nextTick, price: nextPrice }].slice(-200));
 
     setSession((prev) => {
-      if (!prev) return prev;
+      if (!prev || simulationEvent.session_id !== prev.session_id) return prev;
       return {
         ...prev,
-        tick: nextTick,
-        current_price: nextPrice,
+        tick: Number.isFinite(nextTick) && nextTick > 0 ? nextTick : prev.tick,
+        current_price: Number.isFinite(nextPrice) && nextPrice > 0 ? nextPrice : prev.current_price,
         tickers: Array.isArray(simulationEvent.tickers) ? (simulationEvent.tickers as string[]) : prev.tickers,
         market_prices:
           (simulationEvent.market_prices as SimulationState["market_prices"]) ?? prev.market_prices,
-        paused: false,
+        paused: prev.paused,
         crash_mode: Boolean(simulationEvent.crash_mode),
         recent_news: Array.isArray(simulationEvent.news) ? (simulationEvent.news as string[]) : prev.recent_news,
         order_book:
@@ -516,7 +517,7 @@ export default function SimulationPanel({
         ].slice(0, 120)
       };
     });
-  }, [simulationEvent, session]);
+  }, [simulationEvent, activeSessionId]);
 
   async function generateAutoCommentary(reason: "completed" | "stopped", state: SimulationState) {
     setAutoCommentaryLoading(true);
@@ -1156,7 +1157,7 @@ export default function SimulationPanel({
           {sessionStartError ? <p className="error">{sessionStartError}</p> : null}
           {modalSandboxResult?.dashboard_url ? (
             <a href={modalSandboxResult.dashboard_url} target="_blank" rel="noreferrer">
-              Open Modal App Dashboard
+              Open Modal Sandbox
             </a>
           ) : null}
         </div>

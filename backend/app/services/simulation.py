@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Deque, Dict, List, Tuple
-from xml.etree import ElementTree as ET
 
 import httpx
 import numpy as np
@@ -531,21 +530,24 @@ class SimulationOrchestrator:
             return []
 
         try:
-            async with httpx.AsyncClient(timeout=6.0) as client:
+            async with httpx.AsyncClient(timeout=6.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
                 response = await client.get(
-                    "https://feeds.finance.yahoo.com/rss/2.0/headline",
-                    params={"s": symbol, "region": "US", "lang": "en-US"},
+                    "https://query1.finance.yahoo.com/v1/finance/search",
+                    params={"q": symbol, "newsCount": 8, "quotesCount": 0},
                 )
                 if response.status_code in {404, 429}:
                     return []
                 response.raise_for_status()
-                root = ET.fromstring(response.text)
+                payload = response.json()
         except Exception:
             return []
 
         out: List[Dict[str, Any]] = []
-        for item in root.findall(".//item")[:6]:
-            headline = str(item.findtext("title") or "").strip()
+        items = payload.get("news", []) if isinstance(payload, dict) else []
+        for item in items[:6]:
+            if not isinstance(item, dict):
+                continue
+            headline = str(item.get("title") or "").strip()
             if not headline:
                 continue
             out.append(
@@ -553,7 +555,7 @@ class SimulationOrchestrator:
                     "ticker": symbol,
                     "headline": headline,
                     "source": "Yahoo",
-                    "published_at": self._parse_news_timestamp(item.findtext("pubDate")),
+                    "published_at": self._parse_news_timestamp(item.get("providerPublishTime")),
                 }
             )
         return out
@@ -589,6 +591,10 @@ class SimulationOrchestrator:
                 continue
             title = str(post.get("title") or "").strip()
             if not title:
+                continue
+            text_blob = f"{title} {str(post.get('selftext') or '')}".upper()
+            symbol_pattern = re.compile(rf"(^|[^A-Z0-9])\$?{re.escape(symbol)}([^A-Z0-9]|$)")
+            if not symbol_pattern.search(text_blob):
                 continue
             subreddit = str(post.get("subreddit") or "").strip()
             headline = f"r/{subreddit}: {title}" if subreddit else title
@@ -716,55 +722,91 @@ class SimulationOrchestrator:
             return []
 
         endpoint = f"{self.settings.polymarket_gamma_url.rstrip('/')}/markets"
-        params = {"limit": 12, "closed": "false", "search": symbol}
-        try:
-            async with httpx.AsyncClient(timeout=6.0) as client:
-                response = await client.get(endpoint, params=params)
-                if response.status_code in {404, 429}:
-                    return []
-                response.raise_for_status()
-                payload = response.json()
-        except Exception:
-            return []
+        finance_keywords = {
+            "stock",
+            "stocks",
+            "market",
+            "nasdaq",
+            "s&p",
+            "earnings",
+            "fed",
+            "inflation",
+            "rate",
+            "recession",
+            "economy",
+            "treasury",
+            "etf",
+            "option",
+        }
 
-        items = payload if isinstance(payload, list) else payload.get("data", []) if isinstance(payload, dict) else []
-        out: List[Dict[str, Any]] = []
-        for item in items[:6]:
-            if not isinstance(item, dict):
-                continue
-            question = str(item.get("question") or item.get("title") or "").strip()
-            if not question:
-                continue
+        def parse_items(items: List[Any], *, require_symbol: bool) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for item in items[:8]:
+                if not isinstance(item, dict):
+                    continue
+                question = str(item.get("question") or item.get("title") or "").strip()
+                if not question:
+                    continue
 
-            probability = self._safe_float(item.get("probability"))
-            if probability is None:
-                outcomes = item.get("outcomePrices")
-                if isinstance(outcomes, list) and outcomes:
-                    probability = self._safe_float(outcomes[0])
-            if probability is not None and probability > 1:
-                probability = probability / 100.0
+                lower_question = question.lower()
+                upper_question = question.upper()
+                has_finance_signal = any(keyword in lower_question for keyword in finance_keywords)
+                has_symbol = symbol in upper_question
+                if require_symbol and not has_symbol:
+                    continue
+                if not has_symbol and not has_finance_signal:
+                    continue
 
-            volume = self._safe_float(item.get("volumeNum") or item.get("volume"))
+                probability = self._safe_float(item.get("probability"))
+                if probability is None:
+                    outcomes = item.get("outcomePrices")
+                    if isinstance(outcomes, list) and outcomes:
+                        probability = self._safe_float(outcomes[0])
+                if probability is not None and probability > 1:
+                    probability = probability / 100.0
 
-            headline = question
-            if probability is not None and 0 <= probability <= 1:
-                headline = f"{headline} (yes {probability * 100:.0f}%)"
-            if volume is not None and volume > 0:
-                headline = f"{headline} | vol {volume:,.0f}"
+                volume = self._safe_float(item.get("volumeNum") or item.get("volume"))
+                headline = question
+                if probability is not None and 0 <= probability <= 1:
+                    headline = f"{headline} (yes {probability * 100:.0f}%)"
+                if volume is not None and volume > 0:
+                    headline = f"{headline} | vol {volume:,.0f}"
 
-            out.append(
-                {
-                    "ticker": symbol,
-                    "headline": headline,
-                    "source": "Polymarket",
-                    "published_at": self._parse_news_timestamp(item.get("updatedAt") or item.get("createdAt")),
-                }
-            )
-        return out
+                out.append(
+                    {
+                        "ticker": symbol,
+                        "headline": headline,
+                        "source": "Polymarket",
+                        "published_at": self._parse_news_timestamp(item.get("updatedAt") or item.get("createdAt")),
+                    }
+                )
+            return out
+
+        async def fetch(search: str) -> List[Any]:
+            try:
+                async with httpx.AsyncClient(timeout=6.0) as client:
+                    response = await client.get(endpoint, params={"limit": 12, "closed": "false", "search": search})
+                    if response.status_code in {404, 429}:
+                        return []
+                    response.raise_for_status()
+                    payload = response.json()
+            except Exception:
+                return []
+
+            data = payload if isinstance(payload, list) else payload.get("data", []) if isinstance(payload, dict) else []
+            return data if isinstance(data, list) else []
+
+        ticker_items = await fetch(symbol)
+        ticker_news = parse_items(ticker_items, require_symbol=True)
+        if ticker_news:
+            return ticker_news
+
+        market_items = await fetch("stock market")
+        return parse_items(market_items, require_symbol=False)
 
     async def _fetch_multi_source_news(self, runtime: SessionRuntime, *, include_perplexity: bool) -> List[Dict[str, Any]]:
         focus_ticker = self._next_focus_ticker(runtime)
-        tasks: List[asyncio.Future] = [
+        tasks: List[Any] = [
             self._fetch_yahoo_news(focus_ticker),
             self._fetch_reddit_news(focus_ticker),
             self._fetch_x_news(focus_ticker),
@@ -830,7 +872,11 @@ class SimulationOrchestrator:
             except asyncio.TimeoutError:
                 external_news = []
 
+            seen_sources: set[str] = set()
             for item in external_news:
+                source_name = str(item.get("source") or "").strip().lower()
+                if source_name and source_name in seen_sources and len(seen_sources) < 3:
+                    continue
                 if self._record_news_event(
                     runtime,
                     ticker=str(item.get("ticker") or runtime.ticker),
@@ -839,6 +885,8 @@ class SimulationOrchestrator:
                     published_at=item.get("published_at"),
                 ):
                     added += 1
+                    if source_name:
+                        seen_sources.add(source_name)
                 if added >= 4:
                     break
 
