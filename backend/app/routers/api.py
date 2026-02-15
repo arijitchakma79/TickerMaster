@@ -30,14 +30,28 @@ from app.schemas import SimulationStartRequest
 
 router = APIRouter(prefix="/api", tags=["api"])
 
+_SYMBOL_PATTERN = r"^[A-Za-z0-9.\-]{1,12}$"
+_AUTH_REQUIRED_DETAIL = "Authentication required"
+
+
+def _resolve_user_id(request: Request, explicit_user_id: str | None = None) -> str | None:
+    return explicit_user_id or get_user_id_from_request(request)
+
+
+def _require_user_id(request: Request, explicit_user_id: str | None = None) -> str:
+    user_id = _resolve_user_id(request, explicit_user_id=explicit_user_id)
+    if not user_id:
+        raise HTTPException(status_code=401, detail=_AUTH_REQUIRED_DETAIL)
+    return user_id
+
 
 class PokeInboundRequest(BaseModel):
     message: str
 
 
 class TrackerAgentCreateRequest(BaseModel):
-    symbol: str
-    name: str
+    symbol: str = Field(min_length=1, max_length=12, pattern=_SYMBOL_PATTERN)
+    name: str = Field(min_length=1, max_length=120)
     triggers: dict[str, Any] = Field(default_factory=dict)
     auto_simulate: bool = False
 
@@ -50,8 +64,8 @@ class TrackerAgentPatchRequest(BaseModel):
 
 
 class TrackerEmitAlertRequest(BaseModel):
-    symbol: str
-    trigger_reason: str
+    symbol: str = Field(min_length=1, max_length=12, pattern=_SYMBOL_PATTERN)
+    trigger_reason: str = Field(min_length=1, max_length=400)
     narrative: str | None = None
     market_snapshot: dict[str, Any] = Field(default_factory=dict)
     investigation_data: dict[str, Any] = Field(default_factory=dict)
@@ -61,12 +75,12 @@ class TrackerEmitAlertRequest(BaseModel):
 
 
 class TrackerNLCreateRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(min_length=1, max_length=2000)
     user_id: str | None = None
 
 
 class TrackerAgentInteractRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=3000)
     user_id: str | None = None
 
 
@@ -177,7 +191,7 @@ async def ticker_quote(symbol: str) -> dict[str, Any]:
 @router.get("/ticker/{symbol}/ai-research")
 async def ticker_ai_research(symbol: str, request: Request, timeframe: str = "7d") -> dict[str, Any]:
     frame = normalize_timeframe(timeframe)
-    cache_key = f"ai_research:{frame}:15m"
+    cache_key = f"ai_research:{frame}:24h"
     cached = get_cached_research(symbol, cache_key)
     if cached:
         return cached
@@ -191,7 +205,7 @@ async def ticker_ai_research(symbol: str, request: Request, timeframe: str = "7d
         "citations": [link.model_dump() for link in data.tool_links],
         "recommendation": data.recommendation,
     }
-    set_cached_research(symbol, cache_key, payload, ttl_minutes=15)
+    set_cached_research(symbol, cache_key, payload, ttl_minutes=24 * 60)
     return payload
 
 
@@ -258,14 +272,55 @@ async def ticker_full(symbol: str, request: Request, timeframe: str = "7d") -> d
     macro_task = get_macro_indicators(settings)
     deep_task = run_deep_research(symbol, settings)
 
-    metric, research, macro, deep = await asyncio.gather(metric_task, research_task, macro_task, deep_task)
+    metric_out, research_out, macro_out, deep_out = await asyncio.gather(
+        metric_task,
+        research_task,
+        macro_task,
+        deep_task,
+        return_exceptions=True,
+    )
+    metric_payload: dict[str, Any] | None = None
+    if isinstance(metric_out, Exception):
+        last = get_cached_research(symbol, "quote:last")
+        if last:
+            metric_payload = {**last, "stale": True, "provider_error": str(metric_out)}
+    else:
+        metric_payload = metric_out.model_dump()
+        set_cached_research(symbol, "quote:last", metric_payload, ttl_minutes=24 * 60)
+
+    if isinstance(research_out, Exception):
+        research_payload: dict[str, Any] = {
+            "ticker": symbol.upper(),
+            "timeframe": frame,
+            "aggregate_sentiment": 0.0,
+            "recommendation": "neutral",
+            "narratives": ["Research provider temporarily unavailable."],
+            "source_breakdown": [],
+            "prediction_markets": [],
+            "tool_links": [],
+            "provider_error": str(research_out),
+        }
+    else:
+        research_payload = research_out.model_dump()
+
+    macro_payload = (
+        {"provider_error": str(macro_out)}
+        if isinstance(macro_out, Exception)
+        else macro_out
+    )
+    deep_payload = (
+        {"provider_error": str(deep_out)}
+        if isinstance(deep_out, Exception)
+        else deep_out
+    )
+
     payload = {
         "symbol": symbol.upper(),
         "timeframe": frame,
-        "quote": metric.model_dump(),
-        "research": research.model_dump(),
-        "macro": macro,
-        "deep_research": deep,
+        "quote": metric_payload,
+        "research": research_payload,
+        "macro": macro_payload,
+        "deep_research": deep_payload,
         "last_updated": datetime.now(timezone.utc).isoformat(),
     }
     set_cached_research(symbol, cache_key, payload, ttl_minutes=5)
@@ -280,9 +335,7 @@ async def deep_research(symbol: str, request: Request) -> dict[str, Any]:
 
 @router.post("/tracker/agents")
 async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Request, user_id: str | None = None) -> dict[str, Any]:
-    resolved_user_id = user_id or get_user_id_from_request(request)
-    # Prioritize authenticated/explicit user id for FK-safe persistence.
-    # Query param fallback retained for local testing.
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     agent = tracker_repo.create_agent(
         user_id=resolved_user_id,
         symbol=payload.symbol,
@@ -308,13 +361,13 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
 
 @router.get("/tracker/agents")
 async def list_tracker_agents(request: Request, user_id: str | None = None) -> list[dict[str, Any]]:
-    resolved_user_id = user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     return tracker_repo.list_agents(user_id=resolved_user_id)
 
 
 @router.patch("/tracker/agents/{agent_id}")
 async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, request: Request, user_id: str | None = None) -> dict[str, Any]:
-    resolved_user_id = user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     updates = payload.model_dump(exclude_none=True)
     if "triggers" in updates and isinstance(updates.get("triggers"), dict):
         updates["triggers"] = sanitize_tracker_triggers(updates["triggers"])
@@ -339,7 +392,7 @@ async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, 
 
 @router.get("/tracker/agents/{agent_id}")
 async def get_tracker_agent(agent_id: str, request: Request, user_id: str | None = None) -> dict[str, Any]:
-    resolved_user_id = user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     item = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -348,7 +401,7 @@ async def get_tracker_agent(agent_id: str, request: Request, user_id: str | None
 
 @router.get("/tracker/agents/{agent_id}/detail")
 async def get_tracker_agent_detail(agent_id: str, request: Request, user_id: str | None = None) -> dict[str, Any]:
-    resolved_user_id = user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     agent = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -386,7 +439,7 @@ async def get_tracker_agent_detail(agent_id: str, request: Request, user_id: str
 
 @router.delete("/tracker/agents/{agent_id}")
 async def delete_tracker_agent(agent_id: str, request: Request, user_id: str | None = None) -> dict[str, Any]:
-    resolved_user_id = user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     existing = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     ok = tracker_repo.delete_agent(user_id=resolved_user_id, agent_id=agent_id)
     if ok:
@@ -407,7 +460,7 @@ async def delete_tracker_agent(agent_id: str, request: Request, user_id: str | N
 
 @router.post("/tracker/agents/nl-create")
 async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Request) -> dict[str, Any]:
-    resolved_user_id = payload.user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=payload.user_id)
     settings = request.app.state.settings
     parsed = await parse_tracker_instruction(settings, payload.prompt)
 
@@ -441,7 +494,7 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
 
 @router.post("/tracker/agents/{agent_id}/interact")
 async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractRequest, request: Request) -> dict[str, Any]:
-    resolved_user_id = payload.user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=payload.user_id)
     agent = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if agent is None:
         return {"ok": False, "error": "not_found"}
@@ -570,19 +623,20 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
 
 @router.get("/tracker/alerts")
 async def list_tracker_alerts(request: Request, user_id: str | None = None, agent_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
-    resolved_user_id = user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     return tracker_repo.list_alerts(user_id=resolved_user_id, agent_id=agent_id, limit=min(max(limit, 1), 100))
 
 
 @router.post("/tracker/emit-alert")
 async def emit_tracker_alert(payload: TrackerEmitAlertRequest, request: Request) -> dict[str, Any]:
+    resolved_user_id = _require_user_id(request, explicit_user_id=payload.user_id)
     row = tracker_repo.create_alert(
         symbol=payload.symbol,
         trigger_reason=payload.trigger_reason,
         narrative=payload.narrative,
         market_snapshot=payload.market_snapshot,
         investigation_data=payload.investigation_data,
-        user_id=payload.user_id,
+        user_id=resolved_user_id,
         agent_id=payload.agent_id,
         simulation_id=payload.simulation_id,
     )

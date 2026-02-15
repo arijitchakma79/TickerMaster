@@ -4,17 +4,28 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
 
+from app.services.database import get_supabase
+
 router = APIRouter(tags=["system"])
 
 
 @router.get("/health")
 async def health(request: Request):
     settings = request.app.state.settings
+    db_ok = False
+    client = get_supabase()
+    if client is not None:
+        try:
+            client.table("profiles").select("id").limit(1).execute()
+            db_ok = True
+        except Exception:
+            db_ok = False
     return {
         "ok": True,
         "status": "ok",
         "app": settings.app_name,
         "environment": settings.environment,
+        "dependencies": {"database": "ok" if db_ok else "degraded"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

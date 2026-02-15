@@ -165,13 +165,13 @@ async def modal_cron_health(settings: Settings) -> Dict[str, Any]:
     if not _modal_sdk_available():
         return {
             "status": "missing_dependency",
-            "message": "Modal credentials are loaded, but the Modal SDK is missing in the running backend environment.",
+            "message": "Cloud sandbox runtime is temporarily unavailable.",
             "polling_interval_seconds": settings.tracker_poll_interval_seconds,
             "app_name": settings.modal_simulation_app_name,
             "sdk_available": False,
             "inference_function_name": settings.modal_inference_function_name,
             "inference_timeout_seconds": settings.modal_inference_timeout_seconds,
-            "install_hint": "Install backend deps (`pip install -r backend/requirements.txt`) and restart backend.",
+            "install_hint": "Cloud sandbox runtime is unavailable. Local simulation mode remains available.",
         }
     return {
         "status": "configured",

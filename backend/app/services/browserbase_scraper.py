@@ -10,6 +10,7 @@ from app.config import Settings
 from app.schemas import ResearchRequest
 from app.services.agent_logger import log_agent_activity
 from app.services.market_data import fetch_advanced_stock_data
+from app.services.reddit_client import reddit_search_posts
 from app.services.research_cache import get_cached_research
 from app.services.sentiment import run_research
 
@@ -112,21 +113,22 @@ def _company_news(settings: Settings, ticker: str) -> list[dict[str, Any]]:
     return [item for item in out if item.get("headline")]
 
 
-async def _reddit_highlights(ticker: str, user_agent: str) -> Tuple[list[dict[str, Any]], str]:
-    headers = {"User-Agent": user_agent or "TickerMaster/1.0"}
-    params = {"q": ticker, "restrict_sr": "false", "sort": "new", "t": "month", "limit": 12}
-    try:
-        async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
-            resp = await client.get("https://www.reddit.com/search.json", params=params)
-            resp.raise_for_status()
-            children = resp.json().get("data", {}).get("children", [])
-    except Exception:
-        return [], f"Reddit discussions for {ticker} unavailable from public endpoint."
+async def _reddit_highlights(ticker: str, settings: Settings) -> Tuple[list[dict[str, Any]], str]:
+    children = await reddit_search_posts(
+        settings,
+        query=ticker,
+        sort="new",
+        timeframe="month",
+        limit=12,
+        timeout_seconds=15.0,
+    )
+    if not children:
+        return [], f"Reddit discussions for {ticker} unavailable from API."
 
     highlights: list[dict[str, Any]] = []
     for child in children:
-        row = child.get("data", {}) if isinstance(child, dict) else {}
-        if not isinstance(row, dict):
+        row = child if isinstance(child, dict) else {}
+        if not row:
             continue
         title = str(row.get("title") or "").strip()
         if not title:
@@ -276,7 +278,7 @@ async def run_deep_research(symbol: str, settings: Settings) -> Dict[str, Any]:
     timeline_task = asyncio.to_thread(_recommendation_timeline, settings, ticker)
     target_task = asyncio.to_thread(_price_target, settings, ticker)
     news_task = asyncio.to_thread(_company_news, settings, ticker)
-    reddit_task = _reddit_highlights(ticker, settings.reddit_user_agent)
+    reddit_task = _reddit_highlights(ticker, settings)
 
     # Check for cached research first to speed up deep research
     cache_key = "research:v8:30d:1"

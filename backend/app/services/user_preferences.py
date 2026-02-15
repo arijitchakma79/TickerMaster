@@ -40,14 +40,31 @@ def get_watchlist(user_id: str) -> list[str]:
 
 def set_watchlist(user_id: str, symbols: List[str]) -> list[str]:
     clean = _clean_symbols(symbols)
+    target = set(clean)
     client = get_supabase()
     if client is None:
         return clean
     try:
-        client.table("watchlist").delete().eq("user_id", user_id).execute()
-        inserts = [{"user_id": user_id, "symbol": symbol} for symbol in clean]
-        if inserts:
-            client.table("watchlist").insert(inserts).execute()
+        if clean:
+            upserts = [{"user_id": user_id, "symbol": symbol} for symbol in clean]
+            client.table("watchlist").upsert(upserts, on_conflict="user_id,symbol").execute()
+        rows = (
+            client.table("watchlist")
+            .select("symbol")
+            .eq("user_id", user_id)
+            .execute()
+            .data
+            or []
+        )
+        stale = [
+            str(row.get("symbol") or "").upper().strip()
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("symbol") or "").upper().strip()
+            and str(row.get("symbol") or "").upper().strip() not in target
+        ]
+        for symbol in stale:
+            client.table("watchlist").delete().eq("user_id", user_id).eq("symbol", symbol).execute()
     except Exception:
         return get_watchlist(user_id)
     return clean
@@ -74,14 +91,31 @@ def get_favorites(user_id: str) -> list[str]:
 
 def set_favorites(user_id: str, symbols: List[str]) -> list[str]:
     clean = _clean_symbols(symbols)
+    target = set(clean)
     client = get_supabase()
     if client is None:
         return clean
     try:
-        client.table("favorite_stocks").delete().eq("user_id", user_id).execute()
-        inserts = [{"user_id": user_id, "symbol": symbol} for symbol in clean]
-        if inserts:
-            client.table("favorite_stocks").insert(inserts).execute()
+        if clean:
+            upserts = [{"user_id": user_id, "symbol": symbol} for symbol in clean]
+            client.table("favorite_stocks").upsert(upserts, on_conflict="user_id,symbol").execute()
+        rows = (
+            client.table("favorite_stocks")
+            .select("symbol")
+            .eq("user_id", user_id)
+            .execute()
+            .data
+            or []
+        )
+        stale = [
+            str(row.get("symbol") or "").upper().strip()
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("symbol") or "").upper().strip()
+            and str(row.get("symbol") or "").upper().strip() not in target
+        ]
+        for symbol in stale:
+            client.table("favorite_stocks").delete().eq("user_id", user_id).eq("symbol", symbol).execute()
     except Exception:
         return get_favorites(user_id)
     return clean

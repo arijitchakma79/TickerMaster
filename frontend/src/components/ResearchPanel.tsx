@@ -1874,18 +1874,43 @@ export default function ResearchPanel({
                     })()}
                   </div>
                   {entry.links.length > 0 ? (
-                    <div className="source-citations">
-                      {entry.links.slice(0, 4).map((link) => (
-                        <a
-                          key={`${entry.source}-right-${link.url}`}
-                          href={link.url}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          {displayLinkLabel(link.title, link.url)}
-                        </a>
-                      ))}
-                    </div>
+                    entry.source === "X API" ? (
+                      <div className="x-posts-block">
+                        <p className="muted" style={{ margin: "8px 0 6px" }}>
+                          Top X Posts
+                        </p>
+                        <ul className="x-post-links">
+                          {entry.links.slice(0, 5).map((link) => (
+                            <li key={`${entry.source}-right-${link.url}`}>
+                              <a
+                                className="x-post-link"
+                                href={link.url}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                <span className="x-post-link-title">
+                                  {displayLinkLabel(link.title, link.url)}
+                                </span>
+                                <span className="x-post-link-open">Open</span>
+                              </a>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : (
+                      <div className="source-citations">
+                        {entry.links.slice(0, 4).map((link) => (
+                          <a
+                            key={`${entry.source}-right-${link.url}`}
+                            href={link.url}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            {displayLinkLabel(link.title, link.url)}
+                          </a>
+                        ))}
+                      </div>
+                    )
                   ) : null}
                 </article>
               ))}

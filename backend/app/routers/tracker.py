@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.schemas import AlertConfig, TrackerWatchlistRequest
@@ -15,11 +15,19 @@ from app.services.user_preferences import get_watchlist as get_persisted_watchli
 from app.services.user_preferences import set_watchlist as set_persisted_watchlist
 
 router = APIRouter(prefix="/tracker", tags=["tracker"])
+_SYMBOL_PATTERN = r"^[A-Za-z0-9.\-]{1,12}$"
+
+
+def _require_user_id(request: Request, explicit_user_id: str | None = None) -> str:
+    resolved = explicit_user_id or get_user_id_from_request(request)
+    if not resolved:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return resolved
 
 
 class TrackerAgentCreateRequest(BaseModel):
-    symbol: str
-    name: str
+    symbol: str = Field(min_length=1, max_length=12, pattern=_SYMBOL_PATTERN)
+    name: str = Field(min_length=1, max_length=120)
     triggers: dict[str, Any] = Field(default_factory=dict)
     auto_simulate: bool = False
 
@@ -32,13 +40,61 @@ class TrackerAgentPatchRequest(BaseModel):
 
 
 class TrackerEmitAlertRequest(BaseModel):
-    symbol: str
-    trigger_reason: str
+    symbol: str = Field(min_length=1, max_length=12, pattern=_SYMBOL_PATTERN)
+    trigger_reason: str = Field(min_length=1, max_length=400)
     narrative: str | None = None
     market_snapshot: dict[str, Any] = Field(default_factory=dict)
     investigation_data: dict[str, Any] = Field(default_factory=dict)
     user_id: str | None = None
     agent_id: str | None = None
+
+
+def _normalize_timeframe(value: str | None) -> str:
+    if not value:
+        return "7d"
+    raw = value.strip().lower()
+    aliases = {
+        "1d": "24h",
+        "24hr": "24h",
+        "24hrs": "24h",
+        "day": "24h",
+        "week": "7d",
+        "1w": "7d",
+        "month": "30d",
+        "1m": "30d",
+        "3m": "90d",
+        "6m": "180d",
+        "year": "1y",
+        "12m": "1y",
+    }
+    canonical = aliases.get(raw, raw)
+    allowed = {"24h", "7d", "30d", "60d", "90d", "180d", "1y", "2y", "5y", "10y", "max"}
+    return canonical if canonical in allowed else "7d"
+
+
+def _sanitize_tracker_triggers(raw: dict[str, Any] | None) -> dict[str, Any]:
+    raw = raw or {}
+    out: dict[str, Any] = {}
+
+    def _num(key: str, default: float, low: float, high: float) -> float:
+        value = raw.get(key, default)
+        if isinstance(value, bool):
+            return default
+        try:
+            parsed = float(value)
+        except Exception:
+            parsed = default
+        return max(low, min(high, parsed))
+
+    out["price_change_pct"] = _num("price_change_pct", 2.0, 0.1, 25.0)
+    out["volume_spike_ratio"] = _num("volume_spike_ratio", 1.8, 1.0, 10.0)
+    out["sentiment_bearish_threshold"] = _num("sentiment_bearish_threshold", -0.25, -1.0, 0.2)
+    out["sentiment_bullish_threshold"] = _num("sentiment_bullish_threshold", 0.25, -0.2, 1.0)
+    out["x_bearish_threshold"] = _num("x_bearish_threshold", -0.25, -1.0, 0.2)
+
+    if "research_timeframe" in raw and isinstance(raw.get("research_timeframe"), str):
+        out["research_timeframe"] = _normalize_timeframe(str(raw["research_timeframe"]))
+    return out
 
 
 @router.get("/snapshot")
@@ -97,44 +153,48 @@ async def poll_now(request: Request):
 
 @router.post("/agents")
 async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Request, user_id: str | None = None):
-    resolved_user_id = user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     return tracker_repo.create_agent(
         user_id=resolved_user_id,
         symbol=payload.symbol,
         name=payload.name,
-        triggers=payload.triggers,
+        triggers=_sanitize_tracker_triggers(payload.triggers),
         auto_simulate=payload.auto_simulate,
     )
 
 
 @router.get("/agents")
 async def list_tracker_agents(request: Request, user_id: str | None = None):
-    resolved_user_id = user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     return tracker_repo.list_agents(user_id=resolved_user_id)
 
 
 @router.patch("/agents/{agent_id}")
 async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, request: Request, user_id: str | None = None):
     resolved_user_id = user_id or get_user_id_from_request(request)
-    item = tracker_repo.update_agent(user_id=resolved_user_id, agent_id=agent_id, updates=payload.model_dump(exclude_none=True))
+    updates = payload.model_dump(exclude_none=True)
+    if "triggers" in updates and isinstance(updates.get("triggers"), dict):
+        updates["triggers"] = _sanitize_tracker_triggers(updates["triggers"])
+    item = tracker_repo.update_agent(user_id=resolved_user_id, agent_id=agent_id, updates=updates)
     return item or {"error": "not_found"}
 
 
 @router.delete("/agents/{agent_id}")
 async def delete_tracker_agent(agent_id: str, request: Request, user_id: str | None = None):
-    resolved_user_id = user_id or get_user_id_from_request(request)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     return {"ok": tracker_repo.delete_agent(user_id=resolved_user_id, agent_id=agent_id)}
 
 
 @router.post("/emit-alert")
 async def emit_alert(payload: TrackerEmitAlertRequest, request: Request):
+    resolved_user_id = _require_user_id(request, explicit_user_id=payload.user_id)
     row = tracker_repo.create_alert(
         symbol=payload.symbol,
         trigger_reason=payload.trigger_reason,
         narrative=payload.narrative,
         market_snapshot=payload.market_snapshot,
         investigation_data=payload.investigation_data,
-        user_id=payload.user_id,
+        user_id=resolved_user_id,
         agent_id=payload.agent_id,
     )
     manager = request.app.state.ws_manager

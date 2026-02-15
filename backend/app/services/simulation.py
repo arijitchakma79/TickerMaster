@@ -17,6 +17,7 @@ from app.schemas import AgentConfig, SimulationStartRequest, SimulationState, Tr
 from app.services.agent_logger import log_agent_activity
 from app.services.llm import generate_agent_decision
 from app.services.market_data import fetch_sp500_returns_window
+from app.services.reddit_client import reddit_search_posts
 from app.services.simulation_store import complete_simulation_record, create_simulation_record
 from app.ws_manager import WSManager
 
@@ -581,28 +582,16 @@ class SimulationOrchestrator:
         if not symbol:
             return []
 
-        headers = {"User-Agent": self.settings.reddit_user_agent or "TickerMaster/1.0"}
-        params = {
-            "q": f"${symbol} OR {symbol} stock",
-            "restrict_sr": "false",
-            "sort": "new",
-            "t": "day",
-            "limit": 8,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=6.0, headers=headers) as client:
-                response = await client.get("https://www.reddit.com/search.json", params=params)
-                if response.status_code in {403, 429}:
-                    return []
-                response.raise_for_status()
-                payload = response.json()
-        except Exception:
-            return []
-
-        children = payload.get("data", {}).get("children", []) if isinstance(payload, dict) else []
+        children = await reddit_search_posts(
+            self.settings,
+            query=f"${symbol} OR {symbol} stock",
+            sort="new",
+            timeframe="day",
+            limit=8,
+            timeout_seconds=6.0,
+        )
         out: List[Dict[str, Any]] = []
-        for child in children[:6]:
-            post = child.get("data", {}) if isinstance(child, dict) else {}
+        for post in children[:6]:
             if not isinstance(post, dict):
                 continue
             title = str(post.get("title") or "").strip()

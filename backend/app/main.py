@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -13,6 +14,8 @@ from app.services.activity_stream import set_ws_manager
 from app.services.simulation import SimulationOrchestrator
 from app.services.tracker import TrackerService
 from app.ws_manager import WSManager
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -28,12 +31,19 @@ async def lifespan(app: FastAPI):
     app.state.tracker = tracker_service
     set_ws_manager(ws_manager)
 
-    await tracker_service.start()
+    try:
+        await tracker_service.start()
+    except Exception:
+        logger.exception("Failed to start tracker service")
 
-    yield
-
-    for session in list(orchestrator.sessions):
-        await orchestrator.stop(session)
+    try:
+        yield
+    finally:
+        for session_id in list(orchestrator.sessions.keys()):
+            try:
+                await orchestrator.stop(session_id)
+            except Exception:
+                logger.exception("Failed to stop simulation session %s", session_id)
 
 
 settings = get_settings()
@@ -43,8 +53,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.frontend_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-User-Id"],
 )
 
 app.include_router(system.router)
@@ -57,8 +67,10 @@ app.include_router(chat.router)
 
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
+    allowed_channels = {"global", "simulation", "tracker", "agents"}
     channels_param = websocket.query_params.get("channels", "global,simulation,tracker")
-    channels = {channel.strip() for channel in channels_param.split(",") if channel.strip()}
+    requested_channels = {channel.strip() for channel in channels_param.split(",") if channel.strip()}
+    channels = {channel for channel in requested_channels if channel in allowed_channels} or {"global"}
 
     manager: WSManager = websocket.app.state.ws_manager
     await manager.connect(websocket, channels=channels)
@@ -89,6 +101,7 @@ async def websocket_stream(websocket: WebSocket):
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
     except Exception:
+        logger.exception("Unhandled websocket stream error")
         await manager.disconnect(websocket)
 
 
