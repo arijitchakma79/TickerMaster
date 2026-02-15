@@ -24,6 +24,7 @@ export default function TrackerPanel({
   onWatchlistChange,
   onToggleFavorite
 }: Props) {
+  const [infoOpen, setInfoOpen] = useState(false);
   const [watchlistInput, setWatchlistInput] = useState("");
   const [watchlistInputFocused, setWatchlistInputFocused] = useState(false);
   const [watchlistSuggestions, setWatchlistSuggestions] = useState<TickerLookup[]>([]);
@@ -136,12 +137,34 @@ export default function TrackerPanel({
   }
 
   function handleRemoveWatchlistTicker(symbol: string) {
-    if (watchlist.length <= 1) return;
     void onWatchlistChange(watchlist.filter((tickerSymbol) => tickerSymbol !== symbol));
   }
 
   return (
     <section className="panel stack stagger">
+      <header className="panel-header">
+        <div className="panel-title-row">
+          <h2>Tracker</h2>
+          <button type="button" className="panel-info-btn" onClick={() => setInfoOpen(true)} aria-label="Tracker panel info">
+            i
+          </button>
+        </div>
+        <p>Real-time ticker monitor with valuation metrics, alerting, and live anomaly detection pipeline.</p>
+      </header>
+      {infoOpen ? (
+        <div className="panel-info-backdrop" onClick={() => setInfoOpen(false)}>
+          <div className="panel-info-modal" onClick={(event) => event.stopPropagation()}>
+            <h3>Tracker</h3>
+            <p>Monitor your personalized watchlist and trigger alerts on market moves.</p>
+            <ul>
+              <li>Add tickers to your watchlist and pin favorites.</li>
+              <li>Set threshold alerts and direction for quick signal monitoring.</li>
+              <li>Use refresh to force a fresh market snapshot when needed.</li>
+            </ul>
+            <button className="secondary" onClick={() => setInfoOpen(false)}>Close</button>
+          </div>
+        </div>
+      ) : null}
       <WatchlistBar
         watchlist={watchlist}
         activeTicker={activeTicker}

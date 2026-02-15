@@ -6,9 +6,11 @@ import type {
   AgentConfig,
   CandlePoint,
   DeepResearchResponse,
+  IndicatorSnapshot,
   MarketMetric,
   ModalCronHealthResponse,
   ModalSandboxResponse,
+  ResearchChatResponse,
   ResearchResponse,
   TrackerAgent,
   TrackerAgentDetail,
@@ -223,12 +225,19 @@ export async function runResearch(ticker: string, timeframe = "7d"): Promise<Res
   return data;
 }
 
-export async function fetchCandles(ticker: string, period = "3mo", interval = "1d") {
+export async function fetchCandles(ticker: string, period = "3mo", interval = "1d", refresh = false) {
   const { data } = await client.get<{ ticker: string; points: CandlePoint[] }>(
     `/research/candles/${ticker}`,
-    { params: { period, interval } }
+    { params: { period, interval, refresh } }
   );
   return data.points;
+}
+
+export async function fetchIndicatorSnapshot(ticker: string, period = "6mo", interval = "1d"): Promise<IndicatorSnapshot> {
+  const { data } = await client.get<IndicatorSnapshot>(`/research/indicators/${ticker}`, {
+    params: { period, interval }
+  });
+  return data;
 }
 
 export async function fetchAdvancedStockData(ticker: string): Promise<AdvancedStockData> {
@@ -390,6 +399,96 @@ export async function getModalCronHealth(): Promise<ModalCronHealthResponse> {
 export async function runDeepResearch(ticker: string): Promise<DeepResearchResponse> {
   const { data } = await client.post<DeepResearchResponse>(`/research/deep/${ticker}`);
   return data;
+}
+
+export async function askResearchQuery(payload: {
+  prompt: string;
+  ticker?: string;
+  timeframe?: string;
+  include_deep?: boolean;
+  auto_fetch_if_missing?: boolean;
+}): Promise<ResearchChatResponse> {
+  const candidates = new Set<string>();
+  candidates.add("/api/research/chat");
+  candidates.add("/research/chat");
+  candidates.add("/chat/research-query");
+  candidates.add("/api/chat/research-query");
+
+  try {
+    const url = new URL(API_URL);
+    const basePath = trimTrailingSlashes(url.pathname || "");
+    const altPort = url.port === "8000" ? "8010" : url.port === "8010" ? "8000" : "";
+    const origins = new Set<string>([url.origin]);
+    if (altPort) {
+      origins.add(`${url.protocol}//${url.hostname}:${altPort}`);
+    }
+
+    if (basePath && basePath !== "/") {
+      for (const origin of origins) {
+        candidates.add(`${origin}${basePath}/api/research/chat`);
+        candidates.add(`${origin}${basePath}/research/chat`);
+        candidates.add(`${origin}${basePath}/chat/research-query`);
+        candidates.add(`${origin}${basePath}/api/chat/research-query`);
+      }
+    }
+    for (const origin of origins) {
+      candidates.add(`${origin}/api/research/chat`);
+      candidates.add(`${origin}/research/chat`);
+      candidates.add(`${origin}/chat/research-query`);
+      candidates.add(`${origin}/api/chat/research-query`);
+    }
+  } catch {
+    // API_URL can be relative in some setups.
+  }
+
+  const attempted: string[] = [];
+  let last404: unknown = null;
+
+  for (const endpoint of candidates) {
+    attempted.push(endpoint);
+    try {
+      const { data } = await client.post<ResearchChatResponse>(endpoint, payload);
+      return data;
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.status === 404) {
+        last404 = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  if (last404) {
+    // Final fallback: use existing research endpoints so chat never hard-fails on route mismatches.
+    const ticker = (payload.ticker || "AAPL").toUpperCase().trim();
+    const timeframe = payload.timeframe || "7d";
+    try {
+      const { data } = await client.get<{
+        ticker?: string;
+        summary?: string;
+        recommendation?: string;
+      }>(`/api/ticker/${ticker}/ai-research`, { params: { timeframe } });
+      const summary = (data.summary || "").trim();
+      const recommendation = data.recommendation ? `Recommendation: ${data.recommendation}.` : "";
+      return {
+        ticker: ticker,
+        response:
+          summary ||
+          `I couldn't reach the dedicated chat endpoint, but I pulled the latest ${ticker} research context. ${recommendation}`,
+        model: "research-fallback",
+        generated_at: new Date().toISOString(),
+        context_refreshed: true,
+        sources: ["fallback_ai_research_endpoint"],
+      };
+    } catch {
+      throw new Error(
+        `Research chat endpoint returned 404 for all known routes. Tried: ${attempted.join(", ")}. ` +
+        "Backend route mismatch is still present."
+      );
+    }
+  }
+
+  throw new Error("Research chat request failed.");
 }
 
 export async function createTrackerAgent(payload: {
