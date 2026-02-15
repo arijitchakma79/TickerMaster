@@ -316,6 +316,9 @@ export interface ModalSandboxResponse {
   app_dashboard_url?: string;
   sandbox_dashboard_url?: string;
   prompt_preview?: string;
+  generated_code_preview?: string;
+  codegen_source?: string;
+  codegen_model?: string;
   stdout_preview?: string[];
   metadata?: Record<string, unknown>;
   link?: string;

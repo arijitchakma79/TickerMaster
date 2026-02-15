@@ -62,6 +62,54 @@ def _normalize_decision(raw: Any) -> dict[str, Any]:
     }
 
 
+def _clamp01(value: Any, default: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return float(max(0.0, min(1.0, out)))
+
+
+def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    return int(max(lo, min(hi, out)))
+
+
+def _normalize_persona_params(raw: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if isinstance(raw, dict):
+        payload = raw
+    elif isinstance(raw, str):
+        payload = _safe_json_extract(raw)
+
+    personality = str(payload.get("personality") or "fundamental_value").strip()
+    if personality not in {"quant_momentum", "fundamental_value", "retail_reactive"}:
+        personality = "fundamental_value"
+
+    strategy_prompt = str(payload.get("strategy_prompt") or "").strip()
+    if not strategy_prompt:
+        strategy_prompt = "Trade with disciplined risk controls. Prefer liquid names and avoid overtrading."
+
+    aggressiveness = _clamp01(payload.get("aggressiveness"), 0.5)
+    risk_limit = _clamp01(payload.get("risk_limit"), 0.5)
+    trade_size = _clamp_int(payload.get("trade_size"), 60, 1, 1000)
+    model = str(payload.get("model") or "").strip()
+
+    out: dict[str, Any] = {
+        "personality": personality,
+        "strategy_prompt": strategy_prompt[:1200],
+        "aggressiveness": aggressiveness,
+        "risk_limit": risk_limit,
+        "trade_size": trade_size,
+    }
+    if model:
+        out["model"] = model
+    return out
+
+
 @app.function(
     image=inference_image,
     secrets=[modal.Secret.from_name("tickermaster-secrets")],
@@ -108,6 +156,70 @@ def agent_inference(request_payload: dict[str, Any]) -> dict[str, Any]:
             "confidence": 0.35,
             "rationale": f"Modal OpenRouter inference failed: {exc}",
         }
+
+
+@app.function(
+    image=inference_image,
+    secrets=[modal.Secret.from_name("tickermaster-secrets")],
+    timeout=45,
+)
+def persona_param_inference(request_payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Returns a persona configuration payload derived from a public profile blob.
+
+    Expected input: {"openrouter_request": {...}, "persona_name": "...", "public_profile": {...}}
+    Output keys: personality, strategy_prompt, aggressiveness, risk_limit, trade_size (and optional model).
+    """
+
+    import httpx
+
+    openrouter_api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not openrouter_api_key:
+        return _normalize_persona_params(
+            {
+                "personality": "fundamental_value",
+                "strategy_prompt": "OPENROUTER_API_KEY is missing in Modal secret.",
+                "aggressiveness": 0.35,
+                "risk_limit": 0.5,
+                "trade_size": 40,
+            }
+        )
+
+    openrouter_request = request_payload.get("openrouter_request", {})
+    if not isinstance(openrouter_request, dict):
+        return _normalize_persona_params(
+            {
+                "personality": "fundamental_value",
+                "strategy_prompt": "Invalid request payload passed to persona_param_inference.",
+                "aggressiveness": 0.4,
+                "risk_limit": 0.5,
+                "trade_size": 40,
+            }
+        )
+
+    headers = {
+        "Authorization": f"Bearer {openrouter_api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://tickermaster.local",
+        "X-Title": "TickerMaster",
+    }
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post("https://openrouter.ai/api/v1/chat/completions", json=openrouter_request, headers=headers)
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"]
+            return _normalize_persona_params(raw)
+    except Exception as exc:
+        return _normalize_persona_params(
+            {
+                "personality": "fundamental_value",
+                "strategy_prompt": f"Persona inference failed: {exc}",
+                "aggressiveness": 0.4,
+                "risk_limit": 0.5,
+                "trade_size": 40,
+            }
+        )
 
 
 @app.local_entrypoint()
