@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS public.tracker_alerts (
 
 CREATE INDEX IF NOT EXISTS idx_tracker_alerts_agent ON public.tracker_alerts (agent_id);
 CREATE INDEX IF NOT EXISTS idx_tracker_alerts_user ON public.tracker_alerts (user_id);
+CREATE INDEX IF NOT EXISTS idx_tracker_alerts_symbol ON public.tracker_alerts (symbol);
 CREATE INDEX IF NOT EXISTS idx_tracker_alerts_created ON public.tracker_alerts (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS public.tracker_alert_context (
@@ -178,6 +179,8 @@ CREATE TABLE IF NOT EXISTS public.simulations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_simulations_user ON public.simulations (user_id);
+CREATE INDEX IF NOT EXISTS idx_simulations_status ON public.simulations (status);
+CREATE INDEX IF NOT EXISTS idx_simulations_created ON public.simulations (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS public.agent_activity (
     id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
@@ -221,6 +224,18 @@ CREATE TABLE IF NOT EXISTS public.favorite_stocks (
     UNIQUE(user_id, symbol)
 );
 
+CREATE TABLE IF NOT EXISTS public.simulation_agents (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+    agent_name TEXT NOT NULL,
+    config JSONB NOT NULL,
+    icon_emoji TEXT,
+    editor JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, agent_name)
+);
+
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.tracker_agents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.tracker_alerts ENABLE ROW LEVEL SECURITY;
@@ -234,6 +249,7 @@ ALTER TABLE public.research_cache ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.watchlist ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.favorite_stocks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.notification_preferences ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.simulation_agents ENABLE ROW LEVEL SECURITY;
 
 DO $$ BEGIN
     CREATE POLICY "Users can view own profile" ON public.profiles
@@ -336,6 +352,11 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
+    CREATE POLICY "Users can CRUD own simulation agents" ON public.simulation_agents
+        FOR ALL USING (auth.uid() = user_id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
     CREATE POLICY "Anyone can read cache" ON public.research_cache
         FOR SELECT USING (true);
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
@@ -349,6 +370,29 @@ DO $$ BEGIN
     CREATE POLICY "Service can update cache" ON public.research_cache
         FOR UPDATE TO service_role USING (true);
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+CREATE OR REPLACE FUNCTION public.touch_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS profiles_touch_updated_at ON public.profiles;
+CREATE TRIGGER profiles_touch_updated_at
+    BEFORE UPDATE ON public.profiles
+    FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
+
+DROP TRIGGER IF EXISTS tracker_agents_touch_updated_at ON public.tracker_agents;
+CREATE TRIGGER tracker_agents_touch_updated_at
+    BEFORE UPDATE ON public.tracker_agents
+    FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
+
+DROP TRIGGER IF EXISTS simulation_agents_touch_updated_at ON public.simulation_agents;
+CREATE TRIGGER simulation_agents_touch_updated_at
+    BEFORE UPDATE ON public.simulation_agents
+    FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at();
 
 DO $$ BEGIN
     INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)

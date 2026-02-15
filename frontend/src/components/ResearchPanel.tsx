@@ -36,6 +36,10 @@ interface Props {
 }
 
 const ADVANCED_CACHE_STORAGE_KEY = "tickermaster-advanced-cache-v1";
+const RESEARCH_CACHE_STORAGE_KEY = "tickermaster-research-cache-v1";
+const CANDLES_CACHE_STORAGE_KEY = "tickermaster-candles-cache-v1";
+const RESEARCH_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CANDLES_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 function normalizeSymbol(value: string) {
   return value.trim().toUpperCase().replace(/\./g, "-");
@@ -141,6 +145,62 @@ function sentimentToneClass(score: number): "bullish" | "neutral" | "bearish" {
   if (score >= 0.2) return "bullish";
   if (score <= -0.2) return "bearish";
   return "neutral";
+}
+
+function toPercentValue(value: unknown): number | null {
+  if (value == null) return null;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) return null;
+    if (value <= 1) return value * 100;
+    return value <= 100 ? value : null;
+  }
+  if (typeof value === "string") {
+    const clean = value.trim();
+    if (!clean) return null;
+    if (clean.startsWith("[") && clean.endsWith("]")) return null;
+    const parsed = Number(clean.replace("%", "").replace(",", ""));
+    if (!Number.isFinite(parsed) || parsed < 0) return null;
+    if (parsed <= 1) return parsed * 100;
+    return parsed <= 100 ? parsed : null;
+  }
+  return null;
+}
+
+function parseOutcomePrices(raw: unknown): [number | null, number | null] {
+  if (Array.isArray(raw)) {
+    return [toPercentValue(raw[0]), toPercentValue(raw[1])];
+  }
+  if (typeof raw === "string") {
+    const text = raw.trim();
+    if (!text) return [null, null];
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        return [toPercentValue(parsed[0]), toPercentValue(parsed[1])];
+      }
+    } catch {
+      const parts = text.split(",").map((part) => part.trim());
+      if (parts.length >= 2) {
+        return [toPercentValue(parts[0]), toPercentValue(parts[1])];
+      }
+    }
+  }
+  return [null, null];
+}
+
+function predictionSignalText(market: Record<string, unknown>): string {
+  let yes = toPercentValue(market.yes_price);
+  let no = toPercentValue(market.no_price);
+
+  if (yes == null || no == null) {
+    const [yesOutcome, noOutcome] = parseOutcomePrices(market.probability);
+    if (yes == null) yes = yesOutcome;
+    if (no == null) no = noOutcome;
+  }
+  if (yes == null) yes = toPercentValue(market.probability);
+  if (yes != null && no == null) no = Math.max(0, 100 - yes);
+  if (yes == null || no == null) return "-";
+  return `Yes ${yes.toFixed(1)}% | No ${no.toFixed(1)}%`;
 }
 
 type SummarySection = {
@@ -509,6 +569,98 @@ function writeAdvancedCache(snapshot: AdvancedStockData) {
   }
 }
 
+interface CachedResearch {
+  data: ResearchResponse;
+  timestamp: number;
+  timeframe: string;
+}
+
+interface CachedCandles {
+  points: CandlePoint[];
+  timestamp: number;
+  period: string;
+  interval: string;
+}
+
+function readResearchCache(
+  symbol: string,
+  timeframe: string,
+): ResearchResponse | null {
+  try {
+    const raw = window.localStorage.getItem(RESEARCH_CACHE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Record<string, CachedResearch>;
+    const item = parsed[symbol];
+    if (!item || typeof item !== "object") return null;
+    // Check if cache is still valid (same timeframe and not expired)
+    if (item.timeframe !== timeframe) return null;
+    if (Date.now() - item.timestamp > RESEARCH_CACHE_TTL_MS) return null;
+    return item.data;
+  } catch {
+    return null;
+  }
+}
+
+function writeResearchCache(
+  symbol: string,
+  timeframe: string,
+  data: ResearchResponse,
+) {
+  try {
+    const raw = window.localStorage.getItem(RESEARCH_CACHE_STORAGE_KEY);
+    const parsed = raw
+      ? (JSON.parse(raw) as Record<string, CachedResearch>)
+      : {};
+    parsed[symbol] = { data, timestamp: Date.now(), timeframe };
+    window.localStorage.setItem(
+      RESEARCH_CACHE_STORAGE_KEY,
+      JSON.stringify(parsed),
+    );
+  } catch {
+    // no-op
+  }
+}
+
+function readCandlesCache(
+  symbol: string,
+  period: string,
+  interval: string,
+): CandlePoint[] | null {
+  try {
+    const raw = window.localStorage.getItem(CANDLES_CACHE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Record<string, CachedCandles>;
+    const item = parsed[symbol];
+    if (!item || typeof item !== "object") return null;
+    if (item.period !== period || item.interval !== interval) return null;
+    if (Date.now() - item.timestamp > CANDLES_CACHE_TTL_MS) return null;
+    return Array.isArray(item.points) ? item.points : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCandlesCache(
+  symbol: string,
+  period: string,
+  interval: string,
+  points: CandlePoint[],
+) {
+  try {
+    const raw = window.localStorage.getItem(CANDLES_CACHE_STORAGE_KEY);
+    const parsed = raw
+      ? (JSON.parse(raw) as Record<string, CachedCandles>)
+      : {};
+    parsed[symbol] = { points, timestamp: Date.now(), period, interval };
+    window.localStorage.setItem(
+      CANDLES_CACHE_STORAGE_KEY,
+      JSON.stringify(parsed),
+    );
+  } catch {
+    // no-op
+  }
+}
+
 export default function ResearchPanel({
   activeTicker,
   onTickerChange,
@@ -556,6 +708,8 @@ export default function ResearchPanel({
   const chatLogRef = useRef<HTMLDivElement | null>(null);
   const chatSubmitLockRef = useRef(false);
   const autoAnalyzedTickerRef = useRef("");
+  const runNonceRef = useRef(0);
+  const deepRunNonceRef = useRef(0);
   const normalizedTicker = useMemo(
     () => normalizeSymbol(activeTicker),
     [activeTicker],
@@ -638,23 +792,44 @@ export default function ResearchPanel({
     setInsiderPage(1);
   }, [activeTicker]);
 
+  // Load cached research immediately on mount/ticker change for instant display
+  useEffect(() => {
+    const normalized = activeTicker.trim().toUpperCase();
+    if (!normalized) return;
+    const cachedResearch = readResearchCache(normalized, timeframe);
+    if (cachedResearch) {
+      setResearch(cachedResearch);
+    }
+  }, [activeTicker, timeframe]);
+
   useEffect(() => {
     const normalized = activeTicker.trim().toUpperCase();
     if (!normalized) return;
     if (autoAnalyzedTickerRef.current === normalized) return;
+    const cachedResearch = readResearchCache(normalized, timeframe);
+    if (cachedResearch) {
+      autoAnalyzedTickerRef.current = normalized;
+      setResearch(cachedResearch);
+      return;
+    }
     autoAnalyzedTickerRef.current = normalized;
     void handleAnalyze(normalized);
-  }, [activeTicker]);
+  }, [activeTicker, timeframe]);
 
   useEffect(() => {
     const ticker = activeTicker.trim().toUpperCase();
     if (!ticker) return;
     let active = true;
+    const cachedCandles = readCandlesCache(ticker, chartPeriod, chartInterval);
+    if (cachedCandles) {
+      setCandles(cachedCandles);
+    }
 
     void fetchCandles(ticker, chartPeriod, chartInterval)
       .then((chartPoints) => {
         if (!active) return;
         setCandles(chartPoints);
+        writeCandlesCache(ticker, chartPeriod, chartInterval, chartPoints);
       })
       .catch(() => {
         if (!active) return;
@@ -736,10 +911,12 @@ export default function ResearchPanel({
     };
   }, [normalizedTicker]);
 
-  async function handleAnalyze(rawInput?: string) {
+  async function handleAnalyze(rawInput?: string, forceRefresh = false) {
+    // Cancel any in-flight deep run so its completion can't keep the overlay locked.
+    deepRunNonceRef.current += 1;
     setShowDeepResearch(false);
     setDeepResearch(null);
-    setLoading(true);
+    setDeepLoading(false);
     setError("");
     const seed = rawInput ?? tickerInput;
     const ticker = resolveTickerCandidate(seed, tickerSuggestions);
@@ -752,6 +929,52 @@ export default function ResearchPanel({
     setTickerInputFocused(false);
     autoAnalyzedTickerRef.current = ticker;
     onTickerChange(ticker);
+
+    // Check cache first (unless force refresh requested)
+    if (!forceRefresh) {
+      const cachedResearch = readResearchCache(ticker, timeframe);
+      if (cachedResearch) {
+        setResearch(cachedResearch);
+        // Still fetch other data (candles, advanced, indicators) but don't re-run research
+        setLoading(true);
+        try {
+          const [chartResult, advancedResult, indicatorResult] =
+            await Promise.allSettled([
+              fetchCandles(ticker, chartPeriod, chartInterval, true),
+              fetchAdvancedSnapshotWithQuoteFallback(ticker),
+              fetchIndicatorSnapshot(ticker, chartPeriod, chartInterval),
+            ]);
+          if (chartResult.status === "fulfilled") {
+            setCandles(chartResult.value);
+            writeCandlesCache(
+              ticker,
+              chartPeriod,
+              chartInterval,
+              chartResult.value,
+            );
+          }
+          if (advancedResult.status === "fulfilled") {
+            const cached = readAdvancedCache(ticker);
+            setAdvanced((prev) => {
+              const merged = mergeAdvancedSnapshot(
+                advancedResult.value,
+                prev,
+                cached,
+              );
+              writeAdvancedCache(merged);
+              return merged;
+            });
+          }
+          if (indicatorResult.status === "fulfilled")
+            setIndicatorSnapshot(indicatorResult.value);
+        } finally {
+          setLoading(false);
+        }
+        return;
+      }
+    }
+
+    setLoading(true);
     const runNonce = runNonceRef.current + 1;
     runNonceRef.current = runNonce;
     try {
@@ -767,7 +990,12 @@ export default function ResearchPanel({
         throw analysisResult.reason;
       }
       setResearch(analysisResult.value);
-      if (chartResult.status === "fulfilled") setCandles(chartResult.value);
+      // Write to cache
+      writeResearchCache(ticker, timeframe, analysisResult.value);
+      if (chartResult.status === "fulfilled") {
+        setCandles(chartResult.value);
+        writeCandlesCache(ticker, chartPeriod, chartInterval, chartResult.value);
+      }
       if (advancedResult.status === "fulfilled") {
         const cached = readAdvancedCache(ticker);
         setAdvanced((prev) => {
@@ -809,26 +1037,35 @@ export default function ResearchPanel({
     onTickerChange(ticker);
     const runNonce = runNonceRef.current + 1;
     runNonceRef.current = runNonce;
+    const deepRunNonce = deepRunNonceRef.current + 1;
+    deepRunNonceRef.current = deepRunNonce;
+
+    // Use cached research if available (deep research endpoint also runs research internally)
+    const cachedResearch = readResearchCache(ticker, timeframe);
+    if (cachedResearch) {
+      setResearch(cachedResearch);
+    }
+
     try {
+      // Don't run regular research here - deep research endpoint does it internally
+      // This prevents running research twice and speeds up the process
       const [
-        analysisResult,
         chartResult,
         advancedResult,
         indicatorResult,
         deepResult,
       ] = await Promise.allSettled([
-        runResearch(ticker, timeframe),
         fetchCandles(ticker, chartPeriod, chartInterval, true),
         fetchAdvancedSnapshotWithQuoteFallback(ticker),
         fetchIndicatorSnapshot(ticker, chartPeriod, chartInterval),
         runDeepResearch(ticker),
       ]);
       if (runNonce !== runNonceRef.current) return;
-      if (analysisResult.status === "rejected") {
-        throw analysisResult.reason;
+
+      if (chartResult.status === "fulfilled") {
+        setCandles(chartResult.value);
+        writeCandlesCache(ticker, chartPeriod, chartInterval, chartResult.value);
       }
-      setResearch(analysisResult.value);
-      if (chartResult.status === "fulfilled") setCandles(chartResult.value);
       if (advancedResult.status === "fulfilled") {
         const cached = readAdvancedCache(ticker);
         setAdvanced((prev) => {
@@ -845,6 +1082,17 @@ export default function ResearchPanel({
         setIndicatorSnapshot(indicatorResult.value);
       if (deepResult.status === "fulfilled") {
         setDeepResearch(deepResult.value);
+        // If we didn't have cached research, run it now (but deep research already did it internally)
+        if (!cachedResearch) {
+          // Fetch fresh research since deep research ran it
+          try {
+            const freshResearch = await runResearch(ticker, timeframe);
+            setResearch(freshResearch);
+            writeResearchCache(ticker, timeframe, freshResearch);
+          } catch {
+            // Ignore - we still have deep research results
+          }
+        }
       } else {
         setError(
           deepResult.reason instanceof Error
@@ -859,10 +1107,13 @@ export default function ResearchPanel({
         err instanceof Error ? err.message : "Deep research request failed",
       );
     } finally {
-      if (runNonce !== runNonceRef.current) return;
-      setAgentProgress(100);
-      setLoading(false);
-      setDeepLoading(false);
+      if (runNonce === runNonceRef.current) {
+        setAgentProgress(100);
+        setLoading(false);
+      }
+      if (deepRunNonce === deepRunNonceRef.current) {
+        setDeepLoading(false);
+      }
     }
   }
 
@@ -873,7 +1124,6 @@ export default function ResearchPanel({
   const redditEntry =
     sourceRows.find((entry) => entry.source === "Reddit API") ?? null;
   const agentRunning = loading || deepLoading;
-  const runNonceRef = useRef(0);
 
   useEffect(() => {
     if (!agentRunning) {
@@ -893,6 +1143,7 @@ export default function ResearchPanel({
 
   function handleForceQuitRun() {
     runNonceRef.current += 1;
+    deepRunNonceRef.current += 1;
     setLoading(false);
     setDeepLoading(false);
     setAgentProgress(0);
@@ -1320,6 +1571,7 @@ export default function ResearchPanel({
         <label className="research-control">
           Timeframe
           <select
+            className="research-select"
             value={timeframe}
             onChange={(event) => setTimeframe(event.target.value)}
           >
@@ -1339,6 +1591,7 @@ export default function ResearchPanel({
         <label className="research-control">
           Chart Type
           <select
+            className="research-select"
             value={chartMode}
             onChange={(event) =>
               setChartMode(event.target.value as "candles" | "line")
@@ -1351,6 +1604,7 @@ export default function ResearchPanel({
         <label className="research-control">
           Chart Range
           <select
+            className="research-select"
             value={chartPeriod}
             onChange={(event) => setChartPeriod(event.target.value)}
           >
@@ -1368,6 +1622,7 @@ export default function ResearchPanel({
         <label className="research-control">
           Interval
           <select
+            className="research-select"
             value={chartInterval}
             onChange={(event) => setChartInterval(event.target.value)}
           >
@@ -1411,7 +1666,7 @@ export default function ResearchPanel({
           </div>
         </label>
         <div className="research-action-buttons">
-          <button onClick={() => void handleAnalyze()} disabled={loading}>
+          <button onClick={() => void handleAnalyze(undefined, true)} disabled={loading}>
             {loading ? "Analyzing…" : "Run Research"}
           </button>
           <button
@@ -1619,18 +1874,43 @@ export default function ResearchPanel({
                     })()}
                   </div>
                   {entry.links.length > 0 ? (
-                    <div className="source-citations">
-                      {entry.links.slice(0, 4).map((link) => (
-                        <a
-                          key={`${entry.source}-right-${link.url}`}
-                          href={link.url}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          {displayLinkLabel(link.title, link.url)}
-                        </a>
-                      ))}
-                    </div>
+                    entry.source === "X API" ? (
+                      <div className="x-posts-block">
+                        <p className="muted" style={{ margin: "8px 0 6px" }}>
+                          Top X Posts
+                        </p>
+                        <ul className="x-post-links">
+                          {entry.links.slice(0, 5).map((link) => (
+                            <li key={`${entry.source}-right-${link.url}`}>
+                              <a
+                                className="x-post-link"
+                                href={link.url}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                <span className="x-post-link-title">
+                                  {displayLinkLabel(link.title, link.url)}
+                                </span>
+                                <span className="x-post-link-open">Open</span>
+                              </a>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : (
+                      <div className="source-citations">
+                        {entry.links.slice(0, 4).map((link) => (
+                          <a
+                            key={`${entry.source}-right-${link.url}`}
+                            href={link.url}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            {displayLinkLabel(link.title, link.url)}
+                          </a>
+                        ))}
+                      </div>
+                    )
                   ) : null}
                 </article>
               ))}
@@ -1662,8 +1942,8 @@ export default function ResearchPanel({
                         </td>
                         <td>{String(market.market ?? "-")}</td>
                         <td>
-                          {String(
-                            market.probability ?? market.yes_price ?? "-",
+                          {predictionSignalText(
+                            market as Record<string, unknown>,
                           )}
                         </td>
                       </tr>
@@ -1672,6 +1952,15 @@ export default function ResearchPanel({
                     <tr>
                       <td colSpan={3} className="muted">
                         No relevant prediction market found for this ticker.
+                      </td>
+                    </tr>
+                  ) : null}
+                  {(research?.prediction_markets ?? []).some(
+                    (m) => m.context === "macro-adjacent",
+                  ) ? (
+                    <tr>
+                      <td colSpan={3} className="muted" style={{ fontSize: "0.85em", paddingTop: "0.5rem" }}>
+                        Showing macro/economic markets that may impact this ticker.
                       </td>
                     </tr>
                   ) : null}

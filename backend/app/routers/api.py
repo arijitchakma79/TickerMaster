@@ -56,14 +56,34 @@ from app.schemas import SimulationStartRequest
 
 router = APIRouter(prefix="/api", tags=["api"])
 
+_SYMBOL_PATTERN = r"^[A-Za-z0-9.\-]{1,12}$"
+_AUTH_REQUIRED_DETAIL = "Authentication required"
+
+
+def _resolve_user_id(request: Request, explicit_user_id: str | None = None) -> str | None:
+    return explicit_user_id or get_user_id_from_request(request)
+
+
+def _require_user_id(request: Request, explicit_user_id: str | None = None) -> str:
+    user_id = _resolve_user_id(request, explicit_user_id=explicit_user_id)
+    if not user_id:
+        raise HTTPException(status_code=401, detail=_AUTH_REQUIRED_DETAIL)
+    return user_id
+
+
+def _strict_tracker_persistence(request: Request) -> bool:
+    settings = getattr(request.app.state, "settings", None)
+    environment = str(getattr(settings, "environment", "development")).strip().lower()
+    return environment == "production"
+
 
 class PokeInboundRequest(BaseModel):
     message: str
 
 
 class TrackerAgentCreateRequest(BaseModel):
-    symbol: str | None = None
-    name: str | None = None
+    symbol: str | None = Field(default=None, min_length=1, max_length=12, pattern=_SYMBOL_PATTERN)
+    name: str | None = Field(default=None, min_length=1, max_length=120)
     triggers: dict[str, Any] = Field(default_factory=dict)
     auto_simulate: bool = False
     create_prompt: str | None = None
@@ -78,8 +98,8 @@ class TrackerAgentPatchRequest(BaseModel):
 
 
 class TrackerEmitAlertRequest(BaseModel):
-    symbol: str
-    trigger_reason: str
+    symbol: str = Field(min_length=1, max_length=12, pattern=_SYMBOL_PATTERN)
+    trigger_reason: str = Field(min_length=1, max_length=400)
     narrative: str | None = None
     market_snapshot: dict[str, Any] = Field(default_factory=dict)
     investigation_data: dict[str, Any] = Field(default_factory=dict)
@@ -89,12 +109,12 @@ class TrackerEmitAlertRequest(BaseModel):
 
 
 class TrackerNLCreateRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(min_length=1, max_length=2000)
     user_id: str | None = None
 
 
 class TrackerAgentInteractRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=3000)
     user_id: str | None = None
 
 
@@ -800,7 +820,7 @@ async def ticker_quote(symbol: str) -> dict[str, Any]:
 @router.get("/ticker/{symbol}/ai-research")
 async def ticker_ai_research(symbol: str, request: Request, timeframe: str = "7d") -> dict[str, Any]:
     frame = normalize_timeframe(timeframe)
-    cache_key = f"ai_research:{frame}:15m"
+    cache_key = f"ai_research:{frame}:24h"
     cached = get_cached_research(symbol, cache_key)
     if cached:
         return cached
@@ -814,7 +834,7 @@ async def ticker_ai_research(symbol: str, request: Request, timeframe: str = "7d
         "citations": [link.model_dump() for link in data.tool_links],
         "recommendation": data.recommendation,
     }
-    set_cached_research(symbol, cache_key, payload, ttl_minutes=15)
+    set_cached_research(symbol, cache_key, payload, ttl_minutes=24 * 60)
     return payload
 
 
@@ -881,14 +901,60 @@ async def ticker_full(symbol: str, request: Request, timeframe: str = "7d") -> d
     macro_task = get_macro_indicators(settings)
     deep_task = run_deep_research(symbol, settings)
 
-    metric, research, macro, deep = await asyncio.gather(metric_task, research_task, macro_task, deep_task)
+    metric_out, research_out, macro_out, deep_out = await asyncio.gather(
+        metric_task,
+        research_task,
+        macro_task,
+        deep_task,
+        return_exceptions=True,
+    )
+    metric_payload: dict[str, Any] | None = None
+    if isinstance(metric_out, Exception):
+        last = get_cached_research(symbol, "quote:last")
+        if last:
+            metric_payload = {**last, "stale": True, "provider_error": str(metric_out)}
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Market data provider unavailable for {symbol.upper()}: {metric_out}",
+            )
+    else:
+        metric_payload = metric_out.model_dump()
+        set_cached_research(symbol, "quote:last", metric_payload, ttl_minutes=24 * 60)
+
+    if isinstance(research_out, Exception):
+        research_payload: dict[str, Any] = {
+            "ticker": symbol.upper(),
+            "timeframe": frame,
+            "aggregate_sentiment": 0.0,
+            "recommendation": "neutral",
+            "narratives": ["Research provider temporarily unavailable."],
+            "source_breakdown": [],
+            "prediction_markets": [],
+            "tool_links": [],
+            "provider_error": str(research_out),
+        }
+    else:
+        research_payload = research_out.model_dump()
+
+    macro_payload = (
+        {"provider_error": str(macro_out)}
+        if isinstance(macro_out, Exception)
+        else macro_out
+    )
+    deep_payload = (
+        {"provider_error": str(deep_out)}
+        if isinstance(deep_out, Exception)
+        else deep_out
+    )
+
     payload = {
         "symbol": symbol.upper(),
         "timeframe": frame,
-        "quote": metric.model_dump(),
-        "research": research.model_dump(),
-        "macro": macro,
-        "deep_research": deep,
+        "quote": metric_payload,
+        "research": research_payload,
+        "macro": macro_payload,
+        "deep_research": deep_payload,
         "last_updated": datetime.now(timezone.utc).isoformat(),
     }
     set_cached_research(symbol, cache_key, payload, ttl_minutes=5)
@@ -899,14 +965,6 @@ async def ticker_full(symbol: str, request: Request, timeframe: str = "7d") -> d
 async def deep_research(symbol: str, request: Request) -> dict[str, Any]:
     settings = request.app.state.settings
     return await run_deep_research(symbol, settings)
-
-
-def _require_tracker_user_id(request: Request, explicit_user_id: str | None = None) -> str:
-    resolved_user_id = explicit_user_id or get_user_id_from_request(request)
-    if not resolved_user_id:
-        raise HTTPException(status_code=401, detail="Sign in required to persist tracker agents.")
-    return resolved_user_id
-
 
 def _require_agent_start_time(triggers: dict[str, Any]) -> None:
     start_at = str(triggers.get("start_at") or "").strip()
@@ -1561,7 +1619,8 @@ async def _request_heygen_session_token(settings: Any, payload: TrackerAvatarSes
 
 @router.post("/tracker/agents")
 async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Request, user_id: str | None = None) -> dict[str, Any]:
-    resolved_user_id = _require_tracker_user_id(request, user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
+    strict_persistence = _strict_tracker_persistence(request)
     create_prompt = str(payload.create_prompt or "").strip()
     parsed_prompt: dict[str, Any] = {}
     if create_prompt:
@@ -1610,7 +1669,7 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
             name=name,
             triggers=clean_triggers,
             auto_simulate=auto_simulate,
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1627,7 +1686,7 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
                 if not create_prompt
                 else "Agent created via structured tracker create endpoint with initial manager prompt."
             ),
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
         if bool(symbol_resolution.get("auto_corrected")):
             tracker_repo.create_history(
@@ -1640,7 +1699,7 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
                     f"Symbol auto-corrected from {symbol_resolution.get('input_symbol')} "
                     f"to {symbol_resolution.get('resolved_symbol')} (confidence={symbol_resolution.get('confidence')})."
                 ),
-                strict_persistence=True,
+                strict_persistence=strict_persistence,
             )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1691,16 +1750,16 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
 
 @router.get("/tracker/agents")
 async def list_tracker_agents(request: Request, user_id: str | None = None) -> list[dict[str, Any]]:
-    resolved_user_id = _require_tracker_user_id(request, user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     return tracker_repo.list_agents(user_id=resolved_user_id)
 
 
 @router.patch("/tracker/agents/{agent_id}")
 async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, request: Request, user_id: str | None = None) -> dict[str, Any]:
-    resolved_user_id = _require_tracker_user_id(request, user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     existing = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if existing is None:
-        return {"error": "not_found"}
+        raise HTTPException(status_code=404, detail="Agent not found")
     updates = payload.model_dump(exclude_none=True)
     symbol_resolution: dict[str, Any] | None = None
     if "symbol" in updates:
@@ -1725,7 +1784,7 @@ async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, 
         updates["triggers"] = merged_triggers
     item = tracker_repo.update_agent(user_id=resolved_user_id, agent_id=agent_id, updates=updates)
     if item is None:
-        return {"error": "not_found"}
+        raise HTTPException(status_code=404, detail="Agent not found")
     tracker_repo.create_history(
         user_id=resolved_user_id,
         agent_id=agent_id,
@@ -1764,7 +1823,7 @@ async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, 
 
 @router.get("/tracker/agents/{agent_id}")
 async def get_tracker_agent(agent_id: str, request: Request, user_id: str | None = None) -> dict[str, Any]:
-    resolved_user_id = _require_tracker_user_id(request, user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     item = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -1846,7 +1905,7 @@ async def create_tracker_broker_avatar_session(
 
 @router.get("/tracker/agents/{agent_id}/detail")
 async def get_tracker_agent_detail(agent_id: str, request: Request, user_id: str | None = None) -> dict[str, Any]:
-    resolved_user_id = _require_tracker_user_id(request, user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     agent = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -1894,7 +1953,7 @@ async def get_tracker_agent_detail(agent_id: str, request: Request, user_id: str
 
 @router.get("/tracker/agents/{agent_id}/history")
 async def get_tracker_agent_history(agent_id: str, request: Request, user_id: str | None = None, limit: int = 20) -> dict[str, Any]:
-    resolved_user_id = _require_tracker_user_id(request, user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     item = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -1911,7 +1970,7 @@ async def get_tracker_agent_context(
     history_limit: int = 40,
     csv_limit: int = 120,
 ) -> dict[str, Any]:
-    resolved_user_id = _require_tracker_user_id(request, user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     agent = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -1962,7 +2021,7 @@ async def query_tracker_agent_context(
     payload: TrackerContextQueryRequest,
     request: Request,
 ) -> dict[str, Any]:
-    resolved_user_id = _require_tracker_user_id(request, payload.user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=payload.user_id)
     agent = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -2056,7 +2115,7 @@ async def query_tracker_agent_context(
 
 @router.delete("/tracker/agents/{agent_id}")
 async def delete_tracker_agent(agent_id: str, request: Request, user_id: str | None = None) -> dict[str, Any]:
-    resolved_user_id = _require_tracker_user_id(request, user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     existing = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     ok = tracker_repo.delete_agent(user_id=resolved_user_id, agent_id=agent_id)
     if ok:
@@ -2085,7 +2144,8 @@ async def delete_tracker_agent(agent_id: str, request: Request, user_id: str | N
 
 @router.post("/tracker/agents/nl-create")
 async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Request) -> dict[str, Any]:
-    resolved_user_id = _require_tracker_user_id(request, payload.user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=payload.user_id)
+    strict_persistence = _strict_tracker_persistence(request)
     settings = request.app.state.settings
     parsed = await parse_tracker_instruction(settings, payload.prompt)
 
@@ -2113,7 +2173,7 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
             name=name,
             triggers=triggers,
             auto_simulate=auto_simulate,
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -2127,7 +2187,7 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
             parsed_intent=parsed if isinstance(parsed, dict) else {},
             trigger_snapshot=agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {},
             note="Agent created from prompt.",
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
         if bool(symbol_resolution.get("auto_corrected")):
             tracker_repo.create_history(
@@ -2140,7 +2200,7 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
                     f"Symbol auto-corrected from {symbol_resolution.get('input_symbol')} "
                     f"to {symbol_resolution.get('resolved_symbol')} (confidence={symbol_resolution.get('confidence')})."
                 ),
-                strict_persistence=True,
+                strict_persistence=strict_persistence,
             )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -2438,7 +2498,8 @@ async def interact_tracker_main_broker(payload: TrackerMainBrokerInteractRequest
 
 @router.post("/tracker/agents/{agent_id}/interact")
 async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractRequest, request: Request) -> dict[str, Any]:
-    resolved_user_id = _require_tracker_user_id(request, payload.user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=payload.user_id)
+    strict_persistence = _strict_tracker_persistence(request)
     agent = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
     if agent is None:
         return {"ok": False, "error": "not_found"}
@@ -2713,7 +2774,7 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
             trigger_snapshot=agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {},
             tool_outputs=tool_outputs,
             note=f"Manager instruction processed with intent {intent or 'conversation'}.",
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
         tracker_repo.create_history(
             user_id=resolved_user_id,
@@ -2724,7 +2785,7 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
             trigger_snapshot=agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {},
             tool_outputs=tool_outputs,
             note=str(reply.get("response") or ""),
-            strict_persistence=True,
+            strict_persistence=strict_persistence,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -2824,19 +2885,20 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
 
 @router.get("/tracker/alerts")
 async def list_tracker_alerts(request: Request, user_id: str | None = None, agent_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
-    resolved_user_id = _require_tracker_user_id(request, user_id)
+    resolved_user_id = _require_user_id(request, explicit_user_id=user_id)
     return tracker_repo.list_alerts(user_id=resolved_user_id, agent_id=agent_id, limit=min(max(limit, 1), 100))
 
 
 @router.post("/tracker/emit-alert")
 async def emit_tracker_alert(payload: TrackerEmitAlertRequest, request: Request) -> dict[str, Any]:
+    resolved_user_id = _require_user_id(request, explicit_user_id=payload.user_id)
     row = tracker_repo.create_alert(
         symbol=payload.symbol,
         trigger_reason=payload.trigger_reason,
         narrative=payload.narrative,
         market_snapshot=payload.market_snapshot,
         investigation_data=payload.investigation_data,
-        user_id=payload.user_id,
+        user_id=resolved_user_id,
         agent_id=payload.agent_id,
         simulation_id=payload.simulation_id,
     )
@@ -3068,7 +3130,7 @@ async def patch_preferences(payload: UserPrefsRequest, request: Request) -> dict
 
     user_id = get_user_id_from_request(request)
     if not user_id:
-        return {"ok": False, "error": "missing_user_id"}
+        raise HTTPException(status_code=401, detail=_AUTH_REQUIRED_DETAIL)
 
     client = get_supabase()
     if client is None:

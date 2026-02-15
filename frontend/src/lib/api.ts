@@ -4,6 +4,7 @@ import type {
   AgentActivity,
   AdvancedStockData,
   AgentConfig,
+  SimulationAgentEntry,
   CandlePoint,
   DeepResearchResponse,
   IndicatorSnapshot,
@@ -394,13 +395,30 @@ export async function getSimulationSessions() {
   return data.sessions;
 }
 
+export async function getSimulationAgents(): Promise<SimulationAgentEntry[]> {
+  const { data } = await client.get<{ agents?: SimulationAgentEntry[] }>("/simulation/agents");
+  return Array.isArray(data.agents) ? data.agents : [];
+}
+
+export async function setSimulationAgents(agents: SimulationAgentEntry[]): Promise<SimulationAgentEntry[]> {
+  const { data } = await client.put<{ agents?: SimulationAgentEntry[] }>("/simulation/agents", { agents });
+  return Array.isArray(data.agents) ? data.agents : [];
+}
+
+export async function deleteSimulationAgent(agentName: string): Promise<SimulationAgentEntry[]> {
+  const safeName = encodeURIComponent(agentName);
+  const { data } = await client.delete<{ agents?: SimulationAgentEntry[] }>(`/simulation/agents/${safeName}`);
+  return Array.isArray(data.agents) ? data.agents : [];
+}
+
 export async function triggerTrackerPoll(): Promise<TrackerSnapshot> {
   const { data } = await client.post<TrackerSnapshot>("/tracker/poll");
   return data;
 }
 
-export async function getTrackerSnapshot(): Promise<TrackerSnapshot> {
-  const { data } = await client.get<TrackerSnapshot>("/tracker/snapshot");
+export async function getTrackerSnapshot(tickers?: string[]): Promise<TrackerSnapshot> {
+  const params = Array.isArray(tickers) && tickers.length > 0 ? { tickers: tickers.join(",") } : undefined;
+  const { data } = await client.get<TrackerSnapshot>("/tracker/snapshot", { params });
   return data;
 }
 
@@ -562,9 +580,15 @@ export async function runDeepResearch(ticker: string): Promise<DeepResearchRespo
   const endpoints = [`/research/deep/${symbol}`, `/api/research/deep/${symbol}`];
   let lastError: unknown = null;
 
+  // Deep research can take longer - use extended timeout (2 minutes)
+  const deepResearchClient = axios.create({
+    baseURL: API_URL,
+    timeout: 120000,
+  });
+
   for (const endpoint of endpoints) {
     try {
-      const { data } = await client.post<DeepResearchResponse>(endpoint);
+      const { data } = await deepResearchClient.post<DeepResearchResponse>(endpoint);
       return data;
     } catch (error) {
       lastError = error;

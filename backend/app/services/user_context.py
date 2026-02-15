@@ -9,6 +9,7 @@ from fastapi import Request
 from app.services.database import get_supabase
 
 _TOKEN_CACHE_TTL_SECONDS = 300.0
+_TOKEN_CACHE_MAX_ENTRIES = 2048
 _token_user_cache: dict[str, tuple[float, str | None]] = {}
 
 
@@ -48,6 +49,11 @@ def _cached_token_user(token: str) -> str | None:
         if isinstance(candidate, str) and _is_uuid(candidate):
             user_id = candidate
 
+    if len(_token_user_cache) >= _TOKEN_CACHE_MAX_ENTRIES:
+        # Drop oldest entries to keep token cache bounded in long-lived workers.
+        oldest_keys = sorted(_token_user_cache.items(), key=lambda item: item[1][0])[:256]
+        for stale_key, _ in oldest_keys:
+            _token_user_cache.pop(stale_key, None)
     _token_user_cache[key] = (now, user_id)
     return user_id
 
@@ -60,16 +66,10 @@ def get_user_id_from_request(request: Request) -> str | None:
             token_user = _cached_token_user(token)
             if _is_uuid(token_user):
                 return token_user
-        return None
 
     # Prefer explicit header from frontend/session middleware.
     header_user = request.headers.get("x-user-id")
     if _is_uuid(header_user):
         return header_user
-
-    # Optional query fallback for local testing.
-    query_user = request.query_params.get("user_id")
-    if _is_uuid(query_user):
-        return query_user
 
     return None

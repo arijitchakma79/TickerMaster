@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.schemas import SimulationStartRequest
 from app.services.simulation_store import attach_modal_sandbox
 from app.services.modal_integration import modal_cron_health, spin_modal_sandbox
+from app.services.simulation_agents import delete_simulation_agent, list_simulation_agents, set_simulation_agents
 from app.services.user_context import get_user_id_from_request
 
 router = APIRouter(prefix="/simulation", tags=["simulation"])
@@ -14,6 +15,23 @@ router = APIRouter(prefix="/simulation", tags=["simulation"])
 class SandboxRequest(BaseModel):
     prompt: str
     session_id: str
+
+
+class SimulationAgentEditor(BaseModel):
+    risk: int = Field(..., ge=0, le=100)
+    tempo: int = Field(..., ge=0, le=100)
+    style: int = Field(..., ge=0, le=100)
+    news: int = Field(..., ge=0, le=100)
+
+
+class SimulationAgentEntry(BaseModel):
+    config: dict
+    iconEmoji: str | None = None
+    editor: SimulationAgentEditor | None = None
+
+
+class SimulationAgentsRequest(BaseModel):
+    agents: list[SimulationAgentEntry] = Field(default_factory=list)
 
 
 @router.post("/start")
@@ -64,6 +82,31 @@ async def simulation_state(session_id: str, request: Request):
 async def list_simulation_sessions(request: Request):
     orchestrator = request.app.state.orchestrator
     return {"sessions": orchestrator.list()}
+
+
+@router.get("/agents")
+async def get_simulation_agents(request: Request):
+    user_id = get_user_id_from_request(request)
+    if not user_id:
+        return {"agents": [], "note": "Authentication required for persisted simulation agents."}
+    return {"agents": list_simulation_agents(user_id)}
+
+
+@router.put("/agents")
+async def put_simulation_agents(payload: SimulationAgentsRequest, request: Request):
+    user_id = get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    entries = [item.model_dump() for item in payload.agents]
+    return {"agents": set_simulation_agents(user_id, entries)}
+
+
+@router.delete("/agents/{agent_name}")
+async def remove_simulation_agent(agent_name: str, request: Request):
+    user_id = get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return {"agents": delete_simulation_agent(user_id, agent_name)}
 
 
 @router.post("/modal/sandbox")

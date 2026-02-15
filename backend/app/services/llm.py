@@ -45,21 +45,39 @@ async def generate_openai_commentary(prompt: str, context: Dict[str, Any] | None
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 
+    ticker = (context or {}).get("ticker", "the stock")
     system_message = (
-        "You are TickerMaster's live market desk commentator. Provide concise, high-signal commentary for educational trading simulation. "
-        "Avoid financial advice language and keep the tone analytical."
+        f"You are TickerMaster's research assistant for {ticker}. "
+        "Your primary job is to DIRECTLY ANSWER the user's question first. "
+        "If they ask about a person (CEO, CFO, founder), company facts, or general information, answer that question directly and concisely. "
+        "You have access to current market research context which you can use to supplement your answer when relevant. "
+        "After answering the question, you may briefly mention relevant market sentiment or news if it adds value. "
+        "Keep responses concise and helpful. Avoid generic market commentary unless specifically asked."
     )
+
+    # Format context more clearly for the model
+    context_summary = ""
+    if context:
+        if context.get("aggregate_sentiment") is not None:
+            sentiment = context["aggregate_sentiment"]
+            sentiment_label = "bullish" if sentiment > 0.2 else "bearish" if sentiment < -0.2 else "neutral"
+            context_summary += f"Current sentiment: {sentiment_label} ({sentiment:.2f}). "
+        if context.get("recommendation"):
+            context_summary += f"Recommendation: {context['recommendation']}. "
+        if context.get("narratives"):
+            context_summary += f"Key narratives: {'; '.join(context['narratives'][:3])}. "
+
+    user_content = f"Question: {prompt}"
+    if context_summary:
+        user_content += f"\n\nMarket context for reference (use only if relevant to the question): {context_summary}"
 
     body = {
         "model": "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": system_message},
-            {
-                "role": "user",
-                "content": json.dumps({"prompt": prompt, "context": context or {}}, ensure_ascii=True),
-            },
+            {"role": "user", "content": user_content},
         ],
-        "temperature": 0.4,
+        "temperature": 0.3,
     }
 
     headers = {

@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  addAlert,
   createTrackerAgent,
   deleteTrackerAgent,
   getTrackerAgentHistory,
@@ -8,8 +7,7 @@ import {
   interactWithTrackerAgent,
   listTrackerAgents,
   queryTrackerAgentContext,
-  searchTickerDirectory,
-  triggerTrackerPoll
+  searchTickerDirectory
 } from "../lib/api";
 import { formatCompactNumber, formatCurrency, formatPercent } from "../lib/format";
 import { resolveTickerCandidate } from "../lib/tickerInput";
@@ -22,9 +20,7 @@ interface Props {
   onTickerChange: (ticker: string) => void;
   trackerEvent?: WSMessage;
   watchlist: string[];
-  favorites: string[];
   onWatchlistChange: (tickers: string[]) => Promise<string[]>;
-  onToggleFavorite: (ticker: string) => Promise<void>;
 }
 
 type ScheduleMode = "realtime" | "custom" | "hourly" | "daily";
@@ -77,9 +73,7 @@ export default function TrackerPanel({
   onTickerChange,
   trackerEvent,
   watchlist,
-  favorites,
-  onWatchlistChange,
-  onToggleFavorite
+  onWatchlistChange
 }: Props) {
   const [watchlistInput, setWatchlistInput] = useState("");
   const [watchlistInputFocused, setWatchlistInputFocused] = useState(false);
@@ -87,14 +81,13 @@ export default function TrackerPanel({
   const [watchlistSearchLoading, setWatchlistSearchLoading] = useState(false);
   const [snapshot, setSnapshot] = useState<TrackerSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
-  const [threshold, setThreshold] = useState(2);
-  const [direction, setDirection] = useState<"up" | "down" | "either">("either");
   const [agents, setAgents] = useState<TrackerAgent[]>([]);
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [createLoading, setCreateLoading] = useState(false);
   const [createError, setCreateError] = useState("");
   const [createNotice, setCreateNotice] = useState("");
   const [createForm, setCreateForm] = useState<TrackerCreateForm>(() => buildDefaultCreateForm(activeTicker));
+  const [createSymbolFocused, setCreateSymbolFocused] = useState(false);
   const [createSearchLoading, setCreateSearchLoading] = useState(false);
   const [createSearchError, setCreateSearchError] = useState("");
   const [createSearchResults, setCreateSearchResults] = useState<TickerLookup[]>([]);
@@ -111,25 +104,47 @@ export default function TrackerPanel({
   const [contextLoadingAgentId, setContextLoadingAgentId] = useState<string | null>(null);
 
   useEffect(() => {
-    getTrackerSnapshot().then(setSnapshot).catch(() => null);
     void listTrackerAgents()
       .then((items) => setAgents(items))
       .catch(() => setAgents([]));
   }, []);
 
   useEffect(() => {
+    let active = true;
+    void getTrackerSnapshot(watchlist)
+      .then((next) => {
+        if (!active) return;
+        setSnapshot(next);
+      })
+      .catch(() => null);
+    return () => {
+      active = false;
+    };
+  }, [watchlist]);
+
+  useEffect(() => {
     if (!trackerEvent || trackerEvent.type !== "tracker_snapshot") return;
-    setSnapshot({
-      generated_at: String(trackerEvent.generated_at ?? new Date().toISOString()),
-      tickers: Array.isArray(trackerEvent.tickers) ? (trackerEvent.tickers as TrackerSnapshot["tickers"]) : [],
-      alerts_triggered: Array.isArray(trackerEvent.alerts) ? (trackerEvent.alerts as TrackerSnapshot["alerts_triggered"]) : []
-    });
+    let active = true;
+    void getTrackerSnapshot(watchlist)
+      .then((next) => {
+        if (!active) return;
+        setSnapshot(next);
+      })
+      .catch(() => null);
+    return () => {
+      active = false;
+    };
   }, [trackerEvent]);
 
-  const sorted = useMemo(
-    () => [...(snapshot?.tickers ?? [])].sort((a, b) => Math.abs(b.change_percent) - Math.abs(a.change_percent)),
-    [snapshot]
-  );
+  const marketGridTickers = useMemo(() => {
+    const tickers = snapshot?.tickers ?? [];
+    if (watchlist.length === 0) return tickers;
+
+    const bySymbol = new Map(tickers.map((item) => [item.ticker, item] as const));
+    return watchlist
+      .map((symbol) => bySymbol.get(symbol))
+      .filter((item): item is TrackerSnapshot["tickers"][number] => Boolean(item));
+  }, [snapshot, watchlist]);
 
   useEffect(() => {
     const query = watchlistInput.trim();
@@ -163,15 +178,43 @@ export default function TrackerPanel({
     };
   }, [watchlistInput]);
 
+  useEffect(() => {
+    if (!createModalOpen) return;
+    const query = createForm.symbol.trim();
+    if (!query) {
+      setCreateSearchResults([]);
+      setCreateSearchLoading(false);
+      return;
+    }
+
+    let active = true;
+    const timer = window.setTimeout(() => {
+      setCreateSearchLoading(true);
+      void searchTickerDirectory(query, 8)
+        .then((results) => {
+          if (!active) return;
+          setCreateSearchResults(results);
+        })
+        .catch(() => {
+          if (!active) return;
+          setCreateSearchResults([]);
+        })
+        .finally(() => {
+          if (!active) return;
+          setCreateSearchLoading(false);
+        });
+    }, 180);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [createForm.symbol, createModalOpen]);
+
   const availableWatchlistSuggestions = useMemo(
     () => watchlistSuggestions.filter((entry) => !watchlist.includes(entry.ticker)),
     [watchlistSuggestions, watchlist]
   );
-  const resolvedInputTicker = useMemo(
-    () => resolveTickerCandidate(watchlistInput, watchlistSuggestions),
-    [watchlistInput, watchlistSuggestions]
-  );
-  const alertTargetTicker = resolvedInputTicker || activeTicker;
   const selectedInstructionAgent = useMemo(
     () => agents.find((agent) => agent.id === instructionModalAgentId) ?? null,
     [agents, instructionModalAgentId]
@@ -200,8 +243,8 @@ export default function TrackerPanel({
 
     setLoading(true);
     try {
-      await onWatchlistChange([...watchlist, resolvedTicker]);
-      const refreshed = await triggerTrackerPoll();
+      const updatedWatchlist = await onWatchlistChange([...watchlist, resolvedTicker]);
+      const refreshed = await getTrackerSnapshot(updatedWatchlist);
       setSnapshot(refreshed);
       onTickerChange(resolvedTicker);
       setWatchlistInput("");
@@ -211,19 +254,10 @@ export default function TrackerPanel({
     }
   }
 
-  async function handleAddAlert() {
-    if (!alertTargetTicker) return;
-    await addAlert({
-      ticker: alertTargetTicker,
-      threshold_percent: threshold,
-      direction
-    });
-  }
-
   async function handlePoll() {
     setLoading(true);
     try {
-      const refreshed = await triggerTrackerPoll();
+      const refreshed = await getTrackerSnapshot(watchlist);
       setSnapshot(refreshed);
     } finally {
       setLoading(false);
@@ -252,35 +286,6 @@ export default function TrackerPanel({
       updateCreateForm("name", `${resolvedTicker} Tracker Agent`);
     }
     setCreateSearchError("");
-  }
-
-  async function handleCreateTickerSearch() {
-    const query = createForm.symbol.trim();
-    if (!query) {
-      setCreateSearchError("Type a company name or ticker first.");
-      setCreateSearchResults([]);
-      return;
-    }
-    setCreateSearchLoading(true);
-    setCreateSearchError("");
-    try {
-      const results = await searchTickerDirectory(query, 8);
-      setCreateSearchResults(results);
-      if (results.length === 0) {
-        setCreateSearchError("No ticker matches found for that company.");
-        return;
-      }
-      if (results.length === 1) {
-        applyCreateTickerResult(results[0]);
-      } else {
-        setCreateSearchError("Multiple matches found. Select the correct ticker below.");
-      }
-    } catch {
-      setCreateSearchResults([]);
-      setCreateSearchError("Ticker lookup failed. Try again.");
-    } finally {
-      setCreateSearchLoading(false);
-    }
   }
 
   async function handleCreateAgentWithSettings() {
@@ -363,7 +368,7 @@ export default function TrackerPanel({
           : undefined;
       const delivered = Boolean(twilioInfo?.delivered);
       const twilioError = typeof twilioInfo?.error === "string" ? twilioInfo.error : "";
-      const [freshAgents, refreshed] = await Promise.all([listTrackerAgents(), triggerTrackerPoll().catch(() => null)]);
+      const [freshAgents, refreshed] = await Promise.all([listTrackerAgents(), getTrackerSnapshot(watchlist).catch(() => null)]);
       setAgents(freshAgents);
       if (refreshed) setSnapshot(refreshed);
       setCreateModalOpen(false);
@@ -432,7 +437,7 @@ export default function TrackerPanel({
       }));
       setInstructionDraft("");
       setInstructionModalAgentId(null);
-      const refreshed = await triggerTrackerPoll().catch(() => null);
+      const refreshed = await getTrackerSnapshot(watchlist).catch(() => null);
       if (refreshed) setSnapshot(refreshed);
     } catch (error) {
       setInstructionError(error instanceof Error ? error.message : "Manager interaction failed.");
@@ -532,8 +537,15 @@ export default function TrackerPanel({
     }
   }
 
-  function handleRemoveWatchlistTicker(symbol: string) {
-    void onWatchlistChange(watchlist.filter((tickerSymbol) => tickerSymbol !== symbol));
+  async function handleRemoveWatchlistTicker(symbol: string) {
+    setLoading(true);
+    try {
+      const updatedWatchlist = await onWatchlistChange(watchlist.filter((tickerSymbol) => tickerSymbol !== symbol));
+      const refreshed = await getTrackerSnapshot(updatedWatchlist);
+      setSnapshot(refreshed);
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
@@ -543,8 +555,6 @@ export default function TrackerPanel({
         activeTicker={activeTicker}
         onSelectTicker={onTickerChange}
         onRemoveTicker={handleRemoveWatchlistTicker}
-        favorites={favorites}
-        onToggleFavorite={(ticker) => void onToggleFavorite(ticker)}
       />
 
       <div className="glass-card card-row tracker-actions tracker-watchlist-card">
@@ -594,38 +604,6 @@ export default function TrackerPanel({
         <button className="secondary" onClick={handlePoll} disabled={loading}>
           {loading ? "Refreshing…" : "Refresh Market Data"}
         </button>
-      </div>
-
-      <div className="glass-card card-row tracker-actions">
-        <div className="tracker-alert-target">
-          <p className="muted">Alert Target</p>
-          <strong>{alertTargetTicker}</strong>
-          <p className="muted">
-            {resolvedInputTicker
-              ? "Using the ticker resolved from Add Company / Ticker."
-              : "Using the currently selected watchlist ticker."}
-          </p>
-        </div>
-        <label>
-          Threshold %
-          <input
-            type="number"
-            min={0.1}
-            max={25}
-            step={0.1}
-            value={threshold}
-            onChange={(event) => setThreshold(Number(event.target.value) || 2)}
-          />
-        </label>
-        <label>
-          Direction
-          <select value={direction} onChange={(event) => setDirection(event.target.value as "up" | "down" | "either")}>
-            <option value="either">Either</option>
-            <option value="up">Up</option>
-            <option value="down">Down</option>
-          </select>
-        </label>
-        <button onClick={handleAddAlert}>Add Alert</button>
       </div>
 
       <div className="glass-card stack">
@@ -719,10 +697,10 @@ export default function TrackerPanel({
           <span className="muted">{snapshot?.generated_at ? new Date(snapshot.generated_at).toLocaleTimeString() : "No data"}</span>
         </div>
         <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Ticker</th>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Ticker</th>
                 <th>Price</th>
                 <th>Change</th>
                 <th>P/E</th>
@@ -731,14 +709,14 @@ export default function TrackerPanel({
                 <th>Mkt Cap</th>
                 <th>Signal</th>
               </tr>
-            </thead>
-            <tbody>
-              {sorted.map((item) => {
-                const signal = item.change_percent > 1.5 ? "Momentum" : item.change_percent < -1.5 ? "Risk" : "Neutral";
-                return (
-                  <tr
-                    key={item.ticker}
-                    className={item.ticker === activeTicker ? "selected-row" : ""}
+                </thead>
+                <tbody>
+                  {marketGridTickers.map((item) => {
+                    const signal = item.change_percent > 1.5 ? "Momentum" : item.change_percent < -1.5 ? "Risk" : "Neutral";
+                    return (
+                      <tr
+                        key={item.ticker}
+                        className={item.ticker === activeTicker ? "selected-row" : ""}
                     onClick={() => onTickerChange(item.ticker)}
                     role="button"
                   >
@@ -782,40 +760,47 @@ export default function TrackerPanel({
             <div className="tracker-create-grid">
               <label>
                 Ticker or Company
-                <div className="tracker-create-symbol-row">
+                <div className="ticker-autocomplete">
                   <input
                     value={createForm.symbol}
+                    onFocus={() => setCreateSymbolFocused(true)}
+                    onBlur={() => setTimeout(() => setCreateSymbolFocused(false), 120)}
                     onChange={(event) => {
                       updateCreateForm("symbol", normalizeSymbol(event.target.value));
                       setCreateSearchError("");
                     }}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter") return;
+                      event.preventDefault();
+                      const top = createSearchResults[0];
+                      if (top) applyCreateTickerResult(top);
+                    }}
                     placeholder="NVDA or Nvidia"
                   />
-                  <button
-                    type="button"
-                    className="secondary tracker-create-search-btn"
-                    onClick={() => void handleCreateTickerSearch()}
-                    disabled={createLoading || createSearchLoading || !createForm.symbol.trim()}
-                  >
-                    {createSearchLoading ? "Searching..." : "Search"}
-                  </button>
+                  {createSymbolFocused && createForm.symbol.trim() ? (
+                    <div className="ticker-suggestions" role="listbox" aria-label="Ticker suggestions">
+                      {createSearchResults.length > 0 ? (
+                        createSearchResults.slice(0, 6).map((result) => (
+                          <button
+                            key={`${result.ticker}-${result.name}`}
+                            type="button"
+                            className="ticker-suggestion"
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => applyCreateTickerResult(result)}
+                          >
+                            <span className="ticker-suggestion-symbol">{result.ticker}</span>
+                            <span className="ticker-suggestion-name">{result.name}</span>
+                          </button>
+                        ))
+                      ) : createSearchLoading ? (
+                        <p className="ticker-suggestion-empty">Searching…</p>
+                      ) : (
+                        <p className="ticker-suggestion-empty">No matches found</p>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
                 {createSearchError ? <span className="muted">{createSearchError}</span> : null}
-                {createSearchResults.length > 0 ? (
-                  <div className="tracker-create-search-results">
-                    {createSearchResults.slice(0, 5).map((result) => (
-                      <button
-                        key={`${result.ticker}-${result.name}`}
-                        type="button"
-                        className="tracker-create-search-item"
-                        onClick={() => applyCreateTickerResult(result)}
-                      >
-                        <span className="tracker-create-search-symbol">{result.ticker}</span>
-                        <span className="tracker-create-search-name">{result.name}</span>
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
               </label>
 
               <label>

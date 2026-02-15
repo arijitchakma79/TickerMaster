@@ -5,6 +5,7 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,7 +21,6 @@ from app.ws_manager import WSManager
 
 logger = logging.getLogger(__name__)
 
-
 # Avoid noisy WinError 10054 callback traces from Proactor transport shutdown
 # when local clients disconnect abruptly after successful responses.
 if sys.platform.startswith("win"):
@@ -28,7 +28,6 @@ if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -49,14 +48,35 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to ensure Supabase tracker storage buckets on startup.")
 
-    await tracker_service.start()
+    try:
+        await tracker_service.start()
+    except Exception:
+        logger.exception("Failed to start tracker service")
 
-    yield
+    try:
+        yield
+    finally:
+        try:
+            await tracker_service.stop()
+        except Exception:
+            logger.exception("Failed to stop tracker service")
 
-    await tracker_service.stop()
-    for session in list(orchestrator.sessions):
-        await orchestrator.stop(session)
-    await shutdown_tracker_mcp_router()
+        session_ids: list[Any]
+        try:
+            session_ids = list(orchestrator.sessions.keys())  # type: ignore[union-attr]
+        except Exception:
+            session_ids = list(orchestrator.sessions)  # type: ignore[arg-type]
+
+        for session_id in session_ids:
+            try:
+                await orchestrator.stop(session_id)
+            except Exception:
+                logger.exception("Failed to stop simulation session %s", session_id)
+
+        try:
+            await shutdown_tracker_mcp_router()
+        except Exception:
+            logger.exception("Failed to shutdown tracker MCP router")
 
 
 settings = get_settings()
@@ -66,8 +86,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.frontend_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-User-Id"],
 )
 
 app.include_router(system.router)
@@ -80,8 +100,10 @@ app.include_router(chat.router)
 
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
+    allowed_channels = {"global", "simulation", "tracker", "agents"}
     channels_param = websocket.query_params.get("channels", "global,simulation,tracker")
-    channels = {channel.strip() for channel in channels_param.split(",") if channel.strip()}
+    requested_channels = {channel.strip() for channel in channels_param.split(",") if channel.strip()}
+    channels = {channel for channel in requested_channels if channel in allowed_channels} or {"global"}
 
     manager: WSManager = websocket.app.state.ws_manager
     await manager.connect(websocket, channels=channels)
@@ -112,6 +134,7 @@ async def websocket_stream(websocket: WebSocket):
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
     except Exception:
+        logger.exception("Unhandled websocket stream error")
         await manager.disconnect(websocket)
 
 
