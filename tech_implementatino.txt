@@ -1,0 +1,540 @@
+TickerMaster Technical Implementation Report
+==========================================
+
+Last updated: 2026-02-15
+Repository root: /Users/jeffreygong/Documents/GitHub/TickerMaster
+
+0) System Overview
+------------------
+TickerMaster is a monorepo with:
+- Backend: FastAPI app (`backend/app`) that exposes REST + WebSocket endpoints.
+- Frontend: React + TypeScript + Vite SPA (`frontend/src`) with three product surfaces: Research, Simulation, Tracker.
+- Database: Supabase Postgres + Storage (`supabase/schema.sql`).
+
+Core product workflows:
+1. Research: multi-source sentiment synthesis (Perplexity + X + Reddit + prediction markets).
+2. Simulation: multi-agent market simulator with order book, slippage, stochastic returns, and news diffusion.
+3. Tracker: watchlist polling + trigger evaluation + alert generation + optional external notification handoff.
+
+The implementation is heavily fallback-oriented: almost every external dependency degrades to cached data, alternate providers, or synthetic templates.
+
+
+1) Runtime Architecture
+-----------------------
+1.1 Process and app lifecycle
+- Entry point: `backend/app/main.py`.
+- `lifespan` bootstraps and stores on `app.state`:
+  - `settings` (`get_settings()`)
+  - `ws_manager` (`WSManager`)
+  - `orchestrator` (`SimulationOrchestrator`)
+  - `tracker` (`TrackerService`)
+- On startup, tracker background poller starts (`tracker_service.start()`).
+- On shutdown, active simulation sessions are stopped and persisted.
+
+1.2 Router registration
+Registered routers:
+- `system` (health + integration status)
+- `api` (broad aggregate namespace + profile + tracker agent ops)
+- `research`
+- `simulation`
+- `tracker`
+- `chat`
+
+There is intentional/legacy overlap between `/api/...` and domain routers (notably tracker and research access patterns).
+
+1.3 CORS
+CORS allows configured frontend origins (`FRONTEND_ORIGINS`) and credentials. Headers include `Authorization`, `Content-Type`, and `X-User-Id`.
+
+
+2) Configuration and Environment Model
+--------------------------------------
+2.1 Config loader
+`backend/app/config.py` implements custom `.env` loading with fallback search paths:
+- local `.env`
+- repo-level `.env` from parent directories
+
+`Settings` dataclass includes:
+- Core: app/env/logging/frontend origins
+- Supabase keys + DB URL
+- Market data provider creds (Alpaca, Finnhub, TwelveData)
+- LLM creds (OpenAI, OpenRouter, Perplexity)
+- Social creds (X, Reddit)
+- Prediction market config (Kalshi, Polymarket)
+- Macro/FRED key
+- Browserbase
+- Modal sandbox + inference runtime knobs
+- Poke handoff config
+- Cerebras and NVIDIA NIM keys
+- Tracker poll interval/default watchlist
+
+2.2 Validation behavior
+- In production (`ENVIRONMENT=production`), missing Supabase vars hard-fail app startup.
+- Frontend origins are URL-validated.
+
+
+3) Data Model and Persistence Contracts
+---------------------------------------
+3.1 Supabase schema (`supabase/schema.sql`)
+Key tables:
+- `profiles`
+- `tracker_agents`
+- `tracker_alerts`
+- `simulations`
+- `agent_activity`
+- `research_cache`
+- `watchlist`
+- `favorite_stocks`
+- `simulation_agents`
+
+3.2 RLS and policies
+- RLS enabled on all public tables.
+- User-owned rows enforce `auth.uid() = user_id` style checks.
+- Service-like inserts allowed for alerts/activity/cache.
+- Trigger auto-updates `updated_at` on mutable tables.
+
+3.3 Repository patterns
+- `get_supabase()` returns client using service key when available, else publishable key.
+- If DB unavailable/forbidden, many services transparently fall back to in-memory or cached local behavior.
+
+
+4) Authentication and Identity Resolution
+-----------------------------------------
+4.1 Request user identity (`user_context.py`)
+User ID resolution order:
+1. `Authorization: Bearer <jwt>` -> `supabase.auth.get_user(...)` lookup (cached by token hash).
+2. `x-user-id` header if valid UUID.
+3. Otherwise unauthenticated.
+
+Token lookup cache:
+- TTL: 300s
+- max entries: 2048
+- oldest eviction batch when full
+
+4.2 Frontend auth model
+Frontend does direct Supabase auth REST calls (`/auth/v1`) in `frontend/src/lib/api.ts`:
+- sign in / sign up / sign out
+- session stored in localStorage (`tickermaster-auth-session`)
+- axios interceptor injects Bearer token + `x-user-id`
+
+4.3 Profile constraints
+- Username setup is enforced by app logic (`/api/user/profile` + `/api/user/preferences`).
+- Username can become effectively immutable once set away from email-default identity.
+- Avatar uploads accept base64 data URL, size/type validated, uploaded to Supabase Storage bucket.
+
+
+5) Real-Time Event Infrastructure
+---------------------------------
+5.1 WebSocket manager (`ws_manager.py`)
+- Tracks sockets globally and per-channel.
+- Channels: `global`, `simulation`, `tracker`, `agents`.
+- Broadcast target = subscribers for channel union global channel.
+- Dead sockets are removed on send failure.
+
+5.2 WS endpoints
+- `/ws/stream` in `main.py` multiplexes global/simulation/tracker channels.
+- `/api/agents/ws` exposes activity-only stream.
+
+5.3 Activity stream
+`activity_stream.py` + `agent_logger.py`:
+- `log_agent_activity()` writes to DB (best-effort) and always pushes to WS activity stream.
+- In-memory deque keeps recent events when DB is unavailable.
+
+
+6) Research Pipeline: End-to-End
+--------------------------------
+6.1 Main path
+Primary entrypoints:
+- `POST /research/analyze`
+- `GET /api/ticker/{symbol}/ai-research`
+- `GET /api/ticker/{symbol}/sentiment`
+- `POST /research/chat`
+
+Core engine: `run_research()` in `sentiment.py`.
+
+6.2 Inputs and cache strategy
+- Cache key includes ticker + timeframe + prediction-market flag:
+  - `research:v12:<timeframe>:<include_pm_flag>`
+- TTL is long (24h) to stabilize repeated reads and reduce API churn.
+
+6.3 Source collectors
+A) Perplexity (`_perplexity_summary`)
+- If key missing: deterministic demo narrative.
+- If enabled: strict markdown structure requested from model.
+- Citations converted to `SourceLink`s.
+
+B) X (`_x_summary`)
+- Multi-level fallback chain:
+  1. X v2 recent search with bearer token.
+  2. OAuth1 v2 fallback.
+  3. Optional OAuth1 v1.1 fallback (guarded by env toggle).
+  4. Synthetic neutral summary if no posts.
+- Includes rate/spacer guardrails:
+  - max calls per window
+  - min spacing between calls
+  - in-memory post cache by ticker
+
+C) Reddit (`_reddit_summary`)
+- Uses app token when available, else public search endpoint.
+- Strong relevance filter:
+  - ticker/cashtag mention
+  - optional company alias tokens
+  - cross-ticker rejection heuristic
+- Focus on high-signal finance subreddits first.
+- Produces structured summary with coverage + top threads + themes.
+
+6.4 Composite scoring
+Weighted sentiment (explicitly coded):
+- Perplexity: 0.45
+- Reddit: 0.30
+- X: 0.25
+
+Recommendation mapping:
+- score > 0.65: `strong_buy`
+- > 0.25: `buy`
+- < -0.65: `strong_sell`
+- < -0.25: `sell`
+- else: `hold`
+
+6.5 Prediction markets integration
+`prediction_markets.py` adds Kalshi + Polymarket markets:
+- Relevance scoring requires direct ticker/company identity signals + finance context.
+- URL sanitizer ensures valid Polymarket market/event links.
+- If no stock-specific markets:
+  - optional thematic proxy matching
+  - ETF/index macro fallback for selected broad tickers only.
+
+6.6 Research chat
+`POST /research/chat`:
+- Resolves ticker from explicit field or prompt token inference.
+- Uses cached research when available.
+- Optional deep research context injection (`include_deep`).
+- Generates response with OpenAI if configured; else template fallback.
+
+
+7) Deep Research Pipeline
+-------------------------
+`run_deep_research()` in `browserbase_scraper.py` is a multi-source aggregator:
+- Attempts Browserbase session creation (optional enhancement; not hard requirement).
+- Concurrently fetches:
+  - advanced stock fundamentals
+  - Finnhub recommendation timeline
+  - price target
+  - company news
+  - Reddit highlights
+  - full research snapshot (`run_research`, cached when possible)
+- Produces:
+  - analyst summary
+  - insider summary
+  - Reddit DD summary
+  - curated bullets + source list
+
+Output includes both structured data and summarized narrative bullets for UI rendering.
+
+
+8) Market Data Service Architecture
+-----------------------------------
+8.1 Symbol resolution
+`resolve_symbol_input()` supports:
+- direct ticker forms (`AAPL`, `BRK.B` -> normalized `BRK-B`)
+- parenthesized forms (`Alaska Airlines (ALK)`)
+- provider search fallback via Finnhub.
+
+8.2 Quote provider chain (`fetch_metric`)
+Ordered fallback:
+1. Finnhub quote + metrics + profile
+2. Alpaca snapshot (with Finnhub fundamentals enrichment when available)
+3. in-memory last metric cache
+4. raise runtime error
+
+8.3 Candle provider chain (`fetch_candles`)
+Ordered fallback:
+1. Finnhub candles
+2. Alpaca bars
+3. TwelveData
+4. Stooq daily data (with local weekly/monthly aggregation)
+5. in-memory last candles cache
+
+8.4 Advanced snapshot (`fetch_advanced_stock_data`)
+Merges from many providers:
+- Finnhub fundamentals/profile/recommendation/price target/insider
+- TwelveData statistics
+- Yahoo quote
+- SEC company facts / Form 4 fallback
+- Prior cached advanced snapshot (TTL 15 min) if fresh
+
+8.5 Macro data
+`macro.py` fetches FRED observations for rates, CPI, unemployment, 10Y yield, VIX (if key configured).
+
+
+9) Simulation Engine: Internal Mechanics
+----------------------------------------
+9.1 Runtime model
+`SimulationOrchestrator` stores live sessions keyed by UUID.
+Per session state (`SessionRuntime`):
+- ticker universe (up to 12)
+- current and per-ticker prices
+- volatility
+- agents and portfolios
+- trade log, news queues, recent prices
+- crash regime flag
+- pause/resume bookkeeping
+
+9.2 Agent model
+Each agent has:
+- strategy personality (`quant_momentum`, `fundamental_value`, `retail_reactive`)
+- aggressiveness/risk_limit/trade_size
+- optional strategy prompt
+- LLM model id
+
+9.3 Market dynamics loop
+Per 1-second tick (`_run_loop`):
+1. Sample base market return from scaled SP500 historical returns.
+2. Add idiosyncratic + trend-memory components per ticker.
+3. Enter/exit crash mode based on extreme downside draw + probabilistic recovery.
+4. Refresh news (Yahoo + Reddit + X + Polymarket + optional Perplexity) with dedupe and pacing.
+5. Compute per-agent decision policy, optionally refined by LLM every 6 ticks.
+6. Validate trade affordability/holdings.
+7. Execute with spread + impact slippage model.
+8. Apply market impact back into ticker price.
+9. Broadcast WS tick payload with order book, trades, portfolios, news.
+
+9.4 Microstructure model
+- Spread basis points grows with volatility.
+- Impact basis points grows with order size and volatility.
+- Fill price applies directional slippage.
+- Post-trade price impact nudges market price.
+
+9.5 LLM in simulation
+Decision API (`generate_agent_decision`):
+- Primary remote: OpenRouter chat completion returning strict JSON trade action.
+- Optional first hop: Modal inference function.
+- Modal failures trigger temporary backoff window to prevent tick stalls.
+- Missing/failing model path defaults to hold/no-trade.
+
+9.6 Persistence
+`simulation_store.py`:
+- Creates simulation record on start.
+- Updates final `results` and status on completion/stop.
+- Attaches modal sandbox id when launched.
+
+
+10) Tracker Pipeline: Monitoring and Alerting
+---------------------------------------------
+10.1 Poller lifecycle
+`TrackerService.start()` launches background `run_forever()` loop:
+- poll interval from settings (minimum enforced sleep 10s)
+- catches exceptions and broadcasts tracker error events
+
+10.2 Poll iteration (`poll_once`)
+For each watchlist symbol:
+- fetch metric snapshot
+- compare against prior tick price/volume
+- evaluate user-created tracker agents for trigger matches
+- evaluate generic manual alerts
+- optionally execute full investigate/synthesize pipeline for large moves or volume spikes
+
+10.3 Agent trigger model
+Sanitized trigger fields include:
+- `price_change_pct`
+- `volume_spike_ratio`
+- `sentiment_bearish_threshold`
+- `sentiment_bullish_threshold`
+- `x_bearish_threshold`
+- optional `research_timeframe`
+
+10.4 Alert generation
+On trigger hit:
+- compute reason list
+- synthesize narrative (Cerebras -> NVIDIA NIM -> template fallback)
+- persist `tracker_alerts`
+- update agent stats (`last_alert_at`, `total_alerts`)
+- broadcast tracker event via WS
+- optionally prepare Poke handoff payload
+
+10.5 Cooldown
+Agents enforce a 15-minute cooldown using `last_alert_at` to prevent rapid repeated firing.
+
+
+11) API Surface by Domain
+-------------------------
+11.1 System
+- `GET /health`
+- `GET /integrations`
+
+11.2 Research
+- `POST /research/analyze`
+- `GET /research/candles/{ticker}`
+- `GET /research/indicators/{ticker}`
+- `GET /research/advanced/{ticker}`
+- `GET /research/quote/{ticker}`
+- `GET /research/movers`
+- `POST /research/chat`
+- `POST /research/deep/{ticker}`
+
+11.3 Simulation
+- `POST /simulation/start`
+- `POST /simulation/stop/{session_id}`
+- `POST /simulation/pause/{session_id}`
+- `POST /simulation/resume/{session_id}`
+- `GET /simulation/state/{session_id}`
+- `GET /simulation/sessions`
+- `GET|PUT|DELETE /simulation/agents...`
+- `POST /simulation/modal/sandbox`
+- `GET /simulation/modal/cron-health`
+
+11.4 Tracker
+- `GET /tracker/snapshot`
+- `GET|POST /tracker/watchlist`
+- `GET|POST /tracker/alerts`
+- `POST /tracker/poll`
+- `POST|GET|PATCH|DELETE /tracker/agents...`
+- `POST /tracker/emit-alert`
+
+11.5 Aggregate API namespace (`/api`)
+Also exposes combined endpoints for:
+- ticker quote/sentiment/research bundles
+- profile/preferences/favorites/trades
+- tracker agent NL creation and manager-agent interaction
+- agent activity feed
+- poke inbound command parsing
+
+
+12) Frontend Implementation Architecture
+----------------------------------------
+12.1 Top-level composition
+`App.tsx` owns global UI state:
+- active tab (`research`, `simulation`, `tracker`)
+- active ticker + watchlist/favorites
+- theme
+- auth/session/profile state
+- websocket event feed from `useSocket()`
+
+12.2 Data access layer
+`frontend/src/lib/api.ts`:
+- Centralized axios client with auth interceptors.
+- Supabase auth helpers (REST-based, no separate SDK in component code).
+- Typed wrappers for all backend endpoints.
+- Multi-endpoint fallback logic for legacy route compatibility (notably research/chat).
+
+12.3 WebSocket hook
+`useSocket()`:
+- connects to `/ws/stream?channels=global,simulation,tracker,agents`
+- sends heartbeat `ping` every 10s
+- reconnects every 2s on disconnect
+- keeps bounded recent event buffer
+- exposes derived latest simulation tick/lifecycle + tracker snapshot
+
+12.4 ResearchPanel behavior
+- Local storage caches for advanced/research/candles snapshots.
+- Ticker lookup and normalization pipeline.
+- Indicator overlays and parsed source-summary rendering.
+- Research chat fallback if backend route unavailable.
+
+12.5 SimulationPanel behavior
+- Built-in institutional agents + user-defined agents.
+- Custom agent editor maps sliders -> agent risk/aggression/personality config.
+- Prompt parsing infers ticker universe; validates tradable symbols via quote checks.
+- Starts simulation with `inference_runtime: modal`, then optionally triggers sandbox spin-up.
+- Live telemetry: price series chart, portfolio standings, trade log, news feed.
+- Session-end OpenAI commentary + downloadable PDF report (`jsPDF`).
+
+12.6 TrackerPanel behavior
+- Watchlist CRUD + ticker suggestions.
+- Manual alert creation (threshold + direction).
+- Poll trigger and market grid display.
+- Alert stream display from tracker snapshots.
+
+
+13) Caching and Degradation Strategy
+------------------------------------
+13.1 Persistence cache table
+`research_cache` stores payloads with explicit expirations for many domains:
+- quotes
+- research summaries
+- candles
+- movers snapshot
+- prediction markets
+- fallback stores (e.g., simulation agent entries)
+
+13.2 In-memory caches
+- Last known quotes/candles/advanced snapshots.
+- X sentiment cache and rate-limit state.
+- Reddit token/search cache.
+- Local activity ring buffer.
+
+13.3 Degradation philosophy
+If provider calls fail:
+- return stale but flagged data when possible
+- use alternate providers
+- fall back to deterministic templates
+- avoid hard-crashing UI paths
+
+
+14) Testing Coverage Snapshot
+-----------------------------
+Backend tests cover:
+- API hardening/auth requirements for tracker/profile endpoints.
+- Market movers cache/fallback behavior.
+- Prediction market relevance and link-building edge cases.
+- Simulation-agent fallback persistence path when Supabase unavailable.
+- Deploy smoke tests for research indicators and provider failure handling.
+
+Observed note: one smoke test expectation around query-string user-id fallback appears inconsistent with current `get_user_id_from_request` implementation (which currently does not parse query params).
+
+
+15) Security and Operational Considerations
+-------------------------------------------
+Implemented safeguards:
+- UUID validation for user identity headers.
+- Route-level 401 enforcement on protected endpoints.
+- Input constraints via Pydantic and trigger sanitization/clamping.
+- RLS policies in Supabase.
+- Bounded caches and background guardrails to avoid unbounded memory growth.
+
+Current technical tradeoffs to be ready to discuss:
+- `/api` and domain router duplication increases maintenance surface.
+- Some route handlers return soft-error payloads while others raise HTTPException; behavior is not fully uniform.
+- Service-role vs anon key behavior can differ by deployment policy setup.
+- Long cache TTLs stabilize UX but may delay visibility of provider-side updates.
+
+
+16) End-to-End Request Traces (Interview-Friendly)
+--------------------------------------------------
+A) `GET /api/ticker/NVDA`
+1. Normalize timeframe and check bundle cache.
+2. Parallel fan-out:
+   - quote (`fetch_metric`)
+   - research (`run_research`)
+   - macro (`get_macro_indicators`)
+   - deep research (`run_deep_research`)
+3. Merge partial failures without dropping whole response.
+4. Cache 5 minutes and return payload.
+
+B) `POST /simulation/start`
+1. Validate request schema.
+2. Build runtime session and agent portfolios.
+3. Persist simulation row.
+4. Spawn async tick loop task.
+5. Broadcast `simulation_started` event.
+6. Return initial state.
+
+C) Tracker auto alert cycle
+1. Background poll fetches current metrics.
+2. Derives change/volume deltas from previous snapshot.
+3. Runs trigger checks + sentiment snapshot.
+4. On hit, narrative synthesis and alert persistence.
+5. WS broadcast to tracker channel and activity stream.
+
+
+17) Practical Summary
+---------------------
+TickerMaster is implemented as an event-driven, fallback-tolerant FastAPI + React system where:
+- backend services compose multiple external data/LLM providers,
+- WebSocket channels keep simulation/tracker UIs live,
+- Supabase stores user state and historical artifacts,
+- frontend modules are strongly typed and organized around product surfaces.
+
+The strongest technical characteristics are:
+- robust provider fallback chains,
+- explicit state models for simulation and tracking,
+- pragmatic resilience over strict dependency assumptions.
