@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -17,6 +18,15 @@ from app.services.tracker_csv import ensure_tracker_storage_buckets
 from app.ws_manager import WSManager
 
 logger = logging.getLogger(__name__)
+
+
+# Avoid noisy WinError 10054 callback traces from Proactor transport shutdown
+# when local clients disconnect abruptly after successful responses.
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 
 @asynccontextmanager

@@ -193,14 +193,22 @@ def sanitize_tracker_triggers(raw: dict[str, Any] | None) -> dict[str, Any]:
     if schedule_mode not in {"realtime", "hourly", "daily", "custom"}:
         schedule_mode = "realtime"
     out["schedule_mode"] = schedule_mode
-    if schedule_mode == "hourly":
+    custom_time_enabled = bool(raw.get("custom_time_enabled"))
+    out["custom_time_enabled"] = custom_time_enabled
+    if schedule_mode == "realtime":
+        out["poll_interval_seconds"] = 120
+        out["report_interval_seconds"] = 120
+    elif schedule_mode == "hourly":
         out["poll_interval_seconds"] = 3600
-        out["report_interval_seconds"] = max(out["report_interval_seconds"], 3600)
+        out["report_interval_seconds"] = 3600
     elif schedule_mode == "daily":
         out["poll_interval_seconds"] = 86400
-        out["report_interval_seconds"] = max(out["report_interval_seconds"], 86400)
+        out["report_interval_seconds"] = 86400
+    elif schedule_mode == "custom" and custom_time_enabled:
+        out["poll_interval_seconds"] = 86400
+        out["report_interval_seconds"] = 86400
 
-    if schedule_mode == "daily":
+    if schedule_mode == "daily" or (schedule_mode == "custom" and custom_time_enabled):
         daily_run_time_raw = str(raw.get("daily_run_time") or "09:30").strip()
         daily_match = re.match(r"^(\d{1,2}):(\d{2})$", daily_run_time_raw)
         if daily_match:
@@ -257,6 +265,9 @@ def sanitize_tracker_triggers(raw: dict[str, Any] | None) -> dict[str, Any]:
         report_mode = "hybrid"
     out["report_mode"] = report_mode
 
+    style_raw = str(raw.get("notification_style") or "auto").strip().lower()
+    out["notification_style"] = style_raw if style_raw in {"auto", "short", "long"} else "auto"
+
     allowed_tools = {
         "price",
         "volume",
@@ -292,6 +303,7 @@ def sanitize_tracker_triggers(raw: dict[str, Any] | None) -> dict[str, Any]:
             cleaned_sources.append(token)
         if cleaned_sources:
             out["research_sources"] = cleaned_sources
+    out["research_source_lock"] = bool(raw.get("research_source_lock", False))
 
     allowed_channels = {"twilio", "poke"}
     raw_channels = raw.get("notify_channels")
@@ -347,7 +359,7 @@ def _extract_explicit_research_sources(text: str) -> tuple[list[str], bool]:
         found.append("perplexity")
     if " x " in lower or " twitter " in lower:
         found.append("x")
-    if " prediction market" in lower or " polymarket" in lower or " kalshi" in lower:
+    if " prediction market" in lower or " polymarket" in lower or " kalshi" in lower or " trading market" in lower:
         found.append("prediction_markets")
     if " deep research" in lower or " browserbase" in lower:
         found.append("deep")
@@ -510,24 +522,41 @@ def _apply_prompt_overrides(prompt: str, raw_triggers: dict[str, Any] | None) ->
     explicit_interval = _extract_interval_seconds(prompt)
     if explicit_interval is not None:
         merged["schedule_mode"] = "custom"
+        merged["custom_time_enabled"] = False
         merged["poll_interval_seconds"] = explicit_interval
         merged["report_interval_seconds"] = explicit_interval
     elif "realtime" in lower or "real time" in lower:
         # Product default for realtime crawler behavior.
         merged["schedule_mode"] = "realtime"
-        merged.setdefault("poll_interval_seconds", 120)
-        merged.setdefault("report_interval_seconds", 120)
+        merged["custom_time_enabled"] = False
+        merged["poll_interval_seconds"] = 120
+        merged["report_interval_seconds"] = 120
     elif "hourly" in lower:
         merged["schedule_mode"] = "hourly"
+        merged["custom_time_enabled"] = False
         merged["poll_interval_seconds"] = 3600
         merged["report_interval_seconds"] = 3600
     elif "daily" in lower:
         merged["schedule_mode"] = "daily"
+        merged["custom_time_enabled"] = False
         merged["poll_interval_seconds"] = 86400
-        merged.setdefault("report_interval_seconds", 86400)
+        merged["report_interval_seconds"] = 86400
         daily_run_time = _extract_daily_run_time(prompt)
         if daily_run_time:
             merged["daily_run_time"] = daily_run_time
+
+    custom_daily_time = _extract_daily_run_time(prompt)
+    if (
+        explicit_interval is None
+        and custom_daily_time
+        and any(token in lower for token in {"custom time", "custom schedule", "specific time", "every day at", "each day at", "daily at"})
+        and str(merged.get("schedule_mode") or "") not in {"daily"}
+    ):
+        merged["schedule_mode"] = "custom"
+        merged["custom_time_enabled"] = True
+        merged["daily_run_time"] = custom_daily_time
+        merged["poll_interval_seconds"] = 86400
+        merged["report_interval_seconds"] = 86400
 
     wants_report = any(
         token in lower
@@ -584,7 +613,6 @@ def _apply_prompt_overrides(prompt: str, raw_triggers: dict[str, Any] | None) ->
     explicit_sources, exclusive_sources = _extract_explicit_research_sources(prompt)
     explicit_tools = _extract_explicit_tools(prompt)
     if explicit_tools:
-        merged["tool_mode"] = "manual"
         existing_tools = merged.get("tools")
         existing_tokens = [str(item).strip().lower() for item in existing_tools] if isinstance(existing_tools, list) else []
         merged["tools"] = list(dict.fromkeys(existing_tokens + explicit_tools))
@@ -595,20 +623,38 @@ def _apply_prompt_overrides(prompt: str, raw_triggers: dict[str, Any] | None) ->
         existing_sources = merged.get("research_sources")
         existing_tokens = [str(item).strip().lower() for item in existing_sources] if isinstance(existing_sources, list) else []
         merged["research_sources"] = explicit_sources if exclusive_sources else list(dict.fromkeys(existing_tokens + explicit_sources))
+        merged["research_source_lock"] = bool(exclusive_sources)
         # If user explicitly asks for one source only, pin to sentiment/news tools.
         if exclusive_sources:
-            merged["tool_mode"] = "manual"
             base_tools = [tool for tool in explicit_tools if tool in {"price", "volume", "simulation"}]
             sentiment_stack = ["sentiment", "news"]
             merged["tools"] = list(dict.fromkeys(base_tools + sentiment_stack))
+    elif "research_source_lock" not in merged:
+        merged["research_source_lock"] = False
+
+    directional_patterns: dict[str, tuple[str, ...]] = {
+        "reddit": (" from reddit", " on reddit", " via reddit", " reddit sentiment"),
+        "x": (" from x", " on x", " via x", " from twitter", " on twitter", " twitter sentiment"),
+        "perplexity": (" from perplexity", " via perplexity", " perplexity search"),
+        "prediction_markets": (" from prediction market", " from prediction markets", " from polymarket", " from kalshi", " from trading market"),
+        "deep": (" from deep research", " via deep research", " from browserbase"),
+    }
+    directional_sources = [
+        source
+        for source, needles in directional_patterns.items()
+        if source in explicit_sources and any(needle in lower for needle in needles)
+    ]
+    if directional_sources and not exclusive_sources:
+        merged["research_sources"] = list(dict.fromkeys(directional_sources))
+        merged["research_source_lock"] = True
 
     if "24/7" in lower or "24x7" in lower or "always on" in lower:
         merged["schedule_mode"] = "realtime"
-        merged["poll_interval_seconds"] = int(merged.get("poll_interval_seconds") or 120)
-        merged["report_interval_seconds"] = int(merged.get("report_interval_seconds") or merged["poll_interval_seconds"])
+        merged["custom_time_enabled"] = False
+        merged["poll_interval_seconds"] = 120
+        merged["report_interval_seconds"] = 120
 
     if any(token in lower for token in {"sentiment analysis", "market sentiment", "sentiment report", "sentiment summary"}):
-        merged.setdefault("tool_mode", "manual")
         tools = merged.get("tools")
         existing_tools = [str(item).strip().lower() for item in tools] if isinstance(tools, list) else []
         merged["tools"] = list(dict.fromkeys(existing_tools + ["sentiment", "news"]))
@@ -627,7 +673,6 @@ def _apply_prompt_overrides(prompt: str, raw_triggers: dict[str, Any] | None) ->
             "search",
         }
     ):
-        merged.setdefault("tool_mode", "manual")
         tools = merged.get("tools")
         existing_tools = [str(item).strip().lower() for item in tools] if isinstance(tools, list) else []
         merged["tools"] = list(dict.fromkeys(existing_tools + ["news", "sentiment"]))
@@ -642,10 +687,18 @@ def _apply_prompt_overrides(prompt: str, raw_triggers: dict[str, Any] | None) ->
         merged["tool_mode"] = "auto"
         merged.pop("tools", None)
 
+    if any(token in lower for token in {"brief", "short", "quick", "concise"}):
+        merged["notification_style"] = "short"
+    elif any(token in lower for token in {"long", "detailed", "full analysis", "thesis", "deep dive"}):
+        merged["notification_style"] = "long"
+    else:
+        merged.setdefault("notification_style", "auto")
+
     # Default explicit schedule when user says "real-time" preferences without interval.
     if str(merged.get("schedule_mode") or "").lower() == "realtime":
-        merged.setdefault("poll_interval_seconds", 120)
-        merged.setdefault("report_interval_seconds", 120)
+        merged["custom_time_enabled"] = False
+        merged["poll_interval_seconds"] = 120
+        merged["report_interval_seconds"] = 120
     return merged
 
 
@@ -1233,6 +1286,9 @@ async def _notify_agent_created_twilio(
 
     poll_minutes = _interval_minutes(triggers.get("poll_interval_seconds"), 120)
     report_minutes = _interval_minutes(triggers.get("report_interval_seconds"), int(triggers.get("poll_interval_seconds") or 120))
+    daily_run_time = str(triggers.get("daily_run_time") or "").strip()
+    timezone_name = str(triggers.get("timezone") or "America/New_York")
+    custom_time_enabled = bool(triggers.get("custom_time_enabled"))
     start_at_raw = str(triggers.get("start_at") or "").strip()
     start_phrase = "Starts now"
     if start_at_raw:
@@ -1251,10 +1307,21 @@ async def _notify_agent_created_twilio(
         triggers=triggers,
         request=request,
     )
+    cadence_phrase = f"Realtime updates every {poll_minutes} min."
+    mode_token = str(schedule_mode).strip().lower()
+    if mode_token == "hourly":
+        cadence_phrase = "Runs hourly."
+    elif mode_token == "daily":
+        cadence_phrase = f"Runs daily at {daily_run_time or '09:30'} ({timezone_name})."
+    elif mode_token == "custom" and custom_time_enabled:
+        cadence_phrase = f"Runs at custom time {daily_run_time or '09:30'} ({timezone_name})."
+    elif mode_token == "custom":
+        cadence_phrase = f"Runs every {poll_minutes} min."
+
     title = f"TickerMaster Agent Created: {symbol}"
     body = (
         f"{agent_name} is now active. {start_phrase}. "
-        f"Mode: {report_mode}. Poll every {poll_minutes} min; reports every {report_minutes} min."
+        f"Mode: {report_mode}. {cadence_phrase}"
     )
     notification = await dispatch_alert_notification(
         settings=request.app.state.settings,

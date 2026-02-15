@@ -176,6 +176,8 @@ _SOURCE_LABELS = {
     "perplexity": "Perplexity Sonar",
     "x": "X API",
     "reddit": "Reddit API",
+    "prediction_markets": "Prediction Markets",
+    "deep": "Deep Research",
 }
 _SOURCE_WEIGHTS = {
     "perplexity": 0.45,
@@ -813,7 +815,15 @@ def _normalize_source_selection(sources: List[str] | None) -> List[str]:
         "x": "x",
         "twitter": "x",
         "reddit": "reddit",
-        "deep": "perplexity",
+        "prediction_markets": "prediction_markets",
+        "prediction market": "prediction_markets",
+        "prediction markets": "prediction_markets",
+        "polymarket": "prediction_markets",
+        "kalshi": "prediction_markets",
+        "trading market": "prediction_markets",
+        "deep": "deep",
+        "deep research": "deep",
+        "browserbase": "deep",
     }
     out: List[str] = []
     seen: set[str] = set()
@@ -851,12 +861,13 @@ async def run_research_with_source_selection(
     request: ResearchRequest,
     settings: Settings,
     sources: List[str] | None = None,
+    strict_sources: bool = False,
 ) -> ResearchResponse:
     selected_sources = _normalize_source_selection(sources)
-    include_prediction_markets = bool(request.include_prediction_markets)
+    include_prediction_markets = bool(request.include_prediction_markets) or ("prediction_markets" in selected_sources)
 
     cache_suffix = ",".join(sorted(selected_sources))
-    cache_key = f"research:v6:{request.timeframe}:{int(include_prediction_markets)}:{cache_suffix}"
+    cache_key = f"research:v7:{request.timeframe}:{int(include_prediction_markets)}:{cache_suffix}:{int(strict_sources)}"
     ticker = request.ticker.upper().strip()
     cached = get_cached_research(ticker, cache_key)
     if cached:
@@ -896,10 +907,6 @@ async def run_research_with_source_selection(
             )
         )
 
-    if not breakdown:
-        # Fall back to the full pipeline if source-targeted collection yielded nothing.
-        return await run_research(request, settings)
-
     prediction_markets: List[Dict[str, Any]] = []
     if include_prediction_markets:
         company_name = ""
@@ -921,6 +928,43 @@ async def run_research_with_source_selection(
         )
         if len(prediction_markets) == 0:
             prediction_markets = _synthetic_prediction_fallback(ticker, company_name=company_name)
+
+    if "prediction_markets" in selected_sources:
+        top_market = prediction_markets[0] if prediction_markets else {}
+        top_prompt = str(top_market.get("question") or top_market.get("title") or "").strip()
+        top_relevance = float(top_market.get("relevance_score", 0.0) or 0.0)
+        breakdown.append(
+            SentimentBreakdown(
+                source=_SOURCE_LABELS["prediction_markets"],
+                sentiment="neutral",
+                score=0.0,
+                summary=(
+                    f"Top contract: {top_prompt[:220]} (relevance {top_relevance:.2f})."
+                    if top_prompt
+                    else "No high-confidence prediction-market contract found."
+                ),
+                links=[],
+            )
+        )
+
+    if not breakdown:
+        if strict_sources:
+            for source_key in selected_sources:
+                label = _SOURCE_LABELS.get(source_key)
+                if not label:
+                    continue
+                breakdown.append(
+                    SentimentBreakdown(
+                        source=label,
+                        sentiment="neutral",
+                        score=0.0,
+                        summary=f"No fresh {label.lower()} signal returned in this cycle.",
+                        links=[],
+                    )
+                )
+        if not breakdown:
+            # Fall back to the full pipeline if source-targeted collection yielded nothing.
+            return await run_research(request, settings)
 
     aggregate = float(_aggregate_for_sources(breakdown, selected_sources))
     links = [

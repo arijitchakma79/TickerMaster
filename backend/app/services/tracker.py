@@ -13,6 +13,8 @@ import numpy as np
 from app.config import Settings
 from app.schemas import AlertConfig, ResearchRequest, TrackerSnapshot
 from app.services.agent_logger import log_agent_activity
+from app.services.browserbase_scraper import run_deep_research
+from app.services.llm import decide_tracker_runtime_plan
 from app.services.market_data import (
     fetch_metric,
     fetch_watchlist_metrics,
@@ -48,6 +50,8 @@ class TrackerService:
         self._task: asyncio.Task | None = None
         self._research_cache: Dict[str, Dict[str, Any]] = {}
         self._notification_pref_cache: Dict[str, Dict[str, Any]] = {}
+        self._instruction_cache: Dict[str, Dict[str, Any]] = {}
+        self._tool_plan_cache: Dict[str, Dict[str, Any]] = {}
         self._rng = np.random.default_rng()
         self._startup_migrations_done = False
 
@@ -336,10 +340,248 @@ class TrackerService:
         except Exception as exc:
             return f"Perplexity investigation failed: {exc}."
 
-    async def _synthesize_narrative(self, ticker: str, raw_context: str) -> str:
+    def _normalize_notification_style(self, style: Any, event_type: str = "cycle") -> str:
+        token = str(style or "").strip().lower()
+        if token in {"short", "long"}:
+            return token
+        if event_type == "report":
+            return "long"
+        if event_type == "alert":
+            return "short"
+        return "auto"
+
+    async def _latest_manager_instruction(self, agent: dict[str, Any]) -> str:
+        agent_id = str(agent.get("id") or "")
+        if not agent_id:
+            return ""
+
+        cached = self._instruction_cache.get(agent_id)
+        if cached:
+            cached_at = cached.get("cached_at")
+            if isinstance(cached_at, datetime) and (datetime.now(timezone.utc) - cached_at) < timedelta(minutes=2):
+                return str(cached.get("prompt") or "")
+
+        history = tracker_repo.list_history(
+            user_id=agent.get("user_id"),
+            agent_id=agent_id,
+            limit=20,
+        )
+        latest_prompt = next(
+            (
+                str(row.get("raw_prompt") or "").strip()
+                for row in history
+                if str(row.get("event_type") or "") in {"manager_instruction", "create_prompt"} and str(row.get("raw_prompt") or "").strip()
+            ),
+            "",
+        )
+        self._instruction_cache[agent_id] = {"cached_at": datetime.now(timezone.utc), "prompt": latest_prompt}
+        return latest_prompt
+
+    def _extract_prompt_source_intent(self, manager_prompt: str) -> dict[str, Any]:
+        lower = f" {str(manager_prompt or '').lower()} "
+        aliases: dict[str, tuple[str, ...]] = {
+            "reddit": (" reddit ", " r/"),
+            "x": (" twitter ", " x ", " from x", " on x"),
+            "perplexity": (" perplexity ",),
+            "prediction_markets": (" prediction market", " prediction markets", " polymarket", " kalshi", " trading market"),
+            "deep": (" deep research", " deep-research", " browserbase"),
+        }
+
+        mentioned: list[str] = []
+        for source, needles in aliases.items():
+            if any(needle in lower for needle in needles):
+                mentioned.append(source)
+        mentioned = list(dict.fromkeys(mentioned))
+
+        exclusive_markers = (" only ", " just ", " strictly ", " exclusively ")
+        exclusive = any(marker in lower for marker in exclusive_markers)
+        locked_sources: list[str] = []
+
+        if exclusive and mentioned:
+            locked_sources = list(mentioned)
+        else:
+            directional_patterns: dict[str, tuple[str, ...]] = {
+                "reddit": (" from reddit", " on reddit", " via reddit", " reddit sentiment"),
+                "x": (" from x", " on x", " via x", " from twitter", " on twitter", " twitter sentiment"),
+                "perplexity": (" from perplexity", " via perplexity", " perplexity search"),
+                "prediction_markets": (" from prediction market", " from prediction markets", " from polymarket", " from kalshi", " from trading market"),
+                "deep": (" from deep research", " via deep research", " from browserbase"),
+            }
+            for source, patterns in directional_patterns.items():
+                if any(pattern in lower for pattern in patterns):
+                    locked_sources.append(source)
+            locked_sources = list(dict.fromkeys([token for token in locked_sources if token in mentioned]))
+
+        return {
+            "mentioned_sources": mentioned,
+            "locked_sources": locked_sources,
+            "lock": bool(locked_sources),
+        }
+
+    async def _resolve_runtime_tooling(
+        self,
+        *,
+        agent: dict[str, Any],
+        tooling: dict[str, Any],
+        metric: Any,
+        price_change: float,
+        volume_ratio: float,
+    ) -> dict[str, Any]:
+        merged = dict(tooling)
+        tool_mode = str(tooling.get("tool_mode") or "auto").strip().lower()
+        if tool_mode != "auto":
+            merged["notification_style"] = self._normalize_notification_style(
+                tooling.get("notification_style"),
+                "cycle",
+            )
+            return merged
+
+        manager_prompt = await self._latest_manager_instruction(agent)
+        cache_key = f"{str(agent.get('id') or '')}:{manager_prompt.strip().lower()}"
+        cached = self._tool_plan_cache.get(cache_key)
+        plan: dict[str, Any] | None = None
+        if cached:
+            cached_at = cached.get("cached_at")
+            if isinstance(cached_at, datetime) and (datetime.now(timezone.utc) - cached_at) < timedelta(minutes=5):
+                maybe_plan = cached.get("plan")
+                if isinstance(maybe_plan, dict):
+                    plan = dict(maybe_plan)
+
+        if plan is None:
+            plan = await decide_tracker_runtime_plan(
+                self.settings,
+                manager_prompt=manager_prompt,
+                available_tools=["price", "volume", "sentiment", "news", "prediction_markets", "deep_research", "simulation"],
+                available_sources=list(tooling.get("research_sources") or ["perplexity", "x", "reddit", "prediction_markets", "deep"]),
+                market_state={
+                    "ticker": str(metric.ticker),
+                    "price": float(metric.price or 0.0),
+                    "change_percent": float(price_change),
+                    "volume_ratio": float(volume_ratio),
+                },
+                event_hint="cycle",
+            )
+            self._tool_plan_cache[cache_key] = {"cached_at": datetime.now(timezone.utc), "plan": plan}
+
+        chosen_tools = plan.get("tools") if isinstance(plan.get("tools"), list) else []
+        chosen_tools = [str(item).strip().lower() for item in chosen_tools if str(item).strip()]
+
+        chosen_sources = plan.get("research_sources") if isinstance(plan.get("research_sources"), list) else []
+        chosen_sources = [str(item).strip().lower() for item in chosen_sources if str(item).strip()]
+        lower_prompt = f" {manager_prompt.lower()} "
+        source_intent = self._extract_prompt_source_intent(manager_prompt)
+        mentioned_sources = [str(item).strip().lower() for item in (source_intent.get("mentioned_sources") or []) if str(item).strip()]
+        locked_sources = [str(item).strip().lower() for item in (source_intent.get("locked_sources") or []) if str(item).strip()]
+
+        trigger_sources = [str(item).strip().lower() for item in (tooling.get("research_sources") or []) if str(item).strip()]
+        source_lock_from_trigger = bool(tooling.get("research_source_lock"))
+
+        effective_sources: list[str] = []
+        if source_lock_from_trigger and trigger_sources:
+            effective_sources = list(dict.fromkeys(trigger_sources))
+        elif locked_sources:
+            effective_sources = list(dict.fromkeys(locked_sources))
+        else:
+            effective_sources = list(dict.fromkeys(chosen_sources + mentioned_sources))
+            if not effective_sources and trigger_sources:
+                effective_sources = list(dict.fromkeys(trigger_sources))
+
+        if effective_sources:
+            merged["research_sources"] = effective_sources
+        merged["research_source_lock"] = bool(source_lock_from_trigger or bool(locked_sources))
+
+        # Ensure tools match the selected source(s) even if the LLM omits them.
+        if any(source in set(effective_sources) for source in {"reddit", "x", "perplexity"}):
+            if "sentiment" not in chosen_tools:
+                chosen_tools.append("sentiment")
+            if "news" not in chosen_tools:
+                chosen_tools.append("news")
+        if "prediction_markets" in set(effective_sources) and "prediction_markets" not in chosen_tools:
+            chosen_tools.append("prediction_markets")
+        if "deep" in set(effective_sources) and "deep_research" not in chosen_tools:
+            chosen_tools.append("deep_research")
+
+        if " sentiment " in lower_prompt and "sentiment" not in chosen_tools:
+            chosen_tools.append("sentiment")
+        if any(token in lower_prompt for token in {" news ", " catalyst ", " catalysts "}) and "news" not in chosen_tools:
+            chosen_tools.append("news")
+
+        if not chosen_tools:
+            chosen_tools = list(tooling.get("tools") or ["price", "volume"])
+        merged["tools"] = list(dict.fromkeys(chosen_tools))
+
+        merged["simulate_on_alert"] = bool(tooling.get("simulate_on_alert")) or bool(plan.get("simulate_on_alert"))
+        merged["use_prediction_markets"] = "prediction_markets" in set(merged.get("tools") or [])
+        merged["notification_style"] = self._normalize_notification_style(plan.get("notification_style"), "cycle")
+        merged["manager_prompt"] = manager_prompt
+        merged["runtime_tool_plan"] = plan
+        return merged
+
+    def _compose_notification_body(
+        self,
+        *,
+        ticker: str,
+        event_type: str,
+        reasons: list[str],
+        metric: Any,
+        price_change: float,
+        aggregate_sentiment: float,
+        research_sources: list[str],
+        narrative: str,
+        simulation_context: dict[str, Any] | None,
+        style: str,
+    ) -> str:
+        reason_line = "; ".join(reasons) if reasons else "monitoring update"
+        normalized_style = self._normalize_notification_style(style, event_type)
+        source_line = ", ".join(research_sources) if research_sources else "auto"
+        if normalized_style == "short":
+            simulation_line = ""
+            if simulation_context:
+                simulation_line = (
+                    f" Sim exp {simulation_context['expected_return_pct']:+.2f}% "
+                    f"downside>3% {simulation_context['downside_prob_3pct'] * 100:.0f}%."
+                )
+            return (
+                f"{reason_line} | {ticker} ${float(metric.price):.2f} ({price_change:+.2f}%). "
+                f"Sent {aggregate_sentiment:+.2f}. Sources: {source_line}."
+                f"{simulation_line}"
+            )[:480]
+
+        sim_long = ""
+        if simulation_context:
+            sim_long = (
+                f" Simulation outlook: expected {simulation_context['expected_return_pct']:+.2f}% "
+                f"and downside>3% probability {simulation_context['downside_prob_3pct'] * 100:.0f}%."
+            )
+        header = (
+            f"{ticker} {event_type.upper()} | Price ${float(metric.price):.2f} ({price_change:+.2f}%) | "
+            f"Sentiment {aggregate_sentiment:+.2f}."
+        )
+        body = f"{header}\nSources used: {source_line}.\nDrivers: {reason_line}.\n{sim_long}\n{narrative}".strip()
+        return body[:1300]
+
+    async def _synthesize_narrative(
+        self,
+        ticker: str,
+        raw_context: str,
+        *,
+        style: str = "auto",
+        manager_prompt: str = "",
+        event_type: str = "cycle",
+    ) -> str:
+        style_token = self._normalize_notification_style(style, event_type)
+        if style_token == "short":
+            style_instruction = "Return 2-3 concise sentences with only key signal and risk."
+        elif style_token == "long":
+            style_instruction = "Return a detailed but readable multi-sentence analyst brief with clear risks."
+        else:
+            style_instruction = "Return concise but high-signal output suitable for WhatsApp alerts."
         prompt = (
-            "Synthesize this into a concise high-signal trading narrative with risk factors. "
-            f"Ticker: {ticker}. Context: {raw_context}"
+            "You are a beginner hedge-fund assistant writing market updates. "
+            f"{style_instruction} "
+            f"Ticker: {ticker}. "
+            f"Manager instruction: {manager_prompt or 'none provided'}. "
+            f"Context: {raw_context}"
         )
 
         if self.settings.cerebras_api_key:
@@ -578,16 +820,28 @@ class TrackerService:
         schedule_mode = str(triggers.get("schedule_mode") or "realtime").strip().lower()
         if schedule_mode not in {"realtime", "hourly", "daily", "custom"}:
             schedule_mode = "realtime"
-        if schedule_mode == "hourly":
+        custom_time_enabled = bool(triggers.get("custom_time_enabled"))
+        if schedule_mode == "realtime":
+            poll_interval_seconds = 120
+            report_interval_seconds = 120
+        elif schedule_mode == "hourly":
             poll_interval_seconds = 3600
-            report_interval_seconds = max(report_interval_seconds, 3600)
+            report_interval_seconds = 3600
         elif schedule_mode == "daily":
             poll_interval_seconds = 86400
-            report_interval_seconds = max(report_interval_seconds, 86400)
+            report_interval_seconds = 86400
+        elif schedule_mode == "custom" and custom_time_enabled:
+            poll_interval_seconds = 86400
+            report_interval_seconds = 86400
 
-        daily_run_time = str(triggers.get("daily_run_time") or "09:30").strip()
-        if not re.match(r"^\d{1,2}:\d{2}$", daily_run_time):
-            daily_run_time = "09:30"
+        daily_run_time_raw = str(triggers.get("daily_run_time") or "").strip()
+        has_valid_daily_time = bool(re.match(r"^\d{1,2}:\d{2}$", daily_run_time_raw))
+        if schedule_mode == "daily":
+            daily_run_time = daily_run_time_raw if has_valid_daily_time else "09:30"
+        elif schedule_mode == "custom" and custom_time_enabled:
+            daily_run_time = daily_run_time_raw if has_valid_daily_time else "09:30"
+        else:
+            daily_run_time = ""
 
         timezone_name = str(triggers.get("timezone") or "America/New_York").strip() or "America/New_York"
         try:
@@ -617,10 +871,12 @@ class TrackerService:
         timeframe = str(triggers.get("research_timeframe") or "7d")
         notify_phone = str(triggers.get("notify_phone") or "").strip() or None
         simulate_on_alert = bool(triggers.get("simulate_on_alert")) or bool(agent.get("auto_simulate"))
+        notification_style = self._normalize_notification_style(triggers.get("notification_style"), "cycle")
 
         return {
             "tools": tools,
             "research_sources": research_sources,
+            "research_source_lock": bool(triggers.get("research_source_lock", False)),
             "notify_channels": notify_channels,
             "notify_channels_from_trigger": notify_channels_from_trigger,
             "poll_interval_seconds": poll_interval_seconds,
@@ -634,14 +890,26 @@ class TrackerService:
             "baseline_mode": baseline_mode,
             "schedule_mode": schedule_mode,
             "daily_run_time": daily_run_time,
+            "custom_time_enabled": custom_time_enabled,
             "timezone": timezone_name,
             "start_at": start_at.isoformat() if start_at else None,
+            "notification_style": notification_style,
         }
 
     def _agent_poll_due(self, agent: dict[str, Any], tooling: dict[str, Any], now: datetime) -> bool:
         start_at = self._parse_timestamp(tooling.get("start_at"))
         if start_at and now < start_at:
             return False
+
+        schedule_mode = str(tooling.get("schedule_mode") or "realtime").strip().lower()
+        custom_time_enabled = bool(tooling.get("custom_time_enabled"))
+        if schedule_mode == "daily" or (schedule_mode == "custom" and custom_time_enabled):
+            return self._clock_schedule_due(
+                last_stamp=agent.get("last_checked_at"),
+                tooling=tooling,
+                now=now,
+                start_at=start_at,
+            )
 
         poll_interval_seconds = int(tooling.get("poll_interval_seconds") or self.settings.tracker_poll_interval_seconds)
         raw = agent.get("last_checked_at")
@@ -655,7 +923,56 @@ class TrackerService:
             return True
         return (now - stamp) >= timedelta(seconds=max(30, poll_interval_seconds))
 
-    def _agent_report_due(self, agent: dict[str, Any], report_interval_seconds: int, now: datetime) -> bool:
+    def _clock_schedule_due(
+        self,
+        *,
+        last_stamp: Any,
+        tooling: dict[str, Any],
+        now: datetime,
+        start_at: datetime | None,
+    ) -> bool:
+        daily_run_time = str(tooling.get("daily_run_time") or "").strip()
+        if not re.match(r"^\d{1,2}:\d{2}$", daily_run_time):
+            return False
+        timezone_name = str(tooling.get("timezone") or "America/New_York").strip() or "America/New_York"
+        try:
+            tz = ZoneInfo(timezone_name)
+        except Exception:
+            tz = timezone.utc
+
+        hour = int(daily_run_time.split(":")[0])
+        minute = int(daily_run_time.split(":")[1])
+        now_local = now.astimezone(tz)
+        run_today_local = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        run_today_utc = run_today_local.astimezone(timezone.utc)
+
+        if start_at and run_today_utc < start_at:
+            run_today_utc = run_today_utc + timedelta(days=1)
+        if now < run_today_utc:
+            return False
+
+        prior = self._parse_timestamp(last_stamp)
+        if prior is None:
+            return True
+        return prior < run_today_utc
+
+    def _agent_report_due(
+        self,
+        agent: dict[str, Any],
+        tooling: dict[str, Any],
+        report_interval_seconds: int,
+        now: datetime,
+    ) -> bool:
+        schedule_mode = str(tooling.get("schedule_mode") or "realtime").strip().lower()
+        custom_time_enabled = bool(tooling.get("custom_time_enabled"))
+        if schedule_mode == "daily" or (schedule_mode == "custom" and custom_time_enabled):
+            return self._clock_schedule_due(
+                last_stamp=agent.get("last_alert_at"),
+                tooling=tooling,
+                now=now,
+                start_at=self._parse_timestamp(tooling.get("start_at")),
+            )
+
         raw = agent.get("last_alert_at")
         if not raw:
             return True
@@ -836,9 +1153,10 @@ class TrackerService:
         timeframe: str = "7d",
         sources: list[str] | None = None,
         include_prediction_markets: bool = False,
+        strict_sources: bool = False,
     ) -> dict[str, Any]:
         source_key = ",".join(sorted([str(item).lower() for item in (sources or [])])) or "default"
-        key = f"{ticker.upper()}:{timeframe}:{source_key}:{int(include_prediction_markets)}"
+        key = f"{ticker.upper()}:{timeframe}:{source_key}:{int(include_prediction_markets)}:{int(strict_sources)}"
         cached = self._research_cache.get(key)
         if cached:
             at = cached.get("cached_at")
@@ -853,17 +1171,40 @@ class TrackerService:
                 ),
                 self.settings,
                 sources=sources,
+                strict_sources=strict_sources,
             )
             payload = {
                 "aggregate_sentiment": data.aggregate_sentiment,
                 "recommendation": data.recommendation,
                 "breakdown": {item.source: item.score for item in data.source_breakdown},
+                "breakdown_summaries": {item.source: str(item.summary or "")[:320] for item in data.source_breakdown},
                 "prediction_markets": list(data.prediction_markets or []),
             }
             self._research_cache[key] = {"cached_at": datetime.now(timezone.utc), "data": payload}
             return payload
         except Exception:
-            return {"aggregate_sentiment": 0.0, "recommendation": "hold", "breakdown": {}, "prediction_markets": []}
+            return {
+                "aggregate_sentiment": 0.0,
+                "recommendation": "hold",
+                "breakdown": {},
+                "breakdown_summaries": {},
+                "prediction_markets": [],
+            }
+
+    async def _get_deep_research_snapshot(self, ticker: str) -> dict[str, Any]:
+        key = f"deep:{ticker.upper()}"
+        cached = self._research_cache.get(key)
+        if cached:
+            at = cached.get("cached_at")
+            if isinstance(at, datetime) and (datetime.now(timezone.utc) - at) < timedelta(minutes=20):
+                return dict(cached.get("data") or {})
+        try:
+            payload = await run_deep_research(ticker.upper(), self.settings)
+            data = payload if isinstance(payload, dict) else {}
+            self._research_cache[key] = {"cached_at": datetime.now(timezone.utc), "data": data}
+            return data
+        except Exception:
+            return {}
 
     async def _evaluate_agent(
         self,
@@ -883,6 +1224,13 @@ class TrackerService:
                 return default
 
         tooling = self._agent_tooling_config(agent)
+        tooling = await self._resolve_runtime_tooling(
+            agent=agent,
+            tooling=tooling,
+            metric=metric,
+            price_change=price_change,
+            volume_ratio=volume_ratio,
+        )
         notification_prefs = await self._get_notification_preferences(agent.get("user_id"))
         price_alerts_enabled = bool(notification_prefs.get("price_alerts", True))
         volume_alerts_enabled = bool(notification_prefs.get("volume_alerts", True))
@@ -891,6 +1239,7 @@ class TrackerService:
         report_interval_seconds = int(tooling.get("report_interval_seconds") or tooling.get("poll_interval_seconds") or 120)
         scheduled_report_due = report_mode in {"periodic", "hybrid"} and self._agent_report_due(
             agent,
+            tooling,
             report_interval_seconds,
             now,
         )
@@ -906,14 +1255,26 @@ class TrackerService:
             or any(key in triggers for key in {"sentiment_bearish_threshold", "sentiment_bullish_threshold", "x_bearish_threshold"})
         )
 
-        research = {"aggregate_sentiment": 0.0, "recommendation": "hold", "breakdown": {}, "prediction_markets": []}
+        research = {
+            "aggregate_sentiment": 0.0,
+            "recommendation": "hold",
+            "breakdown": {},
+            "breakdown_summaries": {},
+            "prediction_markets": [],
+        }
         if requires_research:
             research = await self._get_research_snapshot(
                 metric.ticker,
                 timeframe=str(tooling.get("research_timeframe") or "7d"),
                 sources=list(tooling.get("research_sources") or []),
                 include_prediction_markets=bool(tooling.get("use_prediction_markets")),
+                strict_sources=bool(tooling.get("research_source_lock")),
             )
+        deep_research_payload: dict[str, Any] = {}
+        if "deep_research" in tools:
+            deep_research_payload = await self._get_deep_research_snapshot(metric.ticker)
+            if deep_research_payload:
+                research = {**research, "deep_research": deep_research_payload}
 
         aggregate = float(research.get("aggregate_sentiment", 0.0))
         x_score = float((research.get("breakdown") or {}).get("X API", 0.0))
@@ -944,6 +1305,8 @@ class TrackerService:
             top_score = float(top_market.get("relevance_score", 0.0) or 0.0)
             if top_score >= 0.45:
                 trigger_reasons.append(f"prediction-market signal elevated ({top_score:.2f})")
+        if "deep_research" in tools and deep_research_payload and scheduled_report_due:
+            trigger_reasons.append("deep-research context refreshed")
 
         quick_investigation = ""
         if "news" in tools and (abs(effective_price_change) >= (price_threshold * 0.75) or volume_spike or scheduled_report_due):
@@ -979,6 +1342,8 @@ class TrackerService:
                 "trigger_matches": trigger_reasons,
                 "report_mode": report_mode,
                 "scheduled_report_due": scheduled_report_due,
+                "notification_style": tooling.get("notification_style"),
+                "runtime_tool_plan": tooling.get("runtime_tool_plan"),
             },
         )
 
@@ -1098,16 +1463,48 @@ class TrackerService:
                 if str(item.get("context_summary") or "").strip()
             ]
         ) or "none"
+        source_scores = research.get("breakdown") if isinstance(research.get("breakdown"), dict) else {}
+        source_summaries = (
+            research.get("breakdown_summaries")
+            if isinstance(research.get("breakdown_summaries"), dict)
+            else {}
+        )
+        source_score_tokens: list[str] = []
+        for label, score in list(source_scores.items())[:4]:
+            try:
+                source_score_tokens.append(f"{str(label)}={float(score):+.2f}")
+            except Exception:
+                continue
+        source_score_line = " | ".join(source_score_tokens) or "none"
+        source_summary_line = " | ".join(
+            [f"{str(label)}: {str(summary)[:120]}" for label, summary in list(source_summaries.items())[:3] if str(summary).strip()]
+        ) or "none"
+        prediction_line = "none"
+        prediction_markets = research.get("prediction_markets") if isinstance(research.get("prediction_markets"), list) else []
+        if prediction_markets:
+            top_market = prediction_markets[0] if isinstance(prediction_markets[0], dict) else {}
+            top_question = str(top_market.get("question") or top_market.get("title") or "").strip()
+            top_relevance = float(top_market.get("relevance_score", 0.0) or 0.0)
+            if top_question:
+                prediction_line = f"{top_question[:140]} (rel={top_relevance:.2f})"
         context = (
             f"Agent={agent.get('name')} symbol={metric.ticker} price={metric.price} "
             f"change={effective_price_change:.2f}% baseline={baseline_mode} "
             f"aggregate_sentiment={aggregate:.2f} x_score={x_score:.2f} "
+            f"source_scores={source_score_line} prediction_market={prediction_line} "
+            f"source_notes={source_summary_line} "
             f"matches={'; '.join(reasons)} prior_alerts={prior_alert_line} "
             f"prior_analysis={prior_context_line}"
         )
         if quick_investigation:
             context = f"{context} | catalyst_note={quick_investigation}"
-        narrative = await self._synthesize_narrative(metric.ticker, context)
+        narrative = await self._synthesize_narrative(
+            metric.ticker,
+            context,
+            style=str(tooling.get("notification_style") or "auto"),
+            manager_prompt=str(tooling.get("manager_prompt") or ""),
+            event_type=event_type,
+        )
 
         simulation_context: dict[str, Any] | None = None
         launched_session_id: str | None = None
@@ -1165,21 +1562,23 @@ class TrackerService:
             return None
 
         title = f"TickerMaster {'Report' if event_type == 'report' else 'Alert'}: {metric.ticker}"
-        simulation_line = ""
-        if simulation_context:
-            simulation_line = (
-                f" Sim outlook: exp {simulation_context['expected_return_pct']:+.2f}% | "
-                f"downside>3% {simulation_context['downside_prob_3pct'] * 100:.0f}%."
-            )
-        body = (
-            f"{'; '.join(reasons)} | Price {float(metric.price):.2f}"
-            f"{simulation_line}"
+        body = self._compose_notification_body(
+            ticker=metric.ticker,
+            event_type=event_type,
+            reasons=reasons,
+            metric=metric,
+            price_change=effective_price_change,
+            aggregate_sentiment=aggregate,
+            research_sources=list(tooling.get("research_sources") or []),
+            narrative=narrative,
+            simulation_context=simulation_context,
+            style=str(tooling.get("notification_style") or "auto"),
         )
         if notification_allowed:
             notification = await dispatch_alert_notification(
                 settings=self.settings,
                 title=title,
-                body=body[:480],
+                body=body,
                 link=f"https://localhost:5173?tab=tracker&ticker={metric.ticker}",
                 preferred_channels=channels,
                 to_number=await self._resolve_notification_phone(
@@ -1228,6 +1627,7 @@ class TrackerService:
                 "simulation_session_id": launched_session_id,
                 "notification": notification,
                 "tooling": tooling,
+                "runtime_tool_plan": tooling.get("runtime_tool_plan"),
                 "notification_preferences": notification_prefs,
                 "event_type": event_type,
                 "baseline_mode": baseline_mode,
@@ -1352,6 +1752,8 @@ class TrackerService:
                 "channels": channels,
                 "simulation_session_id": launched_session_id,
                 "baseline_mode": baseline_mode,
+                "notification_style": tooling.get("notification_style"),
+                "runtime_tool_plan": tooling.get("runtime_tool_plan"),
             },
         )
         return {
@@ -1508,7 +1910,7 @@ class TrackerService:
                     f"price_change={price_change:.2f}% volume={metric.volume} prior_volume={previous_volume:.0f}"
                 )
                 why = await self._investigate_with_perplexity(metric.ticker, trigger_context)
-                synthesis = await self._synthesize_narrative(metric.ticker, why)
+                synthesis = await self._synthesize_narrative(metric.ticker, why, style="short")
                 notification = await dispatch_alert_notification(
                     settings=self.settings,
                     title=f"TickerMaster Alert: {metric.ticker}",

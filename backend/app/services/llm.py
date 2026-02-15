@@ -6,13 +6,23 @@ import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import httpx
 
 from app.config import Settings
 
 _MODAL_INFERENCE_BACKOFF_UNTIL: datetime | None = None
+_TRACKER_ALLOWED_TOOLS = {
+    "price",
+    "volume",
+    "sentiment",
+    "news",
+    "prediction_markets",
+    "deep_research",
+    "simulation",
+}
+_TRACKER_ALLOWED_SOURCES = {"perplexity", "x", "reddit", "prediction_markets", "deep"}
 
 
 def _default_commentary(context: Dict[str, Any] | None = None) -> str:
@@ -327,8 +337,10 @@ def _fallback_tracker_intent(prompt: str) -> Dict[str, Any]:
         report_mode = "hybrid"
     elif wants_reports:
         report_mode = "periodic"
-    else:
+    elif wants_alerts:
         report_mode = "triggers_only"
+    else:
+        report_mode = "hybrid"
 
     schedule_mode = "custom" if interval_match else "realtime"
     if "hourly" in lower:
@@ -345,6 +357,12 @@ def _fallback_tracker_intent(prompt: str) -> Dict[str, Any]:
         baseline_mode = "last_check"
     elif "from last alert" in lower:
         baseline_mode = "last_alert"
+
+    message_style = "auto"
+    if any(token in lower for token in {"brief", "short", "quick", "concise"}):
+        message_style = "short"
+    elif any(token in lower for token in {"long", "detailed", "thesis", "deep dive", "full analysis"}):
+        message_style = "long"
 
     return {
         "intent": intent,
@@ -364,11 +382,13 @@ def _fallback_tracker_intent(prompt: str) -> Dict[str, Any]:
             "schedule_mode": schedule_mode,
             "daily_run_time": "09:30",
             "timezone": "America/New_York",
+            "custom_time_enabled": False,
             "baseline_mode": baseline_mode,
-            "tool_mode": "manual" if tools else "auto",
+            "tool_mode": "auto",
             "notify_channels": notify_channels,
             "notify_phone": notify_phone[:40] if notify_phone else "",
             "simulate_on_alert": "simulate" in lower or "sandbox" in lower,
+            "notification_style": message_style,
         },
         "response": (
             f"Prepared {intent} plan for {symbol} with {threshold:.2f}% price trigger, "
@@ -389,6 +409,7 @@ async def parse_tracker_instruction(settings: Settings, prompt: str) -> Dict[str
         "sentiment_bullish_threshold, x_bearish_threshold, rsi_low, rsi_high, "
         "poll_interval_seconds, report_interval_seconds, report_mode(triggers_only|periodic|hybrid), "
         "schedule_mode(realtime|hourly|daily|custom), daily_run_time(HH:MM), timezone(IANA), "
+        "custom_time_enabled(boolean), notification_style(auto|short|long), "
         "start_at(ISO8601 datetime in UTC), "
         "baseline_mode(prev_close|last_check|last_alert|session_open), tool_mode(auto|manual), "
         "simulate_on_alert, notify_channels(array), notify_phone, tools(array), research_sources(array). "
@@ -422,20 +443,206 @@ async def parse_tracker_instruction(settings: Settings, prompt: str) -> Dict[str
             if isinstance(parsed.get("triggers"), dict):
                 parsed["triggers"].setdefault("poll_interval_seconds", 120)
                 parsed["triggers"].setdefault("report_interval_seconds", parsed["triggers"].get("poll_interval_seconds", 120))
-                parsed["triggers"].setdefault("report_mode", "triggers_only")
+                parsed["triggers"].setdefault("report_mode", "hybrid")
                 parsed["triggers"].setdefault("schedule_mode", "realtime")
                 parsed["triggers"].setdefault("daily_run_time", "09:30")
                 parsed["triggers"].setdefault("timezone", "America/New_York")
+                parsed["triggers"].setdefault("custom_time_enabled", False)
                 parsed["triggers"].setdefault("baseline_mode", "prev_close")
                 parsed["triggers"].setdefault("tool_mode", "auto")
                 parsed["triggers"].setdefault("tools", ["price", "volume", "sentiment", "news"])
                 parsed["triggers"].setdefault("research_sources", ["perplexity", "x", "reddit"])
                 parsed["triggers"].setdefault("notify_channels", ["twilio", "poke"])
                 parsed["triggers"].setdefault("simulate_on_alert", bool(parsed.get("auto_simulate")))
+                parsed["triggers"].setdefault("notification_style", "auto")
             parsed.setdefault("response", "Instruction parsed.")
             return parsed
     except Exception:
         return _fallback_tracker_intent(prompt)
+
+
+def _fallback_tracker_runtime_plan(
+    *,
+    manager_prompt: str,
+    available_tools: List[str],
+    available_sources: List[str],
+    event_hint: str,
+) -> Dict[str, Any]:
+    lower = f" {manager_prompt.lower()} "
+    tool_set = set(token for token in available_tools if token in _TRACKER_ALLOWED_TOOLS)
+    source_set = set(token for token in available_sources if token in _TRACKER_ALLOWED_SOURCES)
+
+    # Base operating profile for a beginner analyst assistant.
+    tools: List[str] = [token for token in ["price", "volume", "sentiment", "news"] if token in tool_set]
+    sources: List[str] = [token for token in ["perplexity", "x", "reddit"] if token in source_set]
+
+    source_mentions: Dict[str, tuple[str, ...]] = {
+        "reddit": (" reddit ", " r/"),
+        "perplexity": (" perplexity ",),
+        "x": (" x ", " twitter ", " from x", " on x", " from twitter", " on twitter"),
+        "prediction_markets": (" prediction market", " prediction markets", " polymarket", " kalshi", " trading market"),
+        "deep": (" deep research", " deep-research", " browserbase"),
+    }
+    directional_patterns: Dict[str, tuple[str, ...]] = {
+        "reddit": (" from reddit", " on reddit", " via reddit", " reddit sentiment"),
+        "perplexity": (" from perplexity", " via perplexity", " perplexity search"),
+        "x": (" from x", " on x", " via x", " from twitter", " on twitter", " twitter sentiment"),
+        "prediction_markets": (" from prediction market", " from prediction markets", " from polymarket", " from kalshi", " from trading market"),
+        "deep": (" from deep research", " via deep research", " from browserbase"),
+    }
+    mentioned_sources = [
+        source
+        for source, needles in source_mentions.items()
+        if source in source_set and any(needle in lower for needle in needles)
+    ]
+    directional_sources = [
+        source
+        for source, patterns in directional_patterns.items()
+        if source in source_set and any(pattern in lower for pattern in patterns)
+    ]
+    exclusive = any(token in lower for token in {" only ", " just ", " strictly ", " exclusively "})
+
+    if exclusive and mentioned_sources:
+        sources = list(dict.fromkeys(mentioned_sources))
+    elif directional_sources:
+        sources = list(dict.fromkeys(directional_sources))
+    elif mentioned_sources:
+        sources = list(dict.fromkeys(sources + mentioned_sources))
+
+    if any(token in lower for token in {"bad thing", "bad news", "negative", "bearish news", "investigate", "search"}):
+        if "news" in tool_set:
+            tools.append("news")
+        if "sentiment" in tool_set:
+            tools.append("sentiment")
+        if "perplexity" in source_set:
+            sources.append("perplexity")
+
+    source_tokens = set(sources)
+    if source_tokens.intersection({"reddit", "x", "perplexity"}):
+        if "sentiment" in tool_set:
+            tools.append("sentiment")
+        if "news" in tool_set:
+            tools.append("news")
+    if "prediction_markets" in source_tokens and "prediction_markets" in tool_set:
+        tools.append("prediction_markets")
+    if "deep" in source_tokens and "deep_research" in tool_set:
+        tools.append("deep_research")
+
+    simulate_on_alert = any(token in lower for token in {"simulate", "simulation", "backtest", "scenario", "sandbox"})
+    if simulate_on_alert and "simulation" in tool_set:
+        tools.append("simulation")
+
+    notification_style = "auto"
+    if any(token in lower for token in {"brief", "short", "quick", "concise"}):
+        notification_style = "short"
+    elif any(token in lower for token in {"long", "detailed", "full analysis", "thesis", "deep dive"}):
+        notification_style = "long"
+    elif event_hint == "report":
+        notification_style = "long"
+    elif event_hint == "alert":
+        notification_style = "short"
+
+    deduped_tools = [token for token in dict.fromkeys(tools) if token in tool_set]
+    if not deduped_tools:
+        deduped_tools = [token for token in ["price", "volume"] if token in tool_set] or [token for token in available_tools if token in tool_set][:2]
+    deduped_sources = [token for token in dict.fromkeys(sources) if token in source_set]
+
+    return {
+        "tools": deduped_tools,
+        "research_sources": deduped_sources,
+        "simulate_on_alert": bool(simulate_on_alert),
+        "notification_style": notification_style,
+        "rationale": "fallback-heuristics",
+    }
+
+
+async def decide_tracker_runtime_plan(
+    settings: Settings,
+    *,
+    manager_prompt: str,
+    available_tools: List[str] | None = None,
+    available_sources: List[str] | None = None,
+    market_state: Dict[str, Any] | None = None,
+    event_hint: str = "cycle",
+) -> Dict[str, Any]:
+    tools = [str(item).strip().lower() for item in (available_tools or list(_TRACKER_ALLOWED_TOOLS)) if str(item).strip()]
+    tools = [item for item in dict.fromkeys(tools) if item in _TRACKER_ALLOWED_TOOLS]
+    sources = [str(item).strip().lower() for item in (available_sources or list(_TRACKER_ALLOWED_SOURCES)) if str(item).strip()]
+    sources = [item for item in dict.fromkeys(sources) if item in _TRACKER_ALLOWED_SOURCES]
+
+    if not settings.openai_api_key:
+        return _fallback_tracker_runtime_plan(
+            manager_prompt=manager_prompt,
+            available_tools=tools,
+            available_sources=sources,
+            event_hint=event_hint,
+        )
+
+    system = (
+        "You are selecting tracker tools for a beginner hedge-fund assistant. "
+        "Return strict JSON with keys: tools(array), research_sources(array), "
+        "simulate_on_alert(boolean), notification_style(auto|short|long), rationale(string). "
+        "Only include tools from: price, volume, sentiment, news, prediction_markets, deep_research, simulation. "
+        "Only include sources from: perplexity, x, reddit, prediction_markets, deep. "
+        "Keep it practical: include only what this instruction needs."
+    )
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "manager_prompt": manager_prompt,
+                        "available_tools": tools,
+                        "available_sources": sources,
+                        "market_state": market_state or {},
+                        "event_hint": event_hint,
+                    },
+                    ensure_ascii=True,
+                ),
+            },
+        ],
+        "temperature": 0.1,
+    }
+    headers = {"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
+            resp.raise_for_status()
+            content = str(resp.json()["choices"][0]["message"]["content"] or "")
+            parsed = _safe_json_extract(content)
+            if not isinstance(parsed, dict):
+                raise ValueError("invalid_response")
+
+            raw_tools = parsed.get("tools") if isinstance(parsed.get("tools"), list) else []
+            resolved_tools = [str(item).strip().lower() for item in raw_tools if str(item).strip()]
+            resolved_tools = [item for item in dict.fromkeys(resolved_tools) if item in _TRACKER_ALLOWED_TOOLS and item in tools]
+            if not resolved_tools:
+                raise ValueError("empty_tools")
+
+            raw_sources = parsed.get("research_sources") if isinstance(parsed.get("research_sources"), list) else []
+            resolved_sources = [str(item).strip().lower() for item in raw_sources if str(item).strip()]
+            resolved_sources = [item for item in dict.fromkeys(resolved_sources) if item in _TRACKER_ALLOWED_SOURCES and item in sources]
+
+            style_raw = str(parsed.get("notification_style") or "auto").strip().lower()
+            style = style_raw if style_raw in {"auto", "short", "long"} else "auto"
+
+            return {
+                "tools": resolved_tools,
+                "research_sources": resolved_sources,
+                "simulate_on_alert": bool(parsed.get("simulate_on_alert", False)),
+                "notification_style": style,
+                "rationale": str(parsed.get("rationale") or "llm"),
+            }
+    except Exception:
+        return _fallback_tracker_runtime_plan(
+            manager_prompt=manager_prompt,
+            available_tools=tools,
+            available_sources=sources,
+            event_hint=event_hint,
+        )
 
 
 async def tracker_agent_chat_response(
