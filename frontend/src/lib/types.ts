@@ -31,7 +31,55 @@ export interface DeepResearchResponse {
   analyst_ratings?: string;
   insider_trading?: string;
   reddit_dd_summary?: string;
+  recommendation_timeline?: Array<{
+    period: string;
+    strong_buy: number;
+    buy: number;
+    hold: number;
+    sell: number;
+    strong_sell: number;
+  }>;
+  price_target?: {
+    last_updated?: string;
+    target_high?: number | null;
+    target_low?: number | null;
+    target_mean?: number | null;
+    target_median?: number | null;
+  };
+  insider_highlights?: Array<{
+    date?: string;
+    name?: string;
+    code?: string;
+    shares?: number | null;
+    price?: number | null;
+    value_estimate?: number | null;
+  }>;
+  reddit_highlights?: Array<{
+    subreddit?: string;
+    title?: string;
+    url?: string;
+    score?: number | null;
+    comments?: number | null;
+  }>;
+  recent_news?: Array<{
+    headline?: string;
+    source?: string;
+    url?: string;
+    datetime?: string | number;
+    summary?: string;
+  }>;
+  deep_bullets?: string[];
+  sources?: string[];
   notes?: string;
+}
+
+export interface ResearchChatResponse {
+  ticker: string;
+  response: string;
+  model: string;
+  generated_at: string;
+  context_refreshed: boolean;
+  sources: string[];
 }
 
 export interface CandlePoint {
@@ -41,6 +89,29 @@ export interface CandlePoint {
   low: number;
   close: number;
   volume: number;
+}
+
+export interface IndicatorSnapshot {
+  ticker: string;
+  period: string;
+  interval: string;
+  latest: {
+    sma20?: number | null;
+    sma50?: number | null;
+    sma200?: number | null;
+    ema21?: number | null;
+    ema50?: number | null;
+    vwap?: number | null;
+    rsi14?: number | null;
+    macd_line?: number | null;
+    macd_signal?: number | null;
+    macd_hist?: number | null;
+    bb_upper?: number | null;
+    bb_mid?: number | null;
+    bb_lower?: number | null;
+    atr14?: number | null;
+  };
+  available: string[];
 }
 
 export interface InsiderTransaction {

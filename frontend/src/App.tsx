@@ -43,9 +43,7 @@ function tabFromQuery(): Tab {
 }
 
 function tickerFromQuery() {
-  return (
-    new URLSearchParams(window.location.search).get("ticker") ?? ""
-  ).toUpperCase();
+  return "";
 }
 
 function normalizeWatchlist(tickers: string[]) {
@@ -94,10 +92,8 @@ async function cropAvatarToDataUrl(
 
 export default function App() {
   const [tab, setTab] = useState<Tab>(tabFromQuery());
-  const [ticker, setTicker] = useState(() => tickerFromQuery());
-  const [watchlist, setWatchlist] = useState<string[]>(() =>
-    normalizeWatchlist(tickerFromQuery() ? [tickerFromQuery()] : []),
-  );
+  const [ticker, setTicker] = useState("");
+  const [watchlist, setWatchlist] = useState<string[]>([]);
   const [favoriteStocks, setFavoriteStocksState] = useState<string[]>([]);
   const [theme, setTheme] = useState<Theme>(() => {
     const stored = window.localStorage.getItem("tickermaster-theme");
@@ -152,16 +148,15 @@ export default function App() {
           getWatchlist().catch(() => []),
           authSession?.user?.id ? getFavoriteStocks().catch(() => []) : Promise.resolve([]),
           authSession?.user?.id
-            ? getUserProfile().catch(() => ({ user_id: null, profile: null, require_username_setup: true, username_locked: false }))
-            : Promise.resolve({ user_id: null, profile: null, require_username_setup: true, username_locked: false }),
+            ? getUserProfile().catch(() => ({ user_id: null, profile: null, require_username_setup: false, username_locked: false }))
+            : Promise.resolve({ user_id: null, profile: null, require_username_setup: false, username_locked: false }),
         ]);
 
         if (!active) return;
         const synced = normalizeWatchlist(serverWatchlist);
         if (synced.length === 0) {
-          const queryTicker = tickerFromQuery();
-          setWatchlist(normalizeWatchlist(queryTicker ? [queryTicker] : []));
-          setTicker(queryTicker);
+          setWatchlist([]);
+          setTicker("");
         } else {
           setWatchlist(synced);
           if (!synced.includes(ticker)) {
@@ -189,7 +184,7 @@ export default function App() {
           }
         } else {
           setUserProfile(null);
-          if (authSession?.user?.id) {
+          if (authSession?.user?.id && profilePayload?.require_username_setup) {
             setUsernameInput("");
             setUsernameSetupOpen(true);
           } else {
@@ -248,7 +243,6 @@ export default function App() {
 
   async function handleWatchlistChange(nextSymbols: string[]) {
     const normalized = normalizeWatchlist(nextSymbols);
-    if (normalized.length === 0) return watchlist;
 
     try {
       const serverUpdated = normalizeWatchlist(
@@ -256,13 +250,17 @@ export default function App() {
       );
       const nextList = serverUpdated.length > 0 ? serverUpdated : normalized;
       setWatchlist(nextList);
-      if (!nextList.includes(ticker)) {
+      if (nextList.length === 0) {
+        setTicker("");
+      } else if (!nextList.includes(ticker)) {
         setTicker(nextList[0]);
       }
       return nextList;
     } catch {
       setWatchlist(normalized);
-      if (!normalized.includes(ticker)) {
+      if (normalized.length === 0) {
+        setTicker("");
+      } else if (!normalized.includes(ticker)) {
         setTicker(normalized[0]);
       }
       return normalized;
@@ -401,6 +399,9 @@ export default function App() {
         display_name: candidate,
         avatar_data_url: avatarDataUrl,
       });
+      if (!response.ok) {
+        throw new Error("Could not save username right now. Please try again.");
+      }
       const nextProfile = response.profile ?? {
         display_name: candidate,
         avatar_url: avatarDataUrl,
@@ -430,6 +431,9 @@ export default function App() {
       const response = await updateUserPreferences({
         avatar_data_url: avatarDataUrl,
       });
+      if (!response.ok) {
+        throw new Error("Could not save profile image right now. Please try again.");
+      }
       const savedAvatar = response.profile?.avatar_url ?? avatarDataUrl ?? userProfile?.avatar_url;
       setUserProfile((prev) => ({
         ...(prev ?? {}),

@@ -226,6 +226,7 @@ export default function SimulationPanel({
   simulationEvent,
   simulationLifecycleEvent
 }: Props) {
+  const [infoOpen, setInfoOpen] = useState(false);
   const [customName, setCustomName] = useState(DEFAULT_CUSTOM.name);
   const [customPrompt, setCustomPrompt] = useState(DEFAULT_CUSTOM.prompt);
   const [customRisk, setCustomRisk] = useState(DEFAULT_CUSTOM.risk);
@@ -575,9 +576,28 @@ export default function SimulationPanel({
   return (
     <section className="panel stack stagger">
       <header className="panel-header">
-        <h2>Simulation Arena</h2>
+        <div className="panel-title-row">
+          <h2>Simulation Arena</h2>
+          <button type="button" className="panel-info-btn" onClick={() => setInfoOpen(true)} aria-label="Simulation panel info">
+            i
+          </button>
+        </div>
         <p>Live roundtable sandbox with realistic market impact, slippage, and asynchronous info flow.</p>
       </header>
+      {infoOpen ? (
+        <div className="panel-info-backdrop" onClick={() => setInfoOpen(false)}>
+          <div className="panel-info-modal" onClick={(event) => event.stopPropagation()}>
+            <h3>Simulation Arena</h3>
+            <p>Test strategies in a multi-agent market before taking real risk.</p>
+            <ul>
+              <li>Configure your custom agent and add it to the roundtable.</li>
+              <li>Start, pause, and stop sessions while monitoring execution behavior.</li>
+              <li>Use post-run commentary to review winners, slippage, and risk controls.</li>
+            </ul>
+            <button className="secondary" onClick={() => setInfoOpen(false)}>Close</button>
+          </div>
+        </div>
+      ) : null}
 
       <div className="glass-card stack">
         <div className="panel-header">

@@ -37,7 +37,6 @@ export default function WatchlistBar({
             onClick={() => onRemoveTicker(symbol)}
             aria-label={`Remove ${symbol} from watchlist`}
             title={`Remove ${symbol}`}
-            disabled={watchlist.length <= 1}
           >
             ×
           </button>
