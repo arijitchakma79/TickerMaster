@@ -20,7 +20,7 @@ import {
   stopSimulation
 } from "../lib/api";
 import EventRail from "./EventRail";
-import { formatCurrency, formatPercent } from "../lib/format";
+import { formatCurrency } from "../lib/format";
 import type {
   AgentConfig,
   MarketMetric,
@@ -88,8 +88,6 @@ const STRATEGY_TEMPLATES = [
     prompt: "I trade post-news dislocations. Fade initial overreaction after catalyst headlines and only size up when follow-through confirms."
   }
 ] as const;
-
-type RuntimeMode = "modal" | "local";
 
 const ALL_MARKET_PROMPT_PATTERN =
   /\b(all stocks|all tickers|entire market|whole market|market-wide|across the market)\b/i;
@@ -431,13 +429,12 @@ export default function SimulationPanel({
   const [liveQuote, setLiveQuote] = useState<MarketMetric | null>(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
   const [quoteError, setQuoteError] = useState("");
-  const [runtimeMode, setRuntimeMode] = useState<RuntimeMode>("modal");
   const [modalHealth, setModalHealth] = useState<ModalCronHealthResponse | null>(null);
   const [modalHealthError, setModalHealthError] = useState("");
   const [modalSandboxResult, setModalSandboxResult] = useState<ModalSandboxResponse | null>(null);
   const [modalSandboxLoading, setModalSandboxLoading] = useState(false);
   const [modalSandboxError, setModalSandboxError] = useState("");
-  const [promptInferredTickers, setPromptInferredTickers] = useState<string[]>([]);
+  const [, setPromptInferredTickers] = useState<string[]>([]);
   const [sessionStartError, setSessionStartError] = useState("");
   const activeSessionId = session?.session_id ?? null;
 
@@ -727,7 +724,7 @@ export default function SimulationPanel({
         initial_price: initialPrice,
         starting_cash: Math.max(1000, Number(startingCapital) || DEFAULT_SETTINGS.startingCash),
         volatility,
-        inference_runtime: runtimeMode === "modal" ? "modal" : "direct",
+        inference_runtime: "modal",
         agents: configuredAgents
       });
       setSession(next);
@@ -737,21 +734,19 @@ export default function SimulationPanel({
       setAutoCommentaryModel("");
       setModalSandboxResult(null);
 
-      if (runtimeMode === "modal") {
-        setModalSandboxLoading(true);
-        const sandboxPrompt = buildSandboxPrompt(cleanTicker, configuredAgents, resolvedTickers);
-        try {
-          const sandbox = await spinModalSandbox(sandboxPrompt, next.session_id);
-          setModalSandboxResult(sandbox);
-          if (sandbox.status === "failed") {
-            setModalSandboxError(sandbox.error || sandbox.hint || "Modal sandbox launch failed.");
-          }
-        } catch {
-          setModalSandboxResult(null);
-          setModalSandboxError("Modal sandbox launch failed. Simulation continues on local engine.");
-        } finally {
-          setModalSandboxLoading(false);
+      setModalSandboxLoading(true);
+      const sandboxPrompt = buildSandboxPrompt(cleanTicker, configuredAgents, resolvedTickers);
+      try {
+        const sandbox = await spinModalSandbox(sandboxPrompt, next.session_id);
+        setModalSandboxResult(sandbox);
+        if (sandbox.status === "failed") {
+          setModalSandboxError(sandbox.error || sandbox.hint || "Modal sandbox launch failed.");
         }
+      } catch {
+        setModalSandboxResult(null);
+        setModalSandboxError("Modal sandbox launch failed. Simulation continues on local engine.");
+      } finally {
+        setModalSandboxLoading(false);
       }
     } catch {
       setSessionStartError(
@@ -943,36 +938,11 @@ export default function SimulationPanel({
 
   const customEditorDisabled = Boolean(session?.running);
   const customEmojiPreview = normalizeEmoji(customEmoji);
-  const displayTicker = activeTicker.trim().toUpperCase() || "AAPL";
-  const quoteLine = quoteLoading
-    ? "Loading live quote…"
-    : liveQuote
-      ? `${formatCurrency(liveQuote.price)} · ${formatPercent(liveQuote.change_percent)}`
-      : quoteError || `Fallback quote: ${formatCurrency(DEFAULT_SETTINGS.fallbackInitialPrice)}`;
-  const modalHealthLine = modalHealth
-    ? `${modalHealth.status.toUpperCase()} · ${modalHealth.message}`
-    : modalHealthError || "Modal runtime status unavailable.";
-  const modalRunLine = modalSandboxResult
-    ? `${modalSandboxResult.status.toUpperCase()}${modalSandboxResult.sandbox_id ? ` · ${modalSandboxResult.sandbox_id}` : ""}`
-    : "No sandbox launched yet.";
-  const inferenceRuntimeLine =
-    runtimeMode === "modal"
-      ? "Modal function first, then OpenRouter fallback."
-      : "Direct OpenRouter from backend.";
-  const inferenceFunctionLine =
-    modalHealth?.inference_function_name
-      ? `${modalHealth.inference_function_name} (${modalHealth.inference_timeout_seconds ?? 15}s timeout)`
-      : "Not configured";
-  const promptUniverseLine =
-    promptInferredTickers.length > 0 ? promptInferredTickers.join(", ") : "No ticker inferred from prompt yet.";
+  const sandboxRunning = Boolean(session?.running) && modalSandboxResult?.status === "started";
+  const normalizedStartingCapital = Math.max(1000, Number(startingCapital) || DEFAULT_SETTINGS.startingCash);
 
   return (
     <section className="panel stack stagger">
-      <header className="panel-header">
-        <h2>Simulation Arena</h2>
-        <p>Live roundtable sandbox with realistic market impact, slippage, and asynchronous info flow.</p>
-      </header>
-
       <div className="glass-card stack">
         <div className="panel-header">
           <h3>Create Custom Agent</h3>
@@ -998,7 +968,6 @@ export default function SimulationPanel({
                 maxLength={4}
                 value={customEmoji}
                 onChange={(event) => setCustomEmoji(event.target.value)}
-                placeholder="Input emoji"
                 disabled={customEditorDisabled}
               />
               <span className="custom-agent-icon-preview" aria-hidden="true">
@@ -1038,7 +1007,7 @@ export default function SimulationPanel({
 
         <div className="custom-slider-grid">
           <label>
-            Risk Appetite ({customRisk})
+            Risk Level ({customRisk})
             <input
               type="range"
               min={0}
@@ -1050,7 +1019,7 @@ export default function SimulationPanel({
             />
           </label>
           <label>
-            Trading Tempo ({customTempo})
+            Trade Frequency ({customTempo})
             <input
               type="range"
               min={0}
@@ -1232,60 +1201,33 @@ export default function SimulationPanel({
       <div className="glass-card stack session-control-card">
         <div className="panel-header">
           <h3>Session Play</h3>
-          <span className="muted">Live input source: {displayTicker}</span>
+          <span className={sandboxRunning ? "pill bullish" : "pill bearish"}>
+            Sandbox {sandboxRunning ? "Running" : "Not Running"}
+          </span>
         </div>
-        <p className="muted">
-          {quoteLine} · Uses live quote + dynamic volatility + default arena bankroll.
-        </p>
-
-        <label className="session-runtime-field">
-          Sandbox Runtime
-          <select
-            value={runtimeMode}
-            onChange={(event) => setRuntimeMode(event.target.value as RuntimeMode)}
-            disabled={loading || Boolean(session?.running)}
-          >
-            <option value="modal">Modal Sandbox</option>
-            <option value="local">Local Engine</option>
-          </select>
-        </label>
-
-        <div className="runtime-status-card">
-          <p className="muted">Modal Health: {modalHealthLine}</p>
-          <p className="muted">Inference Runtime: {inferenceRuntimeLine}</p>
-          <p className="muted">Inference Function: {inferenceFunctionLine}</p>
-          <p className="muted">Prompt Universe: {promptUniverseLine}</p>
-          {runtimeMode === "modal" ? <p className="muted">Current Sandbox: {modalRunLine}</p> : null}
-          {modalSandboxLoading ? <p className="muted">Launching Modal sandbox…</p> : null}
-          {modalHealth?.status === "missing_dependency" && modalHealth.install_hint ? (
-            <p className="error">{modalHealth.install_hint}</p>
-          ) : null}
-          {modalSandboxError ? <p className="error">{modalSandboxError}</p> : null}
-          {sessionStartError ? <p className="error">{sessionStartError}</p> : null}
-          {modalSandboxResult?.sandbox_id ? (
-            <p className="muted">Sandbox ID: {modalSandboxResult.sandbox_id}</p>
-          ) : null}
-          {modalSandboxResult?.dashboard_url && modalSandboxResult.status === "started" ? (
-            <>
-              <a href={modalSandboxResult.dashboard_url} target="_blank" rel="noreferrer">
-                Open Modal Sandbox (same workspace login)
-              </a>
-              <p className="muted">If this 404s, your browser login likely differs from backend token workspace.</p>
-            </>
-          ) : null}
+        <div className="session-capital-spotlight">
+          <label className="session-capital-field">
+            <span>Starting Capital</span>
+            <input
+              className="session-capital-input"
+              type="number"
+              min={1000}
+              step={1000}
+              value={startingCapital}
+              onChange={(event) => setStartingCapital(Number(event.target.value) || DEFAULT_SETTINGS.startingCash)}
+              disabled={loading || Boolean(session?.running)}
+            />
+          </label>
+          <p className="session-capital-preview">{formatCurrency(normalizedStartingCapital)}</p>
         </div>
-
-        <label className="session-capital-field">
-          Starting Capital
-          <input
-            type="number"
-            min={1000}
-            step={1000}
-            value={startingCapital}
-            onChange={(event) => setStartingCapital(Number(event.target.value) || DEFAULT_SETTINGS.startingCash)}
-            disabled={loading || Boolean(session?.running)}
-          />
-        </label>
+        <p className="muted">Uses live quote + dynamic volatility.</p>
+        {modalSandboxLoading ? <p className="muted">Launching Modal sandbox…</p> : null}
+        {modalHealth?.status === "missing_dependency" && modalHealth.install_hint ? (
+          <p className="error">{modalHealth.install_hint}</p>
+        ) : null}
+        {modalHealthError ? <p className="error">{modalHealthError}</p> : null}
+        {modalSandboxError ? <p className="error">{modalSandboxError}</p> : null}
+        {sessionStartError ? <p className="error">{sessionStartError}</p> : null}
 
         {!session ? (
           <button className="start-trading-button" onClick={handlePlay} disabled={loading}>

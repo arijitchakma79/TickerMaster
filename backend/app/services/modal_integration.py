@@ -85,15 +85,20 @@ def _launch_modal_sandbox_sync(
 
     process.poll()
     sandbox_id = str(sandbox.object_id)
-    dashboard_url = f"https://modal.com/id/{sandbox_id}"
+    app_id = str(getattr(app, "app_id", "") or "").strip()
+    app_dashboard_url = f"https://modal.com/apps/{app_id}" if app_id else ""
+    sandbox_dashboard_url = f"https://modal.com/id/{sandbox_id}"
     return {
         "status": "started",
         "session_id": session_id,
         "sandbox_id": sandbox_id,
+        "app_id": app_id,
         "app_name": settings.modal_simulation_app_name,
         "prompt_preview": prompt[:220],
         "stdout_preview": stdout_preview,
-        "dashboard_url": dashboard_url,
+        "dashboard_url": app_dashboard_url or sandbox_dashboard_url,
+        "app_dashboard_url": app_dashboard_url or None,
+        "sandbox_dashboard_url": sandbox_dashboard_url,
         "metadata": metadata,
     }
 

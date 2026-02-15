@@ -218,8 +218,11 @@ export interface ModalSandboxResponse {
   hint?: string;
   session_id: string;
   sandbox_id?: string;
+  app_id?: string;
   app_name?: string;
   dashboard_url?: string;
+  app_dashboard_url?: string;
+  sandbox_dashboard_url?: string;
   prompt_preview?: string;
   stdout_preview?: string[];
   metadata?: Record<string, unknown>;

@@ -4,7 +4,7 @@ import ResearchPanel from "./components/ResearchPanel";
 import SimulationPanel from "./components/SimulationPanel";
 import TrackerPrefsRail from "./components/TrackerPrefsRail";
 import TrackerPanel from "./components/TrackerPanel";
-import { getApiUrl, getWatchlist, setWatchlist as setTrackerWatchlist } from "./lib/api";
+import { getWatchlist, setWatchlist as setTrackerWatchlist } from "./lib/api";
 import { useSocket } from "./hooks/useSocket";
 import brandLogo from "./images/TickerMaster.png";
 import moonIcon from "./images/moon.png";
@@ -71,6 +71,16 @@ export default function App() {
     return "Ticker Tracker";
   }, [tab]);
 
+  const subtitle = useMemo(() => {
+    if (tab === "research") {
+      return "Perplexity Sonar + X + Reddit + prediction markets, summarized into high-signal narratives.";
+    }
+    if (tab === "simulation") {
+      return "Financial AI sandbox for learning trade execution, sentiment asymmetry, and real-time catalyst tracking.";
+    }
+    return "Real-time ticker monitor with valuation metrics, alerting, and live anomaly detection pipeline.";
+  }, [tab]);
+
   async function handleWatchlistChange(nextSymbols: string[]) {
     const normalized = normalizeWatchlist(nextSymbols);
     if (normalized.length === 0) return watchlist;
@@ -123,13 +133,7 @@ export default function App() {
       <header className="hero glass-card">
         <div>
           <h1>{title}</h1>
-          <p className="subtitle">
-            Financial AI sandbox for learning trade execution, sentiment asymmetry, and real-time catalyst tracking.
-          </p>
-        </div>
-        <div className="hero-meta">
-          <span className={connected ? "dot dot-live" : "dot dot-offline"}>{connected ? "Realtime Online" : "Socket Offline"}</span>
-          <span className="muted">API: {getApiUrl()}</span>
+          <p className="subtitle">{subtitle}</p>
         </div>
       </header>
 

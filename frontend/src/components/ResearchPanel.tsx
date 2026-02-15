@@ -277,11 +277,6 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
 
   return (
     <section className="panel stack stagger">
-      <header className="panel-header">
-        <h2>Research</h2>
-        <p>Perplexity Sonar + X + Reddit + prediction markets, summarized into high-signal narratives.</p>
-      </header>
-
       <div className="card-row research-actions research-actions-card">
         <label className="research-ticker-field">
           Ticker

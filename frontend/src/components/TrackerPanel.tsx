@@ -138,11 +138,6 @@ export default function TrackerPanel({
 
   return (
     <section className="panel stack stagger">
-      <header className="panel-header">
-        <h2>Tracker</h2>
-        <p>Real-time ticker monitor with valuation metrics, alerting, and live anomaly detection pipeline.</p>
-      </header>
-
       <WatchlistBar
         watchlist={watchlist}
         activeTicker={activeTicker}
