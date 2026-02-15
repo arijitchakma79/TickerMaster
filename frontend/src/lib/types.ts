@@ -237,6 +237,17 @@ export interface AgentConfig {
   active: boolean;
 }
 
+export interface SimulationAgentEntry {
+  config: AgentConfig;
+  iconEmoji?: string;
+  editor?: {
+    risk: number;
+    tempo: number;
+    style: number;
+    news: number;
+  };
+}
+
 export interface TradeRecord {
   timestamp: string;
   session_id: string;

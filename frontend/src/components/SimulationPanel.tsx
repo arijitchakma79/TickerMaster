@@ -10,11 +10,14 @@ import {
   YAxis
 } from "recharts";
 import {
+  deleteSimulationAgent,
   fetchRealtimeQuote,
+  getSimulationAgents,
   getModalCronHealth,
   pauseSimulation,
   requestCommentary,
   resumeSimulation,
+  setSimulationAgents,
   spinModalSandbox,
   startSimulation,
   stopSimulation
@@ -26,6 +29,7 @@ import type {
   MarketMetric,
   ModalCronHealthResponse,
   ModalSandboxResponse,
+  SimulationAgentEntry,
   SimulationState,
   TradeRecord,
   WSMessage
@@ -46,16 +50,7 @@ interface Props {
   simulationLifecycleEvent?: WSMessage;
 }
 
-interface UserAgentEntry {
-  config: AgentConfig;
-  iconEmoji?: string;
-  editor?: {
-    risk: number;
-    tempo: number;
-    style: number;
-    news: number;
-  };
-}
+type UserAgentEntry = SimulationAgentEntry;
 
 const SELF_AGENT_NAME = "My Trading Agent";
 
@@ -370,6 +365,19 @@ function makeUniqueName(baseName: string, takenNames: Set<string>) {
   return candidate;
 }
 
+function deriveNextCustomAgentSequence(entries: UserAgentEntry[]) {
+  let maxSuffix = 1;
+  for (const entry of entries) {
+    const name = entry.config.name.trim();
+    if (!name.startsWith(`${SELF_AGENT_NAME} `)) continue;
+    const suffix = Number(name.slice(SELF_AGENT_NAME.length + 1));
+    if (Number.isFinite(suffix) && suffix > maxSuffix) {
+      maxSuffix = suffix;
+    }
+  }
+  return maxSuffix + 1;
+}
+
 function normalizeEmoji(input: string) {
   const trimmed = input.trim();
   return trimmed.length > 0 ? trimmed.slice(0, 4) : DEFAULT_CUSTOM.emoji;
@@ -560,6 +568,7 @@ export default function SimulationPanel({
   const marketBoardWrapRef = useRef<HTMLDivElement | null>(null);
   const [syncTelemetryHeight, setSyncTelemetryHeight] = useState(false);
   const [telemetryCardHeight, setTelemetryCardHeight] = useState<number | null>(null);
+  const simulationAgentsLoadedRef = useRef(false);
   const activeSessionId = session?.session_id ?? null;
   const telemetryHeightSynced = syncTelemetryHeight && Boolean(telemetryCardHeight);
 
@@ -655,6 +664,28 @@ export default function SimulationPanel({
         setModalHealthError("Modal runtime health unavailable.");
       });
 
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    simulationAgentsLoadedRef.current = false;
+    void getSimulationAgents()
+      .then((agents) => {
+        if (!active) return;
+        if (!Array.isArray(agents) || agents.length === 0) return;
+        setAddedCustomAgents(agents);
+        setCustomAgentSequence(deriveNextCustomAgentSequence(agents));
+      })
+      .catch(() => {
+        if (!active) return;
+      })
+      .finally(() => {
+        if (!active) return;
+        simulationAgentsLoadedRef.current = true;
+      });
     return () => {
       active = false;
     };
@@ -816,11 +847,21 @@ export default function SimulationPanel({
 
   function handleRemoveAddedAgent(name: string) {
     if (customEditorDisabled) return;
+    const previousAgents = addedCustomAgents;
     setAddedCustomAgents((previous) => previous.filter((entry) => entry.config.name !== name));
     if (editingAgentName === name) {
       setEditingAgentName(null);
       setAgentDialogMode("create");
     }
+    void deleteSimulationAgent(name)
+      .then((saved) => {
+        setAddedCustomAgents(saved);
+        setCustomAgentSequence(deriveNextCustomAgentSequence(saved));
+      })
+      .catch(() => {
+        // Restore local state if backend deletion fails.
+        setAddedCustomAgents(previousAgents);
+      });
   }
 
   function handleCloseAgentDialog() {
@@ -835,44 +876,53 @@ export default function SimulationPanel({
     if (!prompt) return;
 
     if (agentDialogMode === "edit" && editingAgentName) {
-      setAddedCustomAgents((previous) => {
-        const takenNames = new Set([
-          ...INSTITUTIONAL_AGENTS.map((agent) => agent.name),
-          ...previous.map((entry) => entry.config.name).filter((name) => name !== editingAgentName)
-        ]);
-        const uniqueName = makeUniqueName(customName, takenNames);
-        const nextConfig = buildCustomAgent({
-          name: uniqueName,
-          prompt: customPrompt,
-          risk: customRisk,
-          tempo: customTempo,
-          style: customStyle,
-          news: customNews
-        });
-
-        return previous.map((entry) =>
-          entry.config.name === editingAgentName
-            ? {
-                ...entry,
-                config: nextConfig,
-                iconEmoji: normalizeEmoji(customEmoji),
-                editor: {
-                  risk: customRisk,
-                  tempo: customTempo,
-                  style: customStyle,
-                  news: customNews
-                }
-              }
-            : entry
-        );
+      const previousAgents = addedCustomAgents;
+      const takenNames = new Set([
+        ...INSTITUTIONAL_AGENTS.map((agent) => agent.name),
+        ...previousAgents.map((entry) => entry.config.name).filter((name) => name !== editingAgentName)
+      ]);
+      const uniqueName = makeUniqueName(customName, takenNames);
+      const nextConfig = buildCustomAgent({
+        name: uniqueName,
+        prompt: customPrompt,
+        risk: customRisk,
+        tempo: customTempo,
+        style: customStyle,
+        news: customNews
       });
+
+      const nextAgents = previousAgents.map((entry) =>
+        entry.config.name === editingAgentName
+          ? {
+              ...entry,
+              config: nextConfig,
+              iconEmoji: normalizeEmoji(customEmoji),
+              editor: {
+                risk: customRisk,
+                tempo: customTempo,
+                style: customStyle,
+                news: customNews
+              }
+            }
+          : entry
+      );
+      setAddedCustomAgents(nextAgents);
+      void setSimulationAgents(nextAgents)
+        .then((saved) => {
+          setAddedCustomAgents(saved);
+          setCustomAgentSequence(deriveNextCustomAgentSequence(saved));
+        })
+        .catch(() => {
+          setAddedCustomAgents(previousAgents);
+        });
       handleCloseAgentDialog();
       return;
     }
 
+    const previousAgents = addedCustomAgents;
     const takenNames = new Set([
       ...INSTITUTIONAL_AGENTS.map((agent) => agent.name),
-      ...addedCustomAgents.map((entry) => entry.config.name)
+      ...previousAgents.map((entry) => entry.config.name)
     ]);
     const uniqueName = makeUniqueName(customName, takenNames);
     const nextConfig = buildCustomAgent({
@@ -884,8 +934,8 @@ export default function SimulationPanel({
       news: customNews
     });
 
-    setAddedCustomAgents((previous) => [
-      ...previous,
+    const nextAgents = [
+      ...previousAgents,
       {
         config: nextConfig,
         iconEmoji: normalizeEmoji(customEmoji),
@@ -896,7 +946,16 @@ export default function SimulationPanel({
           news: customNews
         }
       }
-    ]);
+    ];
+    setAddedCustomAgents(nextAgents);
+    void setSimulationAgents(nextAgents)
+      .then((saved) => {
+        setAddedCustomAgents(saved);
+        setCustomAgentSequence(deriveNextCustomAgentSequence(saved));
+      })
+      .catch(() => {
+        setAddedCustomAgents(previousAgents);
+      });
     setCustomName(`${SELF_AGENT_NAME} ${customAgentSequence}`);
     setCustomEmoji("");
     setCustomAgentSequence((value) => value + 1);
@@ -1043,6 +1102,9 @@ export default function SimulationPanel({
       setSessionStartError("");
       setPromptInferredTickers([]);
       setAddedCustomAgents([]);
+      void setSimulationAgents([]).catch(() => {
+        // no-op
+      });
       setCustomEmoji("");
       setCustomAgentSequence(2);
       setAgentDialogOpen(false);

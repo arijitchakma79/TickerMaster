@@ -1659,6 +1659,68 @@ h1 {
   background: color-mix(in srgb, var(--field-bg), white 2%);
 }
 
+.research-controls-grid select.research-select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  padding-right: 2.35rem;
+  border: 1px solid color-mix(in srgb, var(--line), transparent 14%);
+  background-image:
+    linear-gradient(45deg, transparent 50%, color-mix(in srgb, var(--ink), transparent 26%) 50%),
+    linear-gradient(135deg, color-mix(in srgb, var(--ink), transparent 26%) 50%, transparent 50%),
+    linear-gradient(
+      to right,
+      color-mix(in srgb, var(--line), transparent 22%),
+      color-mix(in srgb, var(--line), transparent 22%)
+    ),
+    linear-gradient(
+      155deg,
+      color-mix(in srgb, var(--field-bg), white 4%),
+      color-mix(in srgb, var(--field-bg), transparent 6%)
+    );
+  background-position:
+    calc(100% - 15px) calc(50% - 2px),
+    calc(100% - 10px) calc(50% - 2px),
+    calc(100% - 30px) 50%,
+    0 0;
+  background-size:
+    6px 6px,
+    6px 6px,
+    1px 60%,
+    100% 100%;
+  background-repeat: no-repeat;
+  color: color-mix(in srgb, var(--ink), black 6%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, white, transparent 84%),
+    0 1px 2px rgba(9, 22, 32, 0.08);
+  cursor: pointer;
+}
+
+.research-controls-grid select.research-select:hover {
+  border-color: color-mix(in srgb, var(--accent), var(--line) 35%);
+  background-image:
+    linear-gradient(45deg, transparent 50%, color-mix(in srgb, var(--accent), var(--ink) 30%) 50%),
+    linear-gradient(135deg, color-mix(in srgb, var(--accent), var(--ink) 30%) 50%, transparent 50%),
+    linear-gradient(
+      to right,
+      color-mix(in srgb, var(--accent), transparent 66%),
+      color-mix(in srgb, var(--accent), transparent 66%)
+    ),
+    linear-gradient(
+      155deg,
+      color-mix(in srgb, var(--field-bg), white 6%),
+      color-mix(in srgb, var(--field-bg), transparent 4%)
+    );
+}
+
+.research-controls-grid select.research-select:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent), black 12%);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--accent), transparent 78%),
+    inset 0 1px 0 color-mix(in srgb, white, transparent 84%);
+}
+
 .indicator-chip-grid {
   display: flex;
   gap: 6px;
