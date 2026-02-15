@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.routers import api, chat, research, simulation, system, tracker
 from app.services.activity_stream import set_ws_manager
+from app.services.mcp_tool_router import shutdown_tracker_mcp_router
 from app.services.simulation import SimulationOrchestrator
 from app.services.tracker import TrackerService
 from app.services.tracker_csv import ensure_tracker_storage_buckets
@@ -55,6 +56,7 @@ async def lifespan(app: FastAPI):
     await tracker_service.stop()
     for session in list(orchestrator.sessions):
         await orchestrator.stop(session)
+    await shutdown_tracker_mcp_router()
 
 
 settings = get_settings()

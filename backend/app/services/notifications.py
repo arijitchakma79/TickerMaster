@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any, Dict
 
@@ -7,7 +8,6 @@ import httpx
 
 from app.config import Settings
 
-POKE_ENDPOINT = "https://poke.com/api/v1/inbound-sms/webhook"
 _PHONE_RE = re.compile(r"[^\d+]")
 
 
@@ -28,20 +28,43 @@ def _normalize_phone(value: str | None) -> str:
 
 
 async def send_poke_message(settings: Settings, message: str) -> bool:
-    if not settings.poke_api_key:
+    api_key = str(settings.poke_api_key or "").strip()
+    if not api_key:
         return False
 
+    # Prefer official SDK flow when package is installed.
+    try:
+        from poke import Poke  # type: ignore[import-not-found]
+
+        client = Poke(api_key=api_key, base_url=str(settings.poke_api_url or "https://poke.com/api/v1"))
+        result = await asyncio.to_thread(client.send_message, message)
+        if isinstance(result, dict):
+            return bool(result.get("success"))
+        return bool(result)
+    except Exception:
+        pass
+
+    # Fallback HTTP call matching official SDK endpoint contract.
+    base_url = str(settings.poke_api_url or "https://poke.com/api/v1").rstrip("/")
+    endpoint = f"{base_url}/inbound/api-message"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
-                POKE_ENDPOINT,
+                endpoint,
                 headers={
-                    "Authorization": f"Bearer {settings.poke_api_key}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
                 json={"message": message},
             )
-            return response.status_code < 300
+            if response.status_code >= 300:
+                return False
+            content_type = str(response.headers.get("content-type") or "").lower()
+            if "application/json" in content_type:
+                payload = response.json()
+                if isinstance(payload, dict):
+                    return bool(payload.get("success", True))
+            return True
     except Exception:
         return False
 

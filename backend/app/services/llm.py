@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 import httpx
 
 from app.config import Settings
+from app.services.mcp_tool_router import plan_tracker_tools_via_mcp
 
 _MODAL_INFERENCE_BACKOFF_UNTIL: datetime | None = None
 _TRACKER_ALLOWED_TOOLS = {
@@ -473,22 +474,37 @@ def _fallback_tracker_runtime_plan(
     source_set = set(token for token in available_sources if token in _TRACKER_ALLOWED_SOURCES)
 
     # Base operating profile for a beginner analyst assistant.
-    tools: List[str] = [token for token in ["price", "volume", "sentiment", "news"] if token in tool_set]
-    sources: List[str] = [token for token in ["perplexity", "x", "reddit"] if token in source_set]
+    signals_price = any(token in lower for token in {" price ", " drop ", " rally ", " up ", " down ", "%", "breakout", "drawdown"})
+    signals_volume = any(token in lower for token in {" volume ", "flow", "volume spike", "liquidity"})
+    signals_sentiment = any(token in lower for token in {" sentiment ", "tone", "bullish", "bearish", "social"})
+    signals_news = any(
+        token in lower
+        for token in {" news ", "headline", "catalyst", "filing", "investigate", "search", "what happened", "why moved"}
+    )
+    tools: List[str] = []
+    if "price" in tool_set and (signals_price or not signals_volume):
+        tools.append("price")
+    if "volume" in tool_set and (signals_volume or signals_price):
+        tools.append("volume")
+    if signals_sentiment and "sentiment" in tool_set:
+        tools.append("sentiment")
+    if signals_news and "news" in tool_set:
+        tools.append("news")
+    sources: List[str] = []
 
     source_mentions: Dict[str, tuple[str, ...]] = {
-        "reddit": (" reddit ", " r/"),
+        "reddit": (" reddit ", " r/", " at reddit"),
         "perplexity": (" perplexity ",),
-        "x": (" x ", " twitter ", " from x", " on x", " from twitter", " on twitter"),
+        "x": (" x ", " twitter ", " from x", " on x", " at x", " from twitter", " on twitter", " at twitter"),
         "prediction_markets": (" prediction market", " prediction markets", " polymarket", " kalshi", " trading market"),
-        "deep": (" deep research", " deep-research", " browserbase"),
+        "deep": (" deep research", " deep-research", " browserbase", " at deep research"),
     }
     directional_patterns: Dict[str, tuple[str, ...]] = {
-        "reddit": (" from reddit", " on reddit", " via reddit", " reddit sentiment"),
-        "perplexity": (" from perplexity", " via perplexity", " perplexity search"),
-        "x": (" from x", " on x", " via x", " from twitter", " on twitter", " twitter sentiment"),
-        "prediction_markets": (" from prediction market", " from prediction markets", " from polymarket", " from kalshi", " from trading market"),
-        "deep": (" from deep research", " via deep research", " from browserbase"),
+        "reddit": (" from reddit", " on reddit", " at reddit", " via reddit", " reddit sentiment"),
+        "perplexity": (" from perplexity", " at perplexity", " via perplexity", " perplexity search"),
+        "x": (" from x", " on x", " at x", " via x", " from twitter", " on twitter", " at twitter", " twitter sentiment"),
+        "prediction_markets": (" from prediction market", " at prediction market", " from prediction markets", " from polymarket", " from kalshi", " from trading market"),
+        "deep": (" from deep research", " at deep research", " via deep research", " from browserbase"),
     }
     mentioned_sources = [
         source
@@ -501,24 +517,42 @@ def _fallback_tracker_runtime_plan(
         if source in source_set and any(pattern in lower for pattern in patterns)
     ]
     exclusive = any(token in lower for token in {" only ", " just ", " strictly ", " exclusively "})
+    broad_source_markers = {
+        " all sources",
+        " cross-source",
+        " cross source",
+        " combine sources",
+        " blend sources",
+        " multi-source",
+    }
+    source_specific_request = bool(mentioned_sources) and not any(token in lower for token in broad_source_markers)
 
     if exclusive and mentioned_sources:
         sources = list(dict.fromkeys(mentioned_sources))
-    elif directional_sources:
+    elif directional_sources and len(mentioned_sources) <= 1:
         sources = list(dict.fromkeys(directional_sources))
+    elif directional_sources:
+        sources = list(dict.fromkeys(directional_sources + mentioned_sources))
+    elif source_specific_request:
+        sources = list(dict.fromkeys(mentioned_sources))
     elif mentioned_sources:
-        sources = list(dict.fromkeys(sources + mentioned_sources))
+        sources = list(dict.fromkeys([token for token in ["perplexity", "x", "reddit"] if token in source_set] + mentioned_sources))
+    else:
+        sources = [token for token in ["perplexity", "x", "reddit"] if token in source_set]
 
     if any(token in lower for token in {"bad thing", "bad news", "negative", "bearish news", "investigate", "search"}):
         if "news" in tool_set:
             tools.append("news")
         if "sentiment" in tool_set:
             tools.append("sentiment")
-        if "perplexity" in source_set:
+        if "perplexity" in source_set and not source_specific_request:
             sources.append("perplexity")
 
     source_tokens = set(sources)
-    if source_tokens.intersection({"reddit", "x", "perplexity"}):
+    if source_tokens.intersection({"reddit", "x"}):
+        if "sentiment" in tool_set:
+            tools.append("sentiment")
+    if "perplexity" in source_tokens:
         if "sentiment" in tool_set:
             tools.append("sentiment")
         if "news" in tool_set:
@@ -556,6 +590,42 @@ def _fallback_tracker_runtime_plan(
     }
 
 
+def _normalize_runtime_plan(
+    candidate: Dict[str, Any] | None,
+    *,
+    available_tools: List[str],
+    available_sources: List[str],
+    fallback_style_hint: str = "auto",
+    rationale_default: str = "planner",
+) -> Dict[str, Any] | None:
+    if not isinstance(candidate, dict):
+        return None
+
+    tool_set = {token for token in available_tools if token in _TRACKER_ALLOWED_TOOLS}
+    source_set = {token for token in available_sources if token in _TRACKER_ALLOWED_SOURCES}
+
+    raw_tools = candidate.get("tools") if isinstance(candidate.get("tools"), list) else []
+    resolved_tools = [str(item).strip().lower() for item in raw_tools if str(item).strip()]
+    resolved_tools = [item for item in dict.fromkeys(resolved_tools) if item in tool_set]
+    if not resolved_tools:
+        return None
+
+    raw_sources = candidate.get("research_sources") if isinstance(candidate.get("research_sources"), list) else []
+    resolved_sources = [str(item).strip().lower() for item in raw_sources if str(item).strip()]
+    resolved_sources = [item for item in dict.fromkeys(resolved_sources) if item in source_set]
+
+    style_raw = str(candidate.get("notification_style") or fallback_style_hint or "auto").strip().lower()
+    style = style_raw if style_raw in {"auto", "short", "long"} else "auto"
+
+    return {
+        "tools": resolved_tools,
+        "research_sources": resolved_sources,
+        "simulate_on_alert": bool(candidate.get("simulate_on_alert", False)),
+        "notification_style": style,
+        "rationale": str(candidate.get("rationale") or rationale_default),
+    }
+
+
 async def decide_tracker_runtime_plan(
     settings: Settings,
     *,
@@ -569,6 +639,24 @@ async def decide_tracker_runtime_plan(
     tools = [item for item in dict.fromkeys(tools) if item in _TRACKER_ALLOWED_TOOLS]
     sources = [str(item).strip().lower() for item in (available_sources or list(_TRACKER_ALLOWED_SOURCES)) if str(item).strip()]
     sources = [item for item in dict.fromkeys(sources) if item in _TRACKER_ALLOWED_SOURCES]
+
+    mcp_plan = await plan_tracker_tools_via_mcp(
+        settings,
+        manager_prompt=manager_prompt,
+        available_tools=tools,
+        available_sources=sources,
+        market_state=market_state or {},
+        event_hint=event_hint,
+    )
+    normalized_mcp_plan = _normalize_runtime_plan(
+        mcp_plan,
+        available_tools=tools,
+        available_sources=sources,
+        fallback_style_hint=("long" if event_hint == "report" else "short" if event_hint == "alert" else "auto"),
+        rationale_default="mcp",
+    )
+    if normalized_mcp_plan:
+        return normalized_mcp_plan
 
     if not settings.openai_api_key:
         return _fallback_tracker_runtime_plan(
@@ -613,29 +701,16 @@ async def decide_tracker_runtime_plan(
             resp.raise_for_status()
             content = str(resp.json()["choices"][0]["message"]["content"] or "")
             parsed = _safe_json_extract(content)
-            if not isinstance(parsed, dict):
-                raise ValueError("invalid_response")
-
-            raw_tools = parsed.get("tools") if isinstance(parsed.get("tools"), list) else []
-            resolved_tools = [str(item).strip().lower() for item in raw_tools if str(item).strip()]
-            resolved_tools = [item for item in dict.fromkeys(resolved_tools) if item in _TRACKER_ALLOWED_TOOLS and item in tools]
-            if not resolved_tools:
-                raise ValueError("empty_tools")
-
-            raw_sources = parsed.get("research_sources") if isinstance(parsed.get("research_sources"), list) else []
-            resolved_sources = [str(item).strip().lower() for item in raw_sources if str(item).strip()]
-            resolved_sources = [item for item in dict.fromkeys(resolved_sources) if item in _TRACKER_ALLOWED_SOURCES and item in sources]
-
-            style_raw = str(parsed.get("notification_style") or "auto").strip().lower()
-            style = style_raw if style_raw in {"auto", "short", "long"} else "auto"
-
-            return {
-                "tools": resolved_tools,
-                "research_sources": resolved_sources,
-                "simulate_on_alert": bool(parsed.get("simulate_on_alert", False)),
-                "notification_style": style,
-                "rationale": str(parsed.get("rationale") or "llm"),
-            }
+            normalized_llm_plan = _normalize_runtime_plan(
+                parsed if isinstance(parsed, dict) else None,
+                available_tools=tools,
+                available_sources=sources,
+                fallback_style_hint=("long" if event_hint == "report" else "short" if event_hint == "alert" else "auto"),
+                rationale_default="llm",
+            )
+            if not normalized_llm_plan:
+                raise ValueError("invalid_plan")
+            return normalized_llm_plan
     except Exception:
         return _fallback_tracker_runtime_plan(
             manager_prompt=manager_prompt,
@@ -661,8 +736,8 @@ async def tracker_agent_chat_response(
         latest_instruction_line = f" Last instruction: {latest_instruction[:160]}." if latest_instruction else ""
         return {
             "response": (
-                f"{agent.get('name', 'Agent')} update for {symbol}: price {market_state.get('price')} and sentiment {sentiment:.2f}. "
-                "I am monitoring catalyst risk, social tone, and volume regime for trigger changes."
+                f"Broker update on {symbol}: price {market_state.get('price')} and sentiment {sentiment:.2f}. "
+                "I am tracking catalyst risk, social tone drift, and volume regime changes for you."
                 f"{latest_instruction_line}"
             ),
             "model": "fallback-template",
@@ -670,10 +745,10 @@ async def tracker_agent_chat_response(
         }
 
     system = (
-        "You are a beginner-friendly hedge-fund assistant. "
-        "You help configure and operate stock tracker agents. "
-        "Use only the provided context. Be clear, concrete, and action-oriented. "
-        "If data is missing, say exactly what is missing."
+        "You are a personal broker-style assistant for a beginner investor. "
+        "Help configure and operate stock tracker agents and explain updates clearly. "
+        "Write naturally, concise but complete, with practical next actions and key risks. "
+        "Use only provided context. If data is missing, state exactly what is missing."
     )
     payload = {
         "model": "gpt-4o-mini",

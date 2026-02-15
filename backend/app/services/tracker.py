@@ -380,11 +380,11 @@ class TrackerService:
     def _extract_prompt_source_intent(self, manager_prompt: str) -> dict[str, Any]:
         lower = f" {str(manager_prompt or '').lower()} "
         aliases: dict[str, tuple[str, ...]] = {
-            "reddit": (" reddit ", " r/"),
-            "x": (" twitter ", " x ", " from x", " on x"),
+            "reddit": (" reddit ", " r/", " at reddit"),
+            "x": (" twitter ", " x ", " from x", " on x", " at x", " at twitter"),
             "perplexity": (" perplexity ",),
             "prediction_markets": (" prediction market", " prediction markets", " polymarket", " kalshi", " trading market"),
-            "deep": (" deep research", " deep-research", " browserbase"),
+            "deep": (" deep research", " deep-research", " browserbase", " at deep research"),
         }
 
         mentioned: list[str] = []
@@ -401,11 +401,11 @@ class TrackerService:
             locked_sources = list(mentioned)
         else:
             directional_patterns: dict[str, tuple[str, ...]] = {
-                "reddit": (" from reddit", " on reddit", " via reddit", " reddit sentiment"),
-                "x": (" from x", " on x", " via x", " from twitter", " on twitter", " twitter sentiment"),
-                "perplexity": (" from perplexity", " via perplexity", " perplexity search"),
-                "prediction_markets": (" from prediction market", " from prediction markets", " from polymarket", " from kalshi", " from trading market"),
-                "deep": (" from deep research", " via deep research", " from browserbase"),
+                "reddit": (" from reddit", " on reddit", " at reddit", " via reddit", " reddit sentiment"),
+                "x": (" from x", " on x", " at x", " via x", " from twitter", " on twitter", " at twitter", " twitter sentiment"),
+                "perplexity": (" from perplexity", " at perplexity", " via perplexity", " perplexity search"),
+                "prediction_markets": (" from prediction market", " at prediction market", " from prediction markets", " from polymarket", " from kalshi", " from trading market"),
+                "deep": (" from deep research", " at deep research", " via deep research", " from browserbase"),
             }
             for source, patterns in directional_patterns.items():
                 if any(pattern in lower for pattern in patterns):
@@ -472,6 +472,15 @@ class TrackerService:
         source_intent = self._extract_prompt_source_intent(manager_prompt)
         mentioned_sources = [str(item).strip().lower() for item in (source_intent.get("mentioned_sources") or []) if str(item).strip()]
         locked_sources = [str(item).strip().lower() for item in (source_intent.get("locked_sources") or []) if str(item).strip()]
+        broad_source_markers = {
+            " all sources",
+            " cross-source",
+            " cross source",
+            " combine sources",
+            " blend sources",
+            " multi-source",
+        }
+        source_specific_prompt = bool(mentioned_sources) and not any(token in lower_prompt for token in broad_source_markers)
 
         trigger_sources = [str(item).strip().lower() for item in (tooling.get("research_sources") or []) if str(item).strip()]
         source_lock_from_trigger = bool(tooling.get("research_source_lock"))
@@ -481,6 +490,9 @@ class TrackerService:
             effective_sources = list(dict.fromkeys(trigger_sources))
         elif locked_sources:
             effective_sources = list(dict.fromkeys(locked_sources))
+        elif source_specific_prompt:
+            chosen_specific = [token for token in chosen_sources if token in set(mentioned_sources)]
+            effective_sources = list(dict.fromkeys(chosen_specific or mentioned_sources))
         else:
             effective_sources = list(dict.fromkeys(chosen_sources + mentioned_sources))
             if not effective_sources and trigger_sources:
@@ -488,23 +500,38 @@ class TrackerService:
 
         if effective_sources:
             merged["research_sources"] = effective_sources
-        merged["research_source_lock"] = bool(source_lock_from_trigger or bool(locked_sources))
+        merged["research_source_lock"] = bool(source_lock_from_trigger or bool(locked_sources) or source_specific_prompt)
 
         # Ensure tools match the selected source(s) even if the LLM omits them.
-        if any(source in set(effective_sources) for source in {"reddit", "x", "perplexity"}):
+        effective_source_set = set(effective_sources)
+        if any(source in effective_source_set for source in {"reddit", "x"}):
+            if "sentiment" not in chosen_tools:
+                chosen_tools.append("sentiment")
+        if "perplexity" in effective_source_set:
             if "sentiment" not in chosen_tools:
                 chosen_tools.append("sentiment")
             if "news" not in chosen_tools:
                 chosen_tools.append("news")
-        if "prediction_markets" in set(effective_sources) and "prediction_markets" not in chosen_tools:
+        if "prediction_markets" in effective_source_set and "prediction_markets" not in chosen_tools:
             chosen_tools.append("prediction_markets")
-        if "deep" in set(effective_sources) and "deep_research" not in chosen_tools:
+        if "deep" in effective_source_set and "deep_research" not in chosen_tools:
             chosen_tools.append("deep_research")
 
         if " sentiment " in lower_prompt and "sentiment" not in chosen_tools:
             chosen_tools.append("sentiment")
-        if any(token in lower_prompt for token in {" news ", " catalyst ", " catalysts "}) and "news" not in chosen_tools:
+        news_requested = any(
+            token in lower_prompt
+            for token in {" news ", " catalyst ", " catalysts ", " investigate ", " search ", " what happened ", " why moved "}
+        )
+        if news_requested and "news" not in chosen_tools:
             chosen_tools.append("news")
+        if (
+            bool(merged.get("research_source_lock"))
+            and "news" in chosen_tools
+            and "perplexity" not in effective_source_set
+            and not news_requested
+        ):
+            chosen_tools = [token for token in chosen_tools if token != "news"]
 
         if not chosen_tools:
             chosen_tools = list(tooling.get("tools") or ["price", "volume"])
@@ -534,30 +561,45 @@ class TrackerService:
         reason_line = "; ".join(reasons) if reasons else "monitoring update"
         normalized_style = self._normalize_notification_style(style, event_type)
         source_line = ", ".join(research_sources) if research_sources else "auto"
+        event_label = "report" if event_type == "report" else "alert"
         if normalized_style == "short":
             simulation_line = ""
             if simulation_context:
                 simulation_line = (
-                    f" Sim exp {simulation_context['expected_return_pct']:+.2f}% "
-                    f"downside>3% {simulation_context['downside_prob_3pct'] * 100:.0f}%."
+                    f" Sim outlook: {simulation_context['expected_return_pct']:+.2f}% exp, "
+                    f"{simulation_context['downside_prob_3pct'] * 100:.0f}% chance of >3% downside."
                 )
-            return (
-                f"{reason_line} | {ticker} ${float(metric.price):.2f} ({price_change:+.2f}%). "
-                f"Sent {aggregate_sentiment:+.2f}. Sources: {source_line}."
-                f"{simulation_line}"
-            )[:480]
+            lines = [
+                f"{ticker} {event_label}: ${float(metric.price):.2f} ({price_change:+.2f}%), sentiment {aggregate_sentiment:+.2f}.",
+                f"Why now: {reason_line}.",
+                f"Sources: {source_line}.",
+            ]
+            if simulation_line:
+                lines.append(simulation_line)
+            return " ".join(lines)[:480]
 
         sim_long = ""
         if simulation_context:
             sim_long = (
-                f" Simulation outlook: expected {simulation_context['expected_return_pct']:+.2f}% "
-                f"and downside>3% probability {simulation_context['downside_prob_3pct'] * 100:.0f}%."
+                f"Simulation: expected {simulation_context['expected_return_pct']:+.2f}% "
+                f"with {simulation_context['downside_prob_3pct'] * 100:.0f}% probability of >3% downside."
             )
-        header = (
-            f"{ticker} {event_type.upper()} | Price ${float(metric.price):.2f} ({price_change:+.2f}%) | "
-            f"Sentiment {aggregate_sentiment:+.2f}."
+        body_lines = [
+            f"{ticker} {event_type.upper()} broker update",
+            f"Price: ${float(metric.price):.2f} ({price_change:+.2f}%)",
+            f"Sentiment: {aggregate_sentiment:+.2f}",
+            f"Sources: {source_line}",
+            f"What triggered this: {reason_line}",
+        ]
+        if sim_long:
+            body_lines.append(sim_long)
+        body_lines.extend(
+            [
+                f"Broker note: {narrative}",
+                "Risk note: monitoring signal only, not financial advice.",
+            ]
         )
-        body = f"{header}\nSources used: {source_line}.\nDrivers: {reason_line}.\n{sim_long}\n{narrative}".strip()
+        body = "\n".join([line for line in body_lines if line]).strip()
         return body[:1300]
 
     async def _synthesize_narrative(
@@ -571,14 +613,22 @@ class TrackerService:
     ) -> str:
         style_token = self._normalize_notification_style(style, event_type)
         if style_token == "short":
-            style_instruction = "Return 2-3 concise sentences with only key signal and risk."
+            style_instruction = (
+                "Return exactly 2-3 natural sentences like a personal broker text update. "
+                "Include signal, risk, and one next-watch item."
+            )
         elif style_token == "long":
-            style_instruction = "Return a detailed but readable multi-sentence analyst brief with clear risks."
+            style_instruction = (
+                "Return a readable broker-style brief with labeled sections: Setup, What Changed, Risk, Next Step."
+            )
         else:
-            style_instruction = "Return concise but high-signal output suitable for WhatsApp alerts."
+            style_instruction = (
+                "Return 3-5 clear sentences in a personal broker tone, concise and human, no jargon dumping."
+            )
         prompt = (
-            "You are a beginner hedge-fund assistant writing market updates. "
+            "You are a personal broker assistant writing client updates for a beginner investor. "
             f"{style_instruction} "
+            "Write in plain English. Be direct. Avoid hype and avoid generic filler. "
             f"Ticker: {ticker}. "
             f"Manager instruction: {manager_prompt or 'none provided'}. "
             f"Context: {raw_context}"
@@ -621,8 +671,9 @@ class TrackerService:
                 pass
 
         return (
-            "Synthesis fallback: flow suggests short-term momentum displacement rather than structural repricing. "
-            "Monitor volume follow-through, options skew, and macro event timing before conviction sizing."
+            f"{ticker} update: signals are mixed and require confirmation. "
+            "Main risk is fast sentiment reversal on new headlines. "
+            "Next step: watch price reaction and volume follow-through before acting."
         )
 
     def _agent_in_cooldown(self, agent: dict[str, Any], minutes: int = 15) -> bool:

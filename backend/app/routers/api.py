@@ -633,11 +633,11 @@ def _apply_prompt_overrides(prompt: str, raw_triggers: dict[str, Any] | None) ->
         merged["research_source_lock"] = False
 
     directional_patterns: dict[str, tuple[str, ...]] = {
-        "reddit": (" from reddit", " on reddit", " via reddit", " reddit sentiment"),
-        "x": (" from x", " on x", " via x", " from twitter", " on twitter", " twitter sentiment"),
-        "perplexity": (" from perplexity", " via perplexity", " perplexity search"),
-        "prediction_markets": (" from prediction market", " from prediction markets", " from polymarket", " from kalshi", " from trading market"),
-        "deep": (" from deep research", " via deep research", " from browserbase"),
+        "reddit": (" from reddit", " on reddit", " at reddit", " via reddit", " reddit sentiment"),
+        "x": (" from x", " on x", " at x", " via x", " from twitter", " on twitter", " at twitter", " twitter sentiment"),
+        "perplexity": (" from perplexity", " at perplexity", " via perplexity", " perplexity search"),
+        "prediction_markets": (" from prediction market", " at prediction market", " from prediction markets", " from polymarket", " from kalshi", " from trading market"),
+        "deep": (" from deep research", " at deep research", " via deep research", " from browserbase"),
     }
     directional_sources = [
         source
@@ -646,6 +646,19 @@ def _apply_prompt_overrides(prompt: str, raw_triggers: dict[str, Any] | None) ->
     ]
     if directional_sources and not exclusive_sources:
         merged["research_sources"] = list(dict.fromkeys(directional_sources))
+        merged["research_source_lock"] = True
+    if explicit_sources and len(explicit_sources) == 1 and not any(
+        token in lower
+        for token in {
+            " all sources",
+            " cross-source",
+            " cross source",
+            " combine sources",
+            " blend sources",
+            " multi-source",
+        }
+    ):
+        merged["research_sources"] = list(dict.fromkeys(explicit_sources))
         merged["research_source_lock"] = True
 
     if "24/7" in lower or "24x7" in lower or "always on" in lower:

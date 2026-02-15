@@ -131,6 +131,7 @@ class Settings:
     poke_recipe_enabled: bool = True
     poke_api_key: str = ""
     poke_recipe_slug: str = ""
+    poke_api_url: str = "https://poke.com/api/v1"
     poke_kitchen_url: str = "https://poke.com/kitchen"
 
     twilio_account_sid: str = ""
@@ -145,6 +146,9 @@ class Settings:
 
     tracker_poll_interval_seconds: int = 120
     default_watchlist: List[str] = field(default_factory=lambda: ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"])
+    mcp_tracker_router_enabled: bool = True
+    mcp_tracker_server_command: str = ""
+    mcp_tracker_timeout_seconds: int = 6
 
 
 @lru_cache(maxsize=1)
@@ -203,6 +207,7 @@ def get_settings() -> Settings:
         poke_recipe_enabled=_env_bool("POKE_RECIPE_ENABLED", True),
         poke_api_key=_env("POKE_API_KEY"),
         poke_recipe_slug=_env("POKE_RECIPE_SLUG"),
+        poke_api_url=_env("POKE_API", "https://poke.com/api/v1"),
         poke_kitchen_url=_env("POKE_KITCHEN_URL", "https://poke.com/kitchen"),
         twilio_account_sid=_env("TWILIO_ACCOUNT_SID"),
         twilio_auth_token=_env("TWILIO_AUTH_TOKEN"),
@@ -214,4 +219,7 @@ def get_settings() -> Settings:
         nvidia_nim_api_key=_env("NVIDIA_NIM_API_KEY"),
         tracker_poll_interval_seconds=_env_int("TRACKER_POLL_INTERVAL_SECONDS", 120),
         default_watchlist=_env_list("DEFAULT_WATCHLIST", ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"]),
+        mcp_tracker_router_enabled=_env_bool("MCP_TRACKER_ROUTER_ENABLED", True),
+        mcp_tracker_server_command=_env("MCP_TRACKER_SERVER_COMMAND"),
+        mcp_tracker_timeout_seconds=_env_int("MCP_TRACKER_TIMEOUT_SECONDS", 6),
     )
