@@ -1405,6 +1405,26 @@ h1 {
   min-height: 76px;
 }
 
+.research-chat-close-btn.secondary {
+  min-width: 34px;
+  min-height: 34px;
+  width: 34px;
+  padding: 0;
+  border-radius: 9px;
+  border-color: color-mix(in srgb, var(--danger), transparent 28%);
+  background: color-mix(in srgb, var(--danger), transparent 84%);
+  color: color-mix(in srgb, var(--danger), #a62f3b 18%);
+  font-size: 0.96rem;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.research-chat-close-btn.secondary:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--danger), transparent 8%);
+  background: color-mix(in srgb, var(--danger), transparent 76%);
+  color: color-mix(in srgb, var(--danger), #8f2430 10%);
+}
+
 .research-chat-backdrop {
   z-index: 275;
   background: rgba(5, 11, 20, 0.78);

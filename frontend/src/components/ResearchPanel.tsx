@@ -830,7 +830,15 @@ export default function ResearchPanel({ activeTicker, onTickerChange, connected,
                 <button type="button" className="secondary" onClick={handleClearChat} disabled={chatLoading || chatLog.length === 0}>
                   Clear chat
                 </button>
-                <button type="button" className="secondary" onClick={() => setChatModalOpen(false)}>Close</button>
+                <button
+                  type="button"
+                  className="secondary research-chat-close-btn"
+                  onClick={() => setChatModalOpen(false)}
+                  aria-label="Close chat"
+                  title="Close chat"
+                >
+                  X
+                </button>
               </div>
             </div>
             <div className="research-chat-layout">
