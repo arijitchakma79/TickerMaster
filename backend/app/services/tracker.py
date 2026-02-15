@@ -13,7 +13,13 @@ import numpy as np
 from app.config import Settings
 from app.schemas import AlertConfig, ResearchRequest, TrackerSnapshot
 from app.services.agent_logger import log_agent_activity
-from app.services.market_data import fetch_watchlist_metrics
+from app.services.market_data import (
+    fetch_metric,
+    fetch_watchlist_metrics,
+    is_metric_quality_valid,
+    resolve_symbol_input,
+    search_tickers,
+)
 from app.services.notifications import dispatch_alert_notification
 from app.services.sentiment import run_research_with_source_selection
 from app.services.tracker_csv import append_alert_context_csv
@@ -43,6 +49,7 @@ class TrackerService:
         self._research_cache: Dict[str, Dict[str, Any]] = {}
         self._notification_pref_cache: Dict[str, Dict[str, Any]] = {}
         self._rng = np.random.default_rng()
+        self._startup_migrations_done = False
 
     def set_watchlist(self, tickers: List[str]) -> List[str]:
         clean = {t.strip().upper() for t in tickers if t.strip()}
@@ -78,6 +85,21 @@ class TrackerService:
     async def start(self) -> None:
         if self._task and not self._task.done():
             return
+        if not self._startup_migrations_done:
+            try:
+                await self._run_startup_migrations()
+            except Exception as exc:
+                await log_agent_activity(
+                    module="tracker",
+                    agent_name="Tracker Poller",
+                    action="Startup migration failed",
+                    status="error",
+                    details={
+                        "description": "Tracker startup migration encountered an exception and was skipped.",
+                        "error": str(exc),
+                    },
+                )
+            self._startup_migrations_done = True
         self._task = asyncio.create_task(self.run_forever(), name="tracker-poller")
 
     async def stop(self) -> None:
@@ -93,6 +115,191 @@ class TrackerService:
             pass
         finally:
             self._task = None
+
+    async def _symbol_quality_ok(self, symbol: str) -> bool:
+        token = str(symbol or "").strip().upper().replace(".", "-")
+        if not token:
+            return False
+        try:
+            metric = await asyncio.to_thread(fetch_metric, token)
+        except Exception:
+            return False
+        return is_metric_quality_valid(metric)
+
+    def _is_confident_symbol_match(self, input_symbol: str, candidate_symbol: str) -> bool:
+        source = re.sub(r"\s+", "", str(input_symbol or "").strip().upper().replace(".", "-"))
+        target = re.sub(r"\s+", "", str(candidate_symbol or "").strip().upper().replace(".", "-"))
+        if not source or not target:
+            return False
+        if source == target:
+            return True
+        if len(target) < len(source):
+            return False
+        if len(source) >= 2 and not target.startswith(source[:2]):
+            return False
+        return target.startswith(source) and (len(target) - len(source) <= 2)
+
+    async def _symbol_repair_suggestions(self, token: str, limit: int = 5) -> list[dict[str, Any]]:
+        results = await search_tickers(token, limit=max(3, limit))
+        if not results and re.fullmatch(r"[A-Z]{2,5}", token):
+            results = await search_tickers(f"{token} stock", limit=max(3, limit))
+
+        suggestions: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in results:
+            ticker = str(getattr(item, "ticker", "") or "").upper().strip()
+            if not ticker or ticker in seen:
+                continue
+            seen.add(ticker)
+            suggestions.append(
+                {
+                    "ticker": ticker,
+                    "name": str(getattr(item, "name", "") or "").strip(),
+                    "exchange": str(getattr(item, "exchange", "") or "").strip() or None,
+                }
+            )
+            if len(suggestions) >= limit:
+                break
+        return suggestions
+
+    async def _resolve_symbol_repair(self, symbol: str) -> tuple[str | None, list[dict[str, Any]], str]:
+        token = str(symbol or "").strip().upper().replace(".", "-")
+        if not token:
+            return None, [], "missing_symbol"
+        if await self._symbol_quality_ok(token):
+            return token, [], "valid_symbol"
+
+        if re.fullmatch(r"[A-Z]{2,5}", token):
+            try:
+                provider_guess = str(resolve_symbol_input(f"{token} stock") or "").strip().upper().replace(".", "-")
+            except Exception:
+                provider_guess = ""
+            if (
+                provider_guess
+                and provider_guess != token
+                and self._is_confident_symbol_match(token, provider_guess)
+                and await self._symbol_quality_ok(provider_guess)
+            ):
+                return provider_guess, [{"ticker": provider_guess, "name": "", "exchange": None}], "provider_guess"
+
+        suggestions = await self._symbol_repair_suggestions(token, limit=5)
+        if len(suggestions) == 1:
+            candidate = str(suggestions[0].get("ticker") or "").strip().upper()
+            if candidate and self._is_confident_symbol_match(token, candidate) and await self._symbol_quality_ok(candidate):
+                return candidate, suggestions, "single_suggestion"
+
+        return None, suggestions, "ambiguous_or_invalid"
+
+    async def _run_startup_migrations(self) -> None:
+        agents = tracker_repo.list_agents(user_id=None)
+        for agent in agents:
+            status = str(agent.get("status") or "").lower()
+            if status == "deleted":
+                continue
+
+            agent_id = str(agent.get("id") or "")
+            user_id = agent.get("user_id")
+            symbol = str(agent.get("symbol") or "").strip().upper()
+            if not agent_id:
+                continue
+
+            existing_triggers = agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {}
+            next_triggers = dict(existing_triggers or {})
+            updates: dict[str, Any] = {}
+            notes: list[str] = []
+            migration_resolution: dict[str, Any] | None = None
+
+            repaired_symbol, suggestions, repair_reason = await self._resolve_symbol_repair(symbol)
+            if repaired_symbol and repaired_symbol != symbol:
+                updates["symbol"] = repaired_symbol
+                migration_resolution = {
+                    "input_symbol": symbol,
+                    "resolved_symbol": repaired_symbol,
+                    "auto_corrected": True,
+                    "confidence": "high",
+                    "suggestions": suggestions,
+                    "reason": repair_reason,
+                }
+                notes.append(f"Auto-repaired symbol from {symbol} to {repaired_symbol}.")
+                next_triggers.pop("symbol_review_needed", None)
+                next_triggers.pop("symbol_review_input", None)
+                next_triggers.pop("symbol_review_candidates", None)
+                next_triggers.pop("symbol_review_checked_at", None)
+            elif not repaired_symbol:
+                if not bool(next_triggers.get("symbol_review_needed")):
+                    next_triggers["symbol_review_needed"] = True
+                    next_triggers["symbol_review_input"] = symbol
+                    next_triggers["symbol_review_candidates"] = suggestions
+                    next_triggers["symbol_review_checked_at"] = datetime.now(timezone.utc).isoformat()
+                    notes.append("Symbol requires manual confirmation due to ambiguous/invalid mapping.")
+            else:
+                # Clean stale review flags when symbol validates.
+                had_review_flags = any(
+                    key in next_triggers
+                    for key in ("symbol_review_needed", "symbol_review_input", "symbol_review_candidates", "symbol_review_checked_at")
+                )
+                if had_review_flags:
+                    next_triggers.pop("symbol_review_needed", None)
+                    next_triggers.pop("symbol_review_input", None)
+                    next_triggers.pop("symbol_review_candidates", None)
+                    next_triggers.pop("symbol_review_checked_at", None)
+                    notes.append("Cleared stale symbol-review flags after validation.")
+
+            schedule_mode = str(next_triggers.get("schedule_mode") or "realtime").strip().lower()
+            report_mode = str(next_triggers.get("report_mode") or "triggers_only").strip().lower()
+            if schedule_mode == "realtime" and report_mode == "triggers_only":
+                try:
+                    poll_seconds = int(float(next_triggers.get("poll_interval_seconds") or self.settings.tracker_poll_interval_seconds))
+                except Exception:
+                    poll_seconds = max(30, int(self.settings.tracker_poll_interval_seconds))
+                poll_seconds = max(30, min(3600, poll_seconds))
+                try:
+                    report_seconds = int(float(next_triggers.get("report_interval_seconds") or poll_seconds))
+                except Exception:
+                    report_seconds = poll_seconds
+                report_seconds = max(30, min(86400, report_seconds))
+                next_triggers["report_mode"] = "hybrid"
+                next_triggers["poll_interval_seconds"] = poll_seconds
+                next_triggers["report_interval_seconds"] = report_seconds
+                notes.append("Migrated realtime agent from trigger-only to hybrid notification mode.")
+
+            if next_triggers != existing_triggers:
+                updates["triggers"] = next_triggers
+
+            if not updates:
+                continue
+
+            updated = tracker_repo.update_agent(user_id=user_id, agent_id=agent_id, updates=updates)
+            if updated is None:
+                continue
+
+            tracker_repo.create_history(
+                user_id=user_id,
+                agent_id=agent_id,
+                event_type="system_update",
+                parsed_intent={
+                    "intent": "startup_migration",
+                    "symbol_resolution": migration_resolution,
+                    "changes": list(updates.keys()),
+                },
+                trigger_snapshot=updated.get("triggers") if isinstance(updated.get("triggers"), dict) else {},
+                note=" ".join(notes)[:500],
+            )
+            await log_agent_activity(
+                module="tracker",
+                agent_name=str(updated.get("name") or "Tracker Agent"),
+                action=f"Startup migration applied for {str(updated.get('symbol') or symbol).upper()}",
+                status="success",
+                user_id=user_id,
+                details={
+                    "agent_id": agent_id,
+                    "symbol_before": symbol,
+                    "symbol_after": str(updated.get("symbol") or symbol).upper(),
+                    "updates": updates,
+                    "notes": notes,
+                    "symbol_resolution": migration_resolution,
+                },
+            )
 
     async def snapshot(self) -> TrackerSnapshot:
         if self._latest_snapshot is None:
@@ -269,9 +476,6 @@ class TrackerService:
         if not notification_prefs:
             return True, None
 
-        if self._is_quiet_hours(notification_prefs, now):
-            return False, "quiet_hours"
-
         frequency = str(notification_prefs.get("alert_frequency") or "realtime").strip().lower()
         min_interval_seconds = {
             "realtime": 0,
@@ -397,7 +601,7 @@ class TrackerService:
         if baseline_mode not in {"prev_close", "last_check", "last_alert", "session_open"}:
             baseline_mode = "prev_close"
 
-        report_mode_raw = str(triggers.get("report_mode") or "triggers_only").strip().lower()
+        report_mode_raw = str(triggers.get("report_mode") or "hybrid").strip().lower()
         report_mode_aliases = {
             "alerts": "triggers_only",
             "alerts_only": "triggers_only",
@@ -408,7 +612,7 @@ class TrackerService:
         }
         report_mode = report_mode_aliases.get(report_mode_raw, report_mode_raw)
         if report_mode not in {"triggers_only", "periodic", "hybrid"}:
-            report_mode = "triggers_only"
+            report_mode = "hybrid"
 
         timeframe = str(triggers.get("research_timeframe") or "7d")
         notify_phone = str(triggers.get("notify_phone") or "").strip() or None
@@ -439,15 +643,6 @@ class TrackerService:
         if start_at and now < start_at:
             return False
 
-        schedule_mode = str(tooling.get("schedule_mode") or "realtime")
-        if schedule_mode == "daily":
-            return self._agent_daily_due(
-                agent,
-                now,
-                daily_run_time=str(tooling.get("daily_run_time") or "09:30"),
-                timezone_name=str(tooling.get("timezone") or "America/New_York"),
-            )
-
         poll_interval_seconds = int(tooling.get("poll_interval_seconds") or self.settings.tracker_poll_interval_seconds)
         raw = agent.get("last_checked_at")
         if not raw:
@@ -471,31 +666,6 @@ class TrackerService:
         except Exception:
             return True
         return (now - stamp) >= timedelta(seconds=max(30, report_interval_seconds))
-
-    def _agent_daily_due(self, agent: dict[str, Any], now: datetime, *, daily_run_time: str, timezone_name: str) -> bool:
-        try:
-            tz = ZoneInfo(timezone_name)
-        except Exception:
-            tz = timezone.utc
-        local_now = now.astimezone(tz)
-        parts = daily_run_time.split(":")
-        try:
-            hh = max(0, min(23, int(parts[0])))
-            mm = max(0, min(59, int(parts[1])))
-        except Exception:
-            hh, mm = 9, 30
-
-        local_scheduled = local_now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        last_checked = self._parse_timestamp(agent.get("last_checked_at"))
-        if last_checked is not None:
-            last_local = last_checked.astimezone(tz)
-        else:
-            last_local = None
-
-        if local_now >= local_scheduled:
-            return last_local is None or last_local < local_scheduled
-        previous_window = local_scheduled - timedelta(days=1)
-        return last_local is None or last_local < previous_window
 
     def _resolve_agent_price_change(
         self,
@@ -717,7 +887,7 @@ class TrackerService:
         price_alerts_enabled = bool(notification_prefs.get("price_alerts", True))
         volume_alerts_enabled = bool(notification_prefs.get("volume_alerts", True))
         simulation_summary_enabled = bool(notification_prefs.get("simulation_summary", True))
-        report_mode = str(tooling.get("report_mode") or "triggers_only")
+        report_mode = str(tooling.get("report_mode") or "hybrid")
         report_interval_seconds = int(tooling.get("report_interval_seconds") or tooling.get("poll_interval_seconds") or 120)
         scheduled_report_due = report_mode in {"periodic", "hybrid"} and self._agent_report_due(
             agent,
@@ -1233,7 +1403,7 @@ class TrackerService:
                     tooling = self._agent_tooling_config(agent)
                     if not self._agent_poll_due(agent, tooling, now):
                         continue
-                    if self._agent_in_cooldown(agent) and str(tooling.get("report_mode") or "triggers_only") == "triggers_only":
+                    if self._agent_in_cooldown(agent) and str(tooling.get("report_mode") or "hybrid") == "triggers_only":
                         await log_agent_activity(
                             module="tracker",
                             agent_name=str(agent.get("name") or f"{metric.ticker} Associate"),

@@ -10,6 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.schemas import ResearchRequest
@@ -17,7 +18,13 @@ from app.services.agent_logger import get_recent_activity, log_agent_activity
 from app.services.browserbase_scraper import run_deep_research
 from app.services.llm import parse_tracker_instruction, tracker_agent_chat_response, tracker_context_query_response
 from app.services.macro import get_macro_indicators
-from app.services.market_data import fetch_candles, fetch_metric, resolve_symbol_input
+from app.services.market_data import (
+    fetch_candles,
+    fetch_metric,
+    is_metric_quality_valid,
+    resolve_symbol_input,
+    search_tickers,
+)
 from app.services.notifications import dispatch_alert_notification
 from app.services.prediction_markets import fetch_kalshi_markets, fetch_polymarket_markets
 from app.services.research_cache import get_cached_research, set_cached_research
@@ -51,6 +58,7 @@ class TrackerAgentCreateRequest(BaseModel):
 
 
 class TrackerAgentPatchRequest(BaseModel):
+    symbol: str | None = None
     status: str | None = None
     name: str | None = None
     triggers: dict[str, Any] | None = None
@@ -206,10 +214,10 @@ def sanitize_tracker_triggers(raw: dict[str, Any] | None) -> dict[str, Any]:
     out["timezone"] = _normalize_timezone_input(timezone_raw)
 
     start_at_raw = raw.get("start_at")
+    normalized_start_at: str | None = None
     if start_at_raw:
         token = str(start_at_raw).strip()
         if token:
-            normalized_start_at: str | None = None
             try:
                 stamp = datetime.fromisoformat(token.replace("Z", "+00:00"))
                 if stamp.tzinfo is None:
@@ -217,8 +225,11 @@ def sanitize_tracker_triggers(raw: dict[str, Any] | None) -> dict[str, Any]:
                 normalized_start_at = stamp.astimezone(timezone.utc).isoformat()
             except Exception:
                 normalized_start_at = None
-            if normalized_start_at:
-                out["start_at"] = normalized_start_at
+    if normalized_start_at:
+        out["start_at"] = normalized_start_at
+    else:
+        # Timer-first default: if client omits/invalidates start_at, begin immediately.
+        out["start_at"] = datetime.now(timezone.utc).isoformat()
 
     baseline_mode = str(raw.get("baseline_mode") or "prev_close").strip().lower()
     if baseline_mode not in {"prev_close", "last_check", "last_alert", "session_open"}:
@@ -241,9 +252,9 @@ def sanitize_tracker_triggers(raw: dict[str, Any] | None) -> dict[str, Any]:
         "periodic_report": "periodic",
         "mixed": "hybrid",
     }
-    report_mode = report_mode_aliases.get(report_mode_raw, report_mode_raw or "triggers_only")
+    report_mode = report_mode_aliases.get(report_mode_raw, report_mode_raw or "hybrid")
     if report_mode not in {"triggers_only", "periodic", "hybrid"}:
-        report_mode = "triggers_only"
+        report_mode = "hybrid"
     out["report_mode"] = report_mode
 
     allowed_tools = {
@@ -808,10 +819,7 @@ def _require_tracker_user_id(request: Request, explicit_user_id: str | None = No
 def _require_agent_start_time(triggers: dict[str, Any]) -> None:
     start_at = str(triggers.get("start_at") or "").strip()
     if not start_at:
-        raise HTTPException(
-            status_code=422,
-            detail="start_at is required. Set a start time in the future or 'start now' in your instruction.",
-        )
+        triggers["start_at"] = datetime.now(timezone.utc).isoformat()
 
 
 _SYMBOL_STOPWORDS = {
@@ -886,46 +894,233 @@ def _extract_symbol_candidates_from_prompt(prompt: str) -> list[str]:
     return candidates
 
 
-def _resolve_symbol_candidate(candidate: str) -> str:
-    token = str(candidate or "").strip()
-    if not token:
+class _TrackerSymbolResolutionError(Exception):
+    def __init__(self, *, code: str, resolution: dict[str, Any], message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.resolution = resolution
+        self.message = message
+
+
+def _normalize_symbol_input(value: str) -> str:
+    token = str(value or "").strip().upper().replace(".", "-")
+    return re.sub(r"\s+", "", token)
+
+
+def _is_confident_symbol_match(input_symbol: str, candidate_symbol: str) -> bool:
+    source = _normalize_symbol_input(input_symbol)
+    target = _normalize_symbol_input(candidate_symbol)
+    if not source or not target:
+        return False
+    if source == target:
+        return True
+    if len(target) < len(source):
+        return False
+    if len(source) >= 2 and not target.startswith(source[:2]):
+        return False
+    return target.startswith(source) and (len(target) - len(source) <= 2)
+
+
+def _ticker_lookup_to_dict(item: Any) -> dict[str, Any]:
+    return {
+        "ticker": str(getattr(item, "ticker", "") or "").upper().strip(),
+        "name": str(getattr(item, "name", "") or "").strip(),
+        "exchange": str(getattr(item, "exchange", "") or "").strip() or None,
+    }
+
+
+def _build_symbol_resolution(
+    *,
+    input_symbol: str,
+    resolved_symbol: str | None,
+    auto_corrected: bool,
+    confidence: str,
+    suggestions: list[dict[str, Any]] | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "input_symbol": input_symbol,
+        "resolved_symbol": resolved_symbol,
+        "auto_corrected": bool(auto_corrected),
+        "confidence": confidence,
+        "suggestions": suggestions or [],
+        "message": message,
+    }
+
+
+def _symbol_resolution_error_response(exc: _TrackerSymbolResolutionError) -> JSONResponse:
+    payload = {
+        "detail": exc.code,
+        "symbol_resolution": exc.resolution,
+        "message": exc.message,
+    }
+    return JSONResponse(status_code=422, content=payload)
+
+
+async def _probe_symbol_quality(symbol: str) -> tuple[bool, dict[str, Any] | None]:
+    try:
+        metric = await asyncio.to_thread(fetch_metric, symbol)
+    except Exception:
+        return False, None
+    metric_payload = metric.model_dump() if hasattr(metric, "model_dump") else None
+    return is_metric_quality_valid(metric), metric_payload
+
+
+async def _resolve_tracker_symbol_candidate(candidate: str) -> tuple[str, dict[str, Any]]:
+    raw_input = str(candidate or "").strip()
+    if not raw_input:
         raise ValueError("Ticker input is empty.")
-    alias_key = re.sub(r"[^A-Za-z0-9&]+", " ", token).strip().upper()
-    if alias_key in _COMPANY_ALIAS_TO_SYMBOL:
-        return _COMPANY_ALIAS_TO_SYMBOL[alias_key]
 
-    if re.fullmatch(r"[A-Za-z]{4,}", token):
+    normalized_input = _normalize_symbol_input(raw_input)
+    alias_key = re.sub(r"[^A-Za-z0-9&]+", " ", raw_input).strip().upper()
+
+    # High-confidence alias mapping (e.g., AMAZON -> AMZN).
+    alias_symbol = _COMPANY_ALIAS_TO_SYMBOL.get(alias_key)
+    if alias_symbol:
+        quality_ok, _ = await _probe_symbol_quality(alias_symbol)
+        if quality_ok:
+            return alias_symbol, _build_symbol_resolution(
+                input_symbol=raw_input,
+                resolved_symbol=alias_symbol,
+                auto_corrected=_normalize_symbol_input(raw_input) != alias_symbol,
+                confidence="high",
+                message=f"Mapped company alias to {alias_symbol}.",
+            )
+
+    resolved_guess: str | None = None
+    try:
+        resolved_guess = resolve_symbol_input(raw_input)
+    except ValueError:
+        resolved_guess = None
+
+    if resolved_guess:
+        resolved_guess = _normalize_symbol_input(resolved_guess)
+        quality_ok, _ = await _probe_symbol_quality(resolved_guess)
+        if quality_ok:
+            return resolved_guess, _build_symbol_resolution(
+                input_symbol=raw_input,
+                resolved_symbol=resolved_guess,
+                auto_corrected=resolved_guess != normalized_input,
+                confidence="high",
+                message=None if resolved_guess == normalized_input else f"Auto-corrected to {resolved_guess}.",
+            )
+
+    # Try provider search intent for ambiguous short symbols (e.g., AMZ -> AMZN stock).
+    provider_guess: str | None = None
+    if re.fullmatch(r"[A-Za-z]{2,5}", raw_input):
         try:
-            return resolve_symbol_input(f"{token} stock")
+            provider_guess = _normalize_symbol_input(resolve_symbol_input(f"{raw_input} stock"))
         except ValueError:
-            pass
-    return resolve_symbol_input(token)
+            provider_guess = None
+    if provider_guess and provider_guess != resolved_guess and _is_confident_symbol_match(normalized_input, provider_guess):
+        quality_ok, _ = await _probe_symbol_quality(provider_guess)
+        if quality_ok:
+            return provider_guess, _build_symbol_resolution(
+                input_symbol=raw_input,
+                resolved_symbol=provider_guess,
+                auto_corrected=provider_guess != normalized_input,
+                confidence="high",
+                message=f"Auto-corrected {normalized_input or raw_input} to {provider_guess}.",
+            )
 
+    suggestions_models = await search_tickers(raw_input, limit=6)
+    if not suggestions_models and re.fullmatch(r"[A-Za-z]{2,5}", raw_input):
+        suggestions_models = await search_tickers(f"{raw_input} stock", limit=6)
 
-def _infer_symbol_from_prompt(prompt: str) -> str | None:
-    for candidate in _extract_symbol_candidates_from_prompt(prompt):
-        try:
-            return _resolve_symbol_candidate(candidate)
-        except Exception:
+    seen: set[str] = set()
+    suggestions: list[dict[str, Any]] = []
+    for item in suggestions_models:
+        payload = _ticker_lookup_to_dict(item)
+        ticker = str(payload.get("ticker") or "")
+        if not ticker or ticker in seen:
             continue
-    return None
+        seen.add(ticker)
+        suggestions.append(payload)
+        if len(suggestions) >= 5:
+            break
+
+    if suggestions:
+        first = suggestions[0]
+        # High-confidence auto-correct when exactly one clear provider match exists.
+        if len(suggestions) == 1:
+            chosen = str(first.get("ticker") or "").upper()
+            if re.fullmatch(r"[A-Z]{2,5}", normalized_input) and not _is_confident_symbol_match(normalized_input, chosen):
+                resolution = _build_symbol_resolution(
+                    input_symbol=raw_input,
+                    resolved_symbol=None,
+                    auto_corrected=False,
+                    confidence="low",
+                    suggestions=suggestions,
+                    message="Single provider match is low-confidence. Select it explicitly to continue.",
+                )
+                raise _TrackerSymbolResolutionError(
+                    code="symbol_ambiguous",
+                    resolution=resolution,
+                    message="Single provider match is low-confidence. Select it explicitly to continue.",
+                )
+            quality_ok, _ = await _probe_symbol_quality(chosen)
+            if quality_ok:
+                return chosen, _build_symbol_resolution(
+                    input_symbol=raw_input,
+                    resolved_symbol=chosen,
+                    auto_corrected=chosen != normalized_input,
+                    confidence="high",
+                    suggestions=suggestions,
+                    message=f"Auto-corrected {normalized_input or raw_input} to {chosen}.",
+                )
+
+        resolution = _build_symbol_resolution(
+            input_symbol=raw_input,
+            resolved_symbol=None,
+            auto_corrected=False,
+            confidence="low",
+            suggestions=suggestions,
+            message="Multiple ticker matches found. Select one suggestion.",
+        )
+        raise _TrackerSymbolResolutionError(
+            code="symbol_ambiguous",
+            resolution=resolution,
+            message="Multiple ticker matches found. Select one suggestion.",
+        )
+
+    resolution = _build_symbol_resolution(
+        input_symbol=raw_input,
+        resolved_symbol=None,
+        auto_corrected=False,
+        confidence="low",
+        suggestions=[],
+        message=f"Could not resolve a tradable ticker from '{raw_input}'.",
+    )
+    raise _TrackerSymbolResolutionError(
+        code="symbol_invalid",
+        resolution=resolution,
+        message=f"Could not resolve a tradable ticker from '{raw_input}'.",
+    )
 
 
-def _resolve_tracker_symbol(
+async def _resolve_tracker_symbol(
     *,
     explicit_symbol: str | None,
     create_prompt: str,
     parsed_prompt: dict[str, Any] | None,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
+    last_symbol_error: _TrackerSymbolResolutionError | None = None
     if explicit_symbol and str(explicit_symbol).strip():
         try:
-            return _resolve_symbol_candidate(str(explicit_symbol))
+            return await _resolve_tracker_symbol_candidate(str(explicit_symbol))
+        except _TrackerSymbolResolutionError as exc:
+            raise exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    inferred = _infer_symbol_from_prompt(create_prompt)
-    if inferred:
-        return inferred
+    for inferred_candidate in _extract_symbol_candidates_from_prompt(create_prompt):
+        try:
+            return await _resolve_tracker_symbol_candidate(inferred_candidate)
+        except _TrackerSymbolResolutionError as exc:
+            last_symbol_error = exc
+            continue
+        except ValueError:
+            continue
 
     parsed_prompt = parsed_prompt or {}
     parsed_symbol = str(parsed_prompt.get("symbol") or "").strip().upper()
@@ -934,7 +1129,9 @@ def _resolve_tracker_symbol(
         looks_like_fallback = parsed_symbol == "AAPL" and ("AAPL" not in prompt_upper and "APPLE" not in prompt_upper)
         if not looks_like_fallback:
             try:
-                return _resolve_symbol_candidate(parsed_symbol)
+                return await _resolve_tracker_symbol_candidate(parsed_symbol)
+            except _TrackerSymbolResolutionError as exc:
+                last_symbol_error = exc
             except ValueError:
                 pass
 
@@ -943,9 +1140,14 @@ def _resolve_tracker_symbol(
         name_hint = re.sub(r"\b(associate|tracker|agent)\b", "", parsed_name, flags=re.IGNORECASE).strip()
         if name_hint:
             try:
-                return _resolve_symbol_candidate(name_hint)
+                return await _resolve_tracker_symbol_candidate(name_hint)
+            except _TrackerSymbolResolutionError as exc:
+                last_symbol_error = exc
             except ValueError:
                 pass
+
+    if last_symbol_error is not None:
+        raise last_symbol_error
 
     if create_prompt:
         raise HTTPException(
@@ -1020,10 +1222,30 @@ async def _notify_agent_created_twilio(
     symbol = str(agent.get("symbol") or "").upper() or "UNKNOWN"
     agent_name = str(agent.get("name") or f"{symbol} Tracker Agent")
     schedule_mode = str(triggers.get("schedule_mode") or "realtime")
-    report_mode = str(triggers.get("report_mode") or "triggers_only")
-    timezone = _normalize_timezone_input(triggers.get("timezone"))
-    start_at = str(triggers.get("start_at") or "").strip()
-    start_line = start_at if start_at else "immediately"
+    report_mode = str(triggers.get("report_mode") or "hybrid")
+
+    def _interval_minutes(raw_value: Any, default_seconds: int) -> int:
+        try:
+            seconds = int(float(raw_value))
+        except Exception:
+            seconds = default_seconds
+        return max(1, round(max(30, seconds) / 60))
+
+    poll_minutes = _interval_minutes(triggers.get("poll_interval_seconds"), 120)
+    report_minutes = _interval_minutes(triggers.get("report_interval_seconds"), int(triggers.get("poll_interval_seconds") or 120))
+    start_at_raw = str(triggers.get("start_at") or "").strip()
+    start_phrase = "Starts now"
+    if start_at_raw:
+        try:
+            start_stamp = datetime.fromisoformat(start_at_raw.replace("Z", "+00:00"))
+            if start_stamp.tzinfo is None:
+                start_stamp = start_stamp.replace(tzinfo=timezone.utc)
+            seconds_until = (start_stamp.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+            if seconds_until > 90:
+                start_phrase = f"Starts at {start_stamp.astimezone(timezone.utc).strftime('%b %d %I:%M %p UTC')}"
+        except Exception:
+            start_phrase = "Starts now"
+
     to_number = await _resolve_agent_create_notification_phone(
         user_id=user_id,
         triggers=triggers,
@@ -1031,8 +1253,8 @@ async def _notify_agent_created_twilio(
     )
     title = f"TickerMaster Agent Created: {symbol}"
     body = (
-        f"{agent_name} is now active. "
-        f"Schedule={schedule_mode}, mode={report_mode}, start={start_line}, timezone={timezone}."
+        f"{agent_name} is now active. {start_phrase}. "
+        f"Mode: {report_mode}. Poll every {poll_minutes} min; reports every {report_minutes} min."
     )
     notification = await dispatch_alert_notification(
         settings=request.app.state.settings,
@@ -1047,7 +1269,8 @@ async def _notify_agent_created_twilio(
             "symbol": symbol,
             "schedule_mode": schedule_mode,
             "report_mode": report_mode,
-            "timezone": timezone,
+            "poll_interval_minutes": poll_minutes,
+            "report_interval_minutes": report_minutes,
         },
     )
     delivered = bool((notification.get("twilio") or {}).get("delivered"))
@@ -1096,11 +1319,14 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
     }
     clean_triggers = sanitize_tracker_triggers(merged_triggers)
     _require_agent_start_time(clean_triggers)
-    symbol = _resolve_tracker_symbol(
-        explicit_symbol=payload.symbol,
-        create_prompt=create_prompt,
-        parsed_prompt=parsed_prompt,
-    )
+    try:
+        symbol, symbol_resolution = await _resolve_tracker_symbol(
+            explicit_symbol=payload.symbol,
+            create_prompt=create_prompt,
+            parsed_prompt=parsed_prompt,
+        )
+    except _TrackerSymbolResolutionError as exc:
+        return _symbol_resolution_error_response(exc)
     parsed_name = str(parsed_prompt.get("name") or "").strip() if isinstance(parsed_prompt, dict) else ""
     name = str(payload.name or "").strip() or parsed_name or f"{symbol} Tracker Agent"
     auto_simulate = bool(
@@ -1135,6 +1361,19 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
             ),
             strict_persistence=True,
         )
+        if bool(symbol_resolution.get("auto_corrected")):
+            tracker_repo.create_history(
+                user_id=resolved_user_id,
+                agent_id=str(agent.get("id")),
+                event_type="system_update",
+                parsed_intent={"intent": "symbol_resolution", "symbol_resolution": symbol_resolution},
+                trigger_snapshot=agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {},
+                note=(
+                    f"Symbol auto-corrected from {symbol_resolution.get('input_symbol')} "
+                    f"to {symbol_resolution.get('resolved_symbol')} (confidence={symbol_resolution.get('confidence')})."
+                ),
+                strict_persistence=True,
+            )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     await log_agent_activity(
@@ -1150,6 +1389,7 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
             "triggers": agent.get("triggers") or merged_triggers,
             "create_prompt": create_prompt or None,
             "parsed_prompt": parsed_prompt or None,
+            "symbol_resolution": symbol_resolution,
         },
     )
     creation_notification: dict[str, Any] | None = None
@@ -1178,7 +1418,7 @@ async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Requ
                 "notification": creation_notification,
             },
         )
-    return {**agent, "_creation_notification": creation_notification}
+    return {**agent, "_creation_notification": creation_notification, "symbol_resolution": symbol_resolution}
 
 
 @router.get("/tracker/agents")
@@ -1194,6 +1434,19 @@ async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, 
     if existing is None:
         return {"error": "not_found"}
     updates = payload.model_dump(exclude_none=True)
+    symbol_resolution: dict[str, Any] | None = None
+    if "symbol" in updates:
+        raw_symbol = str(updates.get("symbol") or "").strip()
+        if not raw_symbol:
+            updates.pop("symbol", None)
+        else:
+            try:
+                resolved_symbol, symbol_resolution = await _resolve_tracker_symbol_candidate(raw_symbol)
+            except _TrackerSymbolResolutionError as exc:
+                return _symbol_resolution_error_response(exc)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            updates["symbol"] = resolved_symbol
     if "triggers" in updates and isinstance(updates.get("triggers"), dict):
         existing_triggers = sanitize_tracker_triggers(existing.get("triggers")) if isinstance(existing.get("triggers"), dict) else {}
         merged_triggers = {
@@ -1209,9 +1462,20 @@ async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, 
         user_id=resolved_user_id,
         agent_id=agent_id,
         event_type="system_update",
-        parsed_intent={"intent": "update_agent"},
+        parsed_intent={
+            "intent": "update_agent",
+            "symbol_resolution": symbol_resolution,
+        },
         trigger_snapshot=item.get("triggers") if isinstance(item.get("triggers"), dict) else {},
-        note="Agent updated via structured tracker patch endpoint.",
+        note=(
+            "Agent updated via structured tracker patch endpoint."
+            if not symbol_resolution or not symbol_resolution.get("auto_corrected")
+            else (
+                f"Agent updated via structured tracker patch endpoint. "
+                f"Symbol auto-corrected from {symbol_resolution.get('input_symbol')} "
+                f"to {symbol_resolution.get('resolved_symbol')}."
+            )
+        ),
     )
     await log_agent_activity(
         module="tracker",
@@ -1224,9 +1488,10 @@ async def patch_tracker_agent(agent_id: str, payload: TrackerAgentPatchRequest, 
             "symbol": str(item.get("symbol") or "").upper(),
             "description": "Monitoring profile updated and running with new settings.",
             "updates": updates,
+            "symbol_resolution": symbol_resolution,
         },
     )
-    return item
+    return {**item, "symbol_resolution": symbol_resolution}
 
 
 @router.get("/tracker/agents/{agent_id}")
@@ -1449,11 +1714,14 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
     settings = request.app.state.settings
     parsed = await parse_tracker_instruction(settings, payload.prompt)
 
-    symbol = _resolve_tracker_symbol(
-        explicit_symbol=None,
-        create_prompt=payload.prompt,
-        parsed_prompt=parsed if isinstance(parsed, dict) else {},
-    )
+    try:
+        symbol, symbol_resolution = await _resolve_tracker_symbol(
+            explicit_symbol=None,
+            create_prompt=payload.prompt,
+            parsed_prompt=parsed if isinstance(parsed, dict) else {},
+        )
+    except _TrackerSymbolResolutionError as exc:
+        return _symbol_resolution_error_response(exc)
     name = str(parsed.get("name") or f"{symbol} Associate")
     triggers = sanitize_tracker_triggers(
         _apply_prompt_overrides(
@@ -1486,6 +1754,19 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
             note="Agent created from prompt.",
             strict_persistence=True,
         )
+        if bool(symbol_resolution.get("auto_corrected")):
+            tracker_repo.create_history(
+                user_id=resolved_user_id,
+                agent_id=str(agent.get("id")),
+                event_type="system_update",
+                parsed_intent={"intent": "symbol_resolution", "symbol_resolution": symbol_resolution},
+                trigger_snapshot=agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {},
+                note=(
+                    f"Symbol auto-corrected from {symbol_resolution.get('input_symbol')} "
+                    f"to {symbol_resolution.get('resolved_symbol')} (confidence={symbol_resolution.get('confidence')})."
+                ),
+                strict_persistence=True,
+            )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     await log_agent_activity(
@@ -1500,6 +1781,7 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
             "description": "LLM parsed manager instruction into a deployable tracker associate profile.",
             "raw_prompt": payload.prompt,
             "parsed": parsed,
+            "symbol_resolution": symbol_resolution,
         },
     )
     creation_notification: dict[str, Any] | None = None
@@ -1528,7 +1810,11 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
                 "notification": creation_notification,
             },
         )
-    return {"ok": True, "agent": {**agent, "_creation_notification": creation_notification}, "parsed": parsed}
+    return {
+        "ok": True,
+        "agent": {**agent, "_creation_notification": creation_notification, "symbol_resolution": symbol_resolution},
+        "parsed": parsed,
+    }
 
 
 @router.post("/tracker/agents/{agent_id}/interact")

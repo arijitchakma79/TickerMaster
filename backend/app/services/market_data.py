@@ -45,6 +45,19 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
+def is_metric_quality_valid(metric: MarketMetric | None) -> bool:
+    if metric is None:
+        return False
+    price = _safe_float(metric.price)
+    if price is None or price <= 0:
+        return False
+    volume = _safe_int(metric.volume)
+    market_cap = _safe_float(metric.market_cap)
+    change = _safe_float(metric.change_percent) or 0.0
+    # Require at least one additional signal so invalid symbols with zeroed quotes do not pass.
+    return bool((volume and volume > 0) or (market_cap and market_cap > 0) or abs(change) > 0.0001)
+
+
 def _synthetic_metric(symbol: str) -> MarketMetric:
     seed = abs(hash(symbol)) % 10_000
     rng = np.random.default_rng(seed)
@@ -491,7 +504,7 @@ def _alpaca_metric(symbol: str) -> MarketMetric | None:
     price = _safe_float(latest_trade.get("p")) or _safe_float(daily_bar.get("c"))
     prev_close = _safe_float(prev_daily_bar.get("c")) or _safe_float(daily_bar.get("o")) or price
 
-    if price is None:
+    if price is None or price <= 0:
         return None
 
     change_percent = ((price - prev_close) / prev_close * 100) if prev_close else 0.0
@@ -513,7 +526,7 @@ def _finnhub_quote(symbol: str) -> dict[str, Any] | None:
         return None
 
     price = _safe_float(payload.get("c"))
-    if price is None:
+    if price is None or price <= 0:
         return None
 
     prev = _safe_float(payload.get("pc")) or price
