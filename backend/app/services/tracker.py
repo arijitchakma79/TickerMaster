@@ -34,6 +34,11 @@ if TYPE_CHECKING:
 
 
 class TrackerService:
+    _RESEARCH_CACHE_MAX_ENTRIES = 256
+    _NOTIFICATION_PREF_CACHE_MAX_ENTRIES = 512
+    _INSTRUCTION_CACHE_MAX_ENTRIES = 512
+    _TOOL_PLAN_CACHE_MAX_ENTRIES = 512
+
     def __init__(
         self,
         settings: Settings,
@@ -54,6 +59,12 @@ class TrackerService:
         self._tool_plan_cache: Dict[str, Dict[str, Any]] = {}
         self._rng = np.random.default_rng()
         self._startup_migrations_done = False
+
+    def _cache_set(self, cache: dict[str, dict[str, Any]], key: str, value: dict[str, Any], max_entries: int) -> None:
+        cache[key] = value
+        overflow = len(cache) - max_entries
+        for _ in range(max(0, overflow)):
+            cache.pop(next(iter(cache)), None)
 
     def set_watchlist(self, tickers: List[str]) -> List[str]:
         clean = {t.strip().upper() for t in tickers if t.strip()}
@@ -374,7 +385,12 @@ class TrackerService:
             ),
             "",
         )
-        self._instruction_cache[agent_id] = {"cached_at": datetime.now(timezone.utc), "prompt": latest_prompt}
+        self._cache_set(
+            self._instruction_cache,
+            agent_id,
+            {"cached_at": datetime.now(timezone.utc), "prompt": latest_prompt},
+            self._INSTRUCTION_CACHE_MAX_ENTRIES,
+        )
         return latest_prompt
 
     def _extract_prompt_source_intent(self, manager_prompt: str) -> dict[str, Any]:
@@ -461,7 +477,12 @@ class TrackerService:
                 },
                 event_hint="cycle",
             )
-            self._tool_plan_cache[cache_key] = {"cached_at": datetime.now(timezone.utc), "plan": plan}
+            self._cache_set(
+                self._tool_plan_cache,
+                cache_key,
+                {"cached_at": datetime.now(timezone.utc), "plan": plan},
+                self._TOOL_PLAN_CACHE_MAX_ENTRIES,
+            )
 
         chosen_tools = plan.get("tools") if isinstance(plan.get("tools"), list) else []
         chosen_tools = [str(item).strip().lower() for item in chosen_tools if str(item).strip()]
@@ -734,7 +755,12 @@ class TrackerService:
                 "quiet_start": str(row.get("quiet_start") or "22:00:00"),
                 "quiet_end": str(row.get("quiet_end") or "07:00:00"),
             }
-            self._notification_pref_cache[user_id] = {"cached_at": datetime.now(timezone.utc), "data": data}
+            self._cache_set(
+                self._notification_pref_cache,
+                user_id,
+                {"cached_at": datetime.now(timezone.utc), "data": data},
+                self._NOTIFICATION_PREF_CACHE_MAX_ENTRIES,
+            )
             return data
         except Exception:
             return {}
@@ -873,8 +899,8 @@ class TrackerService:
             schedule_mode = "realtime"
         custom_time_enabled = bool(triggers.get("custom_time_enabled"))
         if schedule_mode == "realtime":
-            poll_interval_seconds = 120
-            report_interval_seconds = 120
+            poll_interval_seconds = 300
+            report_interval_seconds = 900
         elif schedule_mode == "hourly":
             poll_interval_seconds = 3600
             report_interval_seconds = 3600
@@ -1231,7 +1257,12 @@ class TrackerService:
                 "breakdown_summaries": {item.source: str(item.summary or "")[:320] for item in data.source_breakdown},
                 "prediction_markets": list(data.prediction_markets or []),
             }
-            self._research_cache[key] = {"cached_at": datetime.now(timezone.utc), "data": payload}
+            self._cache_set(
+                self._research_cache,
+                key,
+                {"cached_at": datetime.now(timezone.utc), "data": payload},
+                self._RESEARCH_CACHE_MAX_ENTRIES,
+            )
             return payload
         except Exception:
             return {
@@ -1252,7 +1283,12 @@ class TrackerService:
         try:
             payload = await run_deep_research(ticker.upper(), self.settings)
             data = payload if isinstance(payload, dict) else {}
-            self._research_cache[key] = {"cached_at": datetime.now(timezone.utc), "data": data}
+            self._cache_set(
+                self._research_cache,
+                key,
+                {"cached_at": datetime.now(timezone.utc), "data": data},
+                self._RESEARCH_CACHE_MAX_ENTRIES,
+            )
             return data
         except Exception:
             return {}

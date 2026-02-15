@@ -4,10 +4,16 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from app.config import get_settings
 from app.services.database import get_supabase
 
 
 class TrackerRepository:
+    _MAX_LOCAL_ALERTS = 500
+    _MAX_LOCAL_ALERT_CONTEXT = 500
+    _MAX_LOCAL_HISTORY = 1000
+    _MAX_LOCAL_RUNS = 1000
+
     def __init__(self) -> None:
         self._agents: dict[str, dict[str, Any]] = {}
         self._alerts: list[dict[str, Any]] = []
@@ -18,6 +24,18 @@ class TrackerRepository:
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    def _allow_local_fallback(self) -> bool:
+        try:
+            return str(get_settings().environment).strip().lower() != "production"
+        except Exception:
+            return True
+
+    def _append_bounded(self, target: list[dict[str, Any]], row: dict[str, Any], max_entries: int) -> None:
+        target.append(row)
+        overflow = len(target) - max_entries
+        if overflow > 0:
+            del target[:overflow]
 
     def create_agent(
         self,
@@ -108,7 +126,8 @@ class TrackerRepository:
             **payload,
             "created_at": self._now(),
         }
-        self._history.append(row)
+        if self._allow_local_fallback():
+            self._append_bounded(self._history, row, self._MAX_LOCAL_HISTORY)
         return row
 
     def list_history(self, user_id: str | None, agent_id: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -178,7 +197,8 @@ class TrackerRepository:
             **payload,
             "created_at": self._now(),
         }
-        self._runs.append(row)
+        if self._allow_local_fallback():
+            self._append_bounded(self._runs, row, self._MAX_LOCAL_RUNS)
         return row
 
     def list_runs(self, user_id: str | None, agent_id: str, limit: int = 50) -> list[dict[str, Any]]:
@@ -401,7 +421,8 @@ class TrackerRepository:
             **payload,
             "created_at": self._now(),
         }
-        self._alerts.append(row)
+        if self._allow_local_fallback():
+            self._append_bounded(self._alerts, row, self._MAX_LOCAL_ALERTS)
         return row
 
     def create_alert_context(
@@ -441,7 +462,8 @@ class TrackerRepository:
             **payload,
             "created_at": self._now(),
         }
-        self._alert_context.append(row)
+        if self._allow_local_fallback():
+            self._append_bounded(self._alert_context, row, self._MAX_LOCAL_ALERT_CONTEXT)
         return row
 
     def list_alert_context(self, user_id: str | None, agent_id: str, limit: int = 40) -> list[dict[str, Any]]:
