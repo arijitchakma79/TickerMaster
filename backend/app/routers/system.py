@@ -43,6 +43,7 @@ async def integrations(request: Request):
             and (settings.twilio_whatsapp_from_number or settings.twilio_from_number)
         ),
         "twilio_mode": "whatsapp" if settings.twilio_use_whatsapp else "sms",
+        "heygen_liveavatar": bool(settings.heygen_api_key),
         "cerebras": bool(settings.cerebras_api_key),
         "nvidia_nim": bool(settings.nvidia_nim_api_key),
         "tracker_mcp_router": bool(settings.mcp_tracker_router_enabled),

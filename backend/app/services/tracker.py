@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -22,9 +23,10 @@ from app.services.market_data import (
     resolve_symbol_input,
     search_tickers,
 )
+from app.services.mcp_tool_router import collect_tracker_research_via_mcp
 from app.services.notifications import dispatch_alert_notification
 from app.services.sentiment import run_research_with_source_selection
-from app.services.tracker_csv import append_alert_context_csv
+from app.services.tracker_csv import append_agent_memory_documents, append_alert_context_csv
 from app.services.tracker_repository import tracker_repo
 from app.services.database import get_supabase
 from app.ws_manager import WSManager
@@ -1203,16 +1205,59 @@ class TrackerService:
         ticker: str,
         timeframe: str = "7d",
         sources: list[str] | None = None,
+        tools: list[str] | None = None,
         include_prediction_markets: bool = False,
         strict_sources: bool = False,
+        manager_prompt: str = "",
+        market_state: dict[str, Any] | None = None,
+        event_hint: str = "cycle",
     ) -> dict[str, Any]:
         source_key = ",".join(sorted([str(item).lower() for item in (sources or [])])) or "default"
-        key = f"{ticker.upper()}:{timeframe}:{source_key}:{int(include_prediction_markets)}:{int(strict_sources)}"
+        tool_key = ",".join(sorted([str(item).lower() for item in (tools or [])])) or "default"
+        key = f"{ticker.upper()}:{timeframe}:{source_key}:{tool_key}:{int(include_prediction_markets)}:{int(strict_sources)}"
         cached = self._research_cache.get(key)
         if cached:
             at = cached.get("cached_at")
             if isinstance(at, datetime) and (datetime.now(timezone.utc) - at) < timedelta(minutes=5):
                 return dict(cached.get("data") or {})
+        mcp_payload = await collect_tracker_research_via_mcp(
+            self.settings,
+            ticker=ticker.upper(),
+            manager_prompt=manager_prompt,
+            tools=list(tools or []),
+            sources=list(sources or []),
+            market_state=market_state or {},
+            timeframe=timeframe,
+            event_hint=event_hint,
+        )
+        if isinstance(mcp_payload, dict) and mcp_payload:
+            payload = {
+                "aggregate_sentiment": float(mcp_payload.get("aggregate_sentiment", 0.0) or 0.0),
+                "recommendation": str(mcp_payload.get("recommendation") or "hold"),
+                "breakdown": mcp_payload.get("breakdown") if isinstance(mcp_payload.get("breakdown"), dict) else {},
+                "breakdown_summaries": (
+                    mcp_payload.get("breakdown_summaries")
+                    if isinstance(mcp_payload.get("breakdown_summaries"), dict)
+                    else {}
+                ),
+                "prediction_markets": (
+                    mcp_payload.get("prediction_markets")
+                    if isinstance(mcp_payload.get("prediction_markets"), list)
+                    else []
+                ),
+                "investigation": str(mcp_payload.get("investigation") or ""),
+                "mcp_debug": mcp_payload.get("mcp_debug") if isinstance(mcp_payload.get("mcp_debug"), dict) else {},
+            }
+            self._research_cache[key] = {"cached_at": datetime.now(timezone.utc), "data": payload}
+            try:
+                print(
+                    f"[tracker-mcp-debug][{ticker.upper()}] "
+                    f"{json.dumps(payload.get('mcp_debug') or {}, ensure_ascii=True)[:6000]}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return payload
         try:
             data = await run_research_with_source_selection(
                 ResearchRequest(
@@ -1230,6 +1275,8 @@ class TrackerService:
                 "breakdown": {item.source: item.score for item in data.source_breakdown},
                 "breakdown_summaries": {item.source: str(item.summary or "")[:320] for item in data.source_breakdown},
                 "prediction_markets": list(data.prediction_markets or []),
+                "investigation": "",
+                "mcp_debug": {},
             }
             self._research_cache[key] = {"cached_at": datetime.now(timezone.utc), "data": payload}
             return payload
@@ -1240,6 +1287,8 @@ class TrackerService:
                 "breakdown": {},
                 "breakdown_summaries": {},
                 "prediction_markets": [],
+                "investigation": "",
+                "mcp_debug": {},
             }
 
     async def _get_deep_research_snapshot(self, ticker: str) -> dict[str, Any]:
@@ -1318,8 +1367,17 @@ class TrackerService:
                 metric.ticker,
                 timeframe=str(tooling.get("research_timeframe") or "7d"),
                 sources=list(tooling.get("research_sources") or []),
+                tools=list(tools),
                 include_prediction_markets=bool(tooling.get("use_prediction_markets")),
                 strict_sources=bool(tooling.get("research_source_lock")),
+                manager_prompt=str(tooling.get("manager_prompt") or ""),
+                market_state={
+                    "ticker": str(metric.ticker),
+                    "price": float(metric.price or 0.0),
+                    "change_percent": float(effective_price_change),
+                    "volume_ratio": float(volume_ratio),
+                },
+                event_hint="cycle",
             )
         deep_research_payload: dict[str, Any] = {}
         if "deep_research" in tools:
@@ -1359,8 +1417,12 @@ class TrackerService:
         if "deep_research" in tools and deep_research_payload and scheduled_report_due:
             trigger_reasons.append("deep-research context refreshed")
 
-        quick_investigation = ""
-        if "news" in tools and (abs(effective_price_change) >= (price_threshold * 0.75) or volume_spike or scheduled_report_due):
+        quick_investigation = str(research.get("investigation") or "").strip()
+        if (
+            "news" in tools
+            and not quick_investigation
+            and (abs(effective_price_change) >= (price_threshold * 0.75) or volume_spike or scheduled_report_due)
+        ):
             quick_investigation = await self._investigate_with_perplexity(
                 metric.ticker,
                 (
@@ -1368,8 +1430,8 @@ class TrackerService:
                     f"sentiment={aggregate:.2f} reasons={'; '.join(trigger_reasons) or 'none'}"
                 ),
             )
-            if quick_investigation and trigger_reasons:
-                trigger_reasons.append("news catalysts detected")
+        if quick_investigation and trigger_reasons and "news catalysts detected" not in trigger_reasons:
+            trigger_reasons.append("news catalysts detected")
 
         await log_agent_activity(
             module="tracker",
@@ -1732,6 +1794,39 @@ class TrackerService:
                     simulation_requested=simulation_requested,
                     context_payload=alert_context_payload,
                 )
+            except Exception:
+                pass
+            try:
+                memory_export = await asyncio.to_thread(
+                    append_agent_memory_documents,
+                    user_id=str(agent.get("user_id")),
+                    agent_id=str(agent.get("id")),
+                    symbol=str(metric.ticker),
+                    generated_at=now.isoformat(),
+                    event_type=event_type,
+                    manager_instruction=str(tooling.get("manager_prompt") or ""),
+                    agent_response=str(narrative or ""),
+                    context_payload={
+                        "reasons": reasons,
+                        "research": research,
+                        "quick_investigation": quick_investigation,
+                        "simulation": simulation_context or {},
+                        "runtime_tool_plan": tooling.get("runtime_tool_plan"),
+                        "market_snapshot": {
+                            "price": metric.price,
+                            "change_percent": round(effective_price_change, 2),
+                            "volume": metric.volume,
+                            "volume_ratio": round(volume_ratio, 3),
+                        },
+                    },
+                    mcp_debug=(
+                        research.get("mcp_debug")
+                        if isinstance(research.get("mcp_debug"), dict)
+                        else {}
+                    ),
+                )
+                if isinstance(memory_export, dict):
+                    alert_context_payload["memory_export"] = memory_export
             except Exception:
                 pass
         update_payload = {

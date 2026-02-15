@@ -3107,6 +3107,93 @@ pre {
   gap: 8px;
 }
 
+.tracker-call-modal {
+  width: min(1280px, 98vw);
+  max-height: 96vh;
+  overflow: auto;
+}
+
+.tracker-call-video-wrap {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #040709;
+  min-height: min(70vh, 760px);
+}
+
+.tracker-call-video-wrap video {
+  width: 100%;
+  min-height: 420px;
+  height: min(70vh, 760px);
+  max-height: none;
+  object-fit: contain;
+  object-position: center top;
+  background: #020406;
+}
+
+.tracker-call-iframe {
+  width: 100%;
+  border: 0;
+  min-height: 320px;
+  aspect-ratio: 16 / 9;
+  background: #020406;
+}
+
+.tracker-call-mode-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tracker-call-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.tracker-call-note {
+  margin: 0;
+  flex: 1 1 260px;
+}
+
+.tracker-call-log {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card-soft-bg-3);
+  padding: 10px;
+  max-height: 240px;
+  overflow: auto;
+  display: grid;
+  gap: 6px;
+}
+
+.tracker-call-log-item {
+  margin: 0;
+  line-height: 1.45;
+  font-size: 0.86rem;
+  color: var(--ink-soft);
+}
+
+.tracker-call-log-item.system {
+  color: var(--muted);
+}
+
+.tracker-call-log-item.you strong {
+  color: #0b7a59;
+}
+
+.tracker-call-log-item.agent strong,
+.tracker-call-log-item.avatar strong {
+  color: #1d5f9b;
+}
+
+.tracker-call-compose {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
 .watchlist-add-field {
   min-width: min(460px, 100%);
 }
@@ -3832,5 +3919,18 @@ time {
 
   .tracker-check-grid {
     grid-template-columns: 1fr;
+  }
+
+  .tracker-call-compose {
+    grid-template-columns: 1fr;
+  }
+
+  .tracker-call-video-wrap {
+    min-height: 54vh;
+  }
+
+  .tracker-call-video-wrap video {
+    min-height: 54vh;
+    height: 54vh;
   }
 }

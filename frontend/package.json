@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@heygen/liveavatar-web-sdk": "^0.0.10",
     "axios": "^1.8.2",
     "clsx": "^2.1.1",
     "jspdf": "^4.1.0",

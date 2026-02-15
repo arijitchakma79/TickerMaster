@@ -15,6 +15,7 @@ import { formatCompactNumber, formatCurrency, formatPercent } from "../lib/forma
 import { resolveTickerCandidate } from "../lib/tickerInput";
 import type { TickerLookup, TrackerAgent, TrackerSnapshot, TrackerSymbolResolution, WSMessage } from "../lib/types";
 import WatchlistBar from "./WatchlistBar";
+import MainBrokerVideoCallModal from "./MainBrokerVideoCallModal";
 
 interface Props {
   activeTicker: string;
@@ -98,6 +99,7 @@ export default function TrackerPanel({
   const [createSearchError, setCreateSearchError] = useState("");
   const [createSearchResults, setCreateSearchResults] = useState<TickerLookup[]>([]);
   const [instructionModalAgentId, setInstructionModalAgentId] = useState<string | null>(null);
+  const [mainBrokerCallOpen, setMainBrokerCallOpen] = useState(false);
   const [instructionDraft, setInstructionDraft] = useState("");
   const [instructionError, setInstructionError] = useState("");
   const [instructionLoadingAgentId, setInstructionLoadingAgentId] = useState<string | null>(null);
@@ -463,6 +465,14 @@ export default function TrackerPanel({
     }
   }
 
+  function openMainBrokerCall() {
+    setMainBrokerCallOpen(true);
+  }
+
+  function closeMainBrokerCall() {
+    setMainBrokerCallOpen(false);
+  }
+
   function commonAsks(symbol: string): Array<{ label: string; prompt: string }> {
     const ticker = symbol.toUpperCase();
     return [
@@ -625,6 +635,9 @@ export default function TrackerPanel({
         </div>
         <button type="button" className="tracker-create-open" onClick={openCreateModal}>
           Add Agent
+        </button>
+        <button type="button" className="secondary tracker-create-open" onClick={openMainBrokerCall}>
+          Call Main Broker
         </button>
         <p className="muted">Keep setup simple: pick cadence + baseline, then describe behavior in natural language.</p>
         {createNotice ? <p className="muted">{createNotice}</p> : null}
@@ -938,6 +951,13 @@ export default function TrackerPanel({
             {instructionError ? <p className="auth-error">{instructionError}</p> : null}
           </div>
         </div>
+      ) : null}
+
+      {mainBrokerCallOpen ? (
+        <MainBrokerVideoCallModal
+          agents={agents}
+          onClose={closeMainBrokerCall}
+        />
       ) : null}
     </section>
   );

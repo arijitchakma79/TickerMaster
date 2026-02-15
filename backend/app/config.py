@@ -140,6 +140,13 @@ class Settings:
     twilio_whatsapp_from_number: str = ""
     twilio_use_whatsapp: bool = False
     twilio_default_to_number: str = ""
+    heygen_api_key: str = ""
+    heygen_api_url: str = "https://api.liveavatar.com"
+    heygen_default_avatar_id: str = ""
+    heygen_default_mode: str = "FULL"
+    heygen_default_voice_id: str = ""
+    heygen_default_context_id: str = ""
+    heygen_default_language: str = ""
 
     cerebras_api_key: str = ""
     nvidia_nim_api_key: str = ""
@@ -215,6 +222,13 @@ def get_settings() -> Settings:
         twilio_whatsapp_from_number=_env("TWILIO_WHATSAPP_FROM_NUMBER") or _env("TWILIO_WHATSAPP_FROM"),
         twilio_use_whatsapp=_env_bool("TWILIO_USE_WHATSAPP", False),
         twilio_default_to_number=_env("TWILIO_DEFAULT_TO_NUMBER"),
+        heygen_api_key=_env("HEYGEN_API_KEY"),
+        heygen_api_url=_env("HEYGEN_API_URL", "https://api.liveavatar.com"),
+        heygen_default_avatar_id=_env("HEYGEN_DEFAULT_AVATAR_ID"),
+        heygen_default_mode=_env("HEYGEN_DEFAULT_MODE", "FULL"),
+        heygen_default_voice_id=_env("HEYGEN_DEFAULT_VOICE_ID"),
+        heygen_default_context_id=_env("HEYGEN_DEFAULT_CONTEXT_ID"),
+        heygen_default_language=_env("HEYGEN_DEFAULT_LANGUAGE"),
         cerebras_api_key=_env("CEREBRAS_API_KEY"),
         nvidia_nim_api_key=_env("NVIDIA_NIM_API_KEY"),
         tracker_poll_interval_seconds=_env_int("TRACKER_POLL_INTERVAL_SECONDS", 120),

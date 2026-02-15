@@ -28,7 +28,7 @@ def _ensure_exports_bucket(client: Any, bucket: str) -> bool:
             options={
                 "public": False,
                 "file_size_limit": 20_000_000,
-                "allowed_mime_types": ["text/csv"],
+                "allowed_mime_types": ["text/csv", "application/json", "text/plain"],
             },
         )
     except Exception as exc:
@@ -278,3 +278,134 @@ def read_alert_context_csv_tail(
         rows = []
     limit = max(1, min(1000, int(limit)))
     return {"bucket": bucket, "path": path, "rows": rows[-limit:]}
+
+
+def _download_text(client: Any, bucket: str, path: str) -> str:
+    try:
+        raw = client.storage.from_(bucket).download(path)
+        if isinstance(raw, (bytes, bytearray)):
+            return raw.decode("utf-8")
+        return str(raw or "")
+    except Exception:
+        return ""
+
+
+def _upload_text(client: Any, bucket: str, path: str, payload: str, content_type: str) -> None:
+    client.storage.from_(bucket).upload(
+        path,
+        payload.encode("utf-8"),
+        {"content-type": content_type, "upsert": True},
+    )
+
+
+def append_agent_memory_documents(
+    *,
+    user_id: str,
+    agent_id: str,
+    symbol: str,
+    generated_at: str,
+    event_type: str,
+    manager_instruction: str,
+    agent_response: str,
+    context_payload: dict[str, Any] | None = None,
+    mcp_debug: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    client = get_supabase()
+    if client is None:
+        raise RuntimeError("Supabase client unavailable.")
+
+    settings = get_settings()
+    bucket = settings.supabase_tracker_memory_bucket or "tracker-memory"
+    bucket_ready = _ensure_exports_bucket(client, bucket)
+    if not bucket_ready:
+        logger.warning("Proceeding with memory document upload without confirmed bucket readiness for '%s'.", bucket)
+
+    base_path = f"{user_id}/agents/{agent_id}"
+    jsonl_path = f"{base_path}/memory.jsonl"
+    txt_path = f"{base_path}/memory.txt"
+    payload = {
+        "generated_at": generated_at,
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "symbol": symbol,
+        "event_type": event_type,
+        "manager_instruction": manager_instruction,
+        "agent_response": agent_response,
+        "context": context_payload or {},
+        "mcp_debug": mcp_debug or {},
+    }
+
+    existing_jsonl = _download_text(client, bucket, jsonl_path).rstrip("\n")
+    next_jsonl = f"{existing_jsonl}\n{json.dumps(payload, ensure_ascii=False)}" if existing_jsonl else json.dumps(payload, ensure_ascii=False)
+    _upload_text(client, bucket, jsonl_path, next_jsonl, "application/json")
+
+    instruction = str(manager_instruction or "").strip()
+    response = str(agent_response or "").strip()
+    existing_txt = _download_text(client, bucket, txt_path).rstrip("\n")
+    entry_lines = [
+        f"[{generated_at}] {event_type} {symbol}",
+        f"Manager: {instruction}" if instruction else "Manager: (none)",
+        f"Agent: {response}" if response else "Agent: (none)",
+    ]
+    txt_entry = "\n".join(entry_lines)
+    next_txt = f"{existing_txt}\n\n{txt_entry}" if existing_txt else txt_entry
+    _upload_text(client, bucket, txt_path, next_txt, "text/plain")
+
+    return {
+        "bucket": bucket,
+        "jsonl_path": jsonl_path,
+        "txt_path": txt_path,
+    }
+
+
+def read_agent_memory_json_tail(
+    *,
+    user_id: str,
+    agent_id: str,
+    limit: int = 120,
+) -> dict[str, Any]:
+    client = get_supabase()
+    if client is None:
+        return {"bucket": None, "path": None, "rows": []}
+
+    settings = get_settings()
+    bucket = settings.supabase_tracker_memory_bucket or "tracker-memory"
+    path = f"{user_id}/agents/{agent_id}/memory.jsonl"
+    raw = _download_text(client, bucket, path)
+    if not raw.strip():
+        return {"bucket": bucket, "path": path, "rows": []}
+
+    rows: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        token = line.strip()
+        if not token:
+            continue
+        try:
+            parsed = json.loads(token)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    limit = max(1, min(2000, int(limit)))
+    return {"bucket": bucket, "path": path, "rows": rows[-limit:]}
+
+
+def read_agent_memory_text_tail(
+    *,
+    user_id: str,
+    agent_id: str,
+    max_chars: int = 16000,
+) -> dict[str, Any]:
+    client = get_supabase()
+    if client is None:
+        return {"bucket": None, "path": None, "text": ""}
+
+    settings = get_settings()
+    bucket = settings.supabase_tracker_memory_bucket or "tracker-memory"
+    path = f"{user_id}/agents/{agent_id}/memory.txt"
+    raw = _download_text(client, bucket, path)
+    if not raw:
+        return {"bucket": bucket, "path": path, "text": ""}
+    size = max(500, min(200000, int(max_chars)))
+    trimmed = raw[-size:]
+    return {"bucket": bucket, "path": path, "text": trimmed}

@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import json
 import re
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -16,7 +18,14 @@ from pydantic import BaseModel, Field
 from app.schemas import ResearchRequest
 from app.services.agent_logger import get_recent_activity, log_agent_activity
 from app.services.browserbase_scraper import run_deep_research
-from app.services.llm import parse_tracker_instruction, tracker_agent_chat_response, tracker_context_query_response
+from app.services.llm import (
+    decide_tracker_runtime_plan,
+    parse_tracker_instruction,
+    tracker_main_broker_chat_response,
+    tracker_agent_chat_response,
+    tracker_context_query_response,
+)
+from app.services.mcp_tool_router import collect_tracker_research_via_mcp
 from app.services.macro import get_macro_indicators
 from app.services.market_data import (
     fetch_candles,
@@ -30,9 +39,12 @@ from app.services.prediction_markets import fetch_kalshi_markets, fetch_polymark
 from app.services.research_cache import get_cached_research, set_cached_research
 from app.services.sentiment import get_x_sentiment, run_research
 from app.services.tracker_csv import (
+    append_agent_memory_documents,
     append_agent_response_csv,
     read_agent_response_csv_tail,
     read_alert_context_csv_tail,
+    read_agent_memory_json_tail,
+    read_agent_memory_text_tail,
 )
 from app.services.tracker_repository import tracker_repo
 from app.services.user_context import get_user_id_from_request
@@ -86,12 +98,26 @@ class TrackerAgentInteractRequest(BaseModel):
     user_id: str | None = None
 
 
+class TrackerMainBrokerInteractRequest(BaseModel):
+    message: str
+    user_id: str | None = None
+    agent_limit: int = 4
+
+
 class TrackerContextQueryRequest(BaseModel):
     question: str
     user_id: str | None = None
     run_limit: int = 40
     history_limit: int = 40
     csv_limit: int = 120
+
+
+class TrackerAvatarSessionRequest(BaseModel):
+    avatar_id: str | None = None
+    mode: str | None = None
+    voice_id: str | None = None
+    context_id: str | None = None
+    language: str | None = None
 
 
 def normalize_timeframe(value: str | None) -> str:
@@ -1371,6 +1397,168 @@ async def _notify_agent_created_twilio(
     return notification
 
 
+def _normalize_heygen_mode(value: str | None) -> str:
+    mode = str(value or "").strip().upper()
+    if mode in {"FULL", "LITE"}:
+        return mode
+    return "FULL"
+
+
+def _extract_heygen_session_token(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    token_keys = ("session_token", "sessionToken", "token", "access_token", "accessToken")
+    session_id_keys = ("session_id", "sessionId", "id")
+
+    candidates: list[dict[str, Any]] = [payload]
+    for key in ("data", "result", "session"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+
+    token_value: str | None = None
+    session_id_value: str | None = None
+    for source in candidates:
+        if token_value is None:
+            for key in token_keys:
+                raw = source.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    token_value = raw.strip()
+                    break
+        if session_id_value is None:
+            for key in session_id_keys:
+                raw = source.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    session_id_value = raw.strip()
+                    break
+        if token_value is not None and session_id_value is not None:
+            break
+    return token_value, session_id_value
+
+
+def _extract_message_tickers(text: str) -> list[str]:
+    token = str(text or "").upper()
+    raw = re.findall(r"\b[A-Z]{1,5}\b", token)
+    stopwords = {
+        "THE",
+        "AND",
+        "FOR",
+        "WITH",
+        "FROM",
+        "THIS",
+        "THAT",
+        "WHAT",
+        "WHY",
+        "HOW",
+        "WHEN",
+        "CALL",
+        "MAIN",
+        "BROKER",
+        "AGENT",
+        "AGENTS",
+        "TRACK",
+        "TRACKER",
+        "NEWS",
+        "ALERT",
+        "ALERTS",
+    }
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if item in stopwords or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+async def _request_heygen_session_token(settings: Any, payload: TrackerAvatarSessionRequest) -> dict[str, Any]:
+    heygen_api_key = str(settings.heygen_api_key or "").strip()
+    if not heygen_api_key:
+        raise HTTPException(status_code=503, detail="HeyGen LiveAvatar is not configured on backend.")
+
+    avatar_id = str(payload.avatar_id or settings.heygen_default_avatar_id or "").strip()
+    if not avatar_id:
+        raise HTTPException(
+            status_code=422,
+            detail="HeyGen avatar_id is required. Set HEYGEN_DEFAULT_AVATAR_ID or pass avatar_id.",
+        )
+
+    mode = _normalize_heygen_mode(payload.mode or settings.heygen_default_mode)
+    persona: dict[str, Any] = {}
+
+    context_id = str(payload.context_id or settings.heygen_default_context_id or "").strip()
+    if context_id:
+        persona["context_id"] = context_id
+    voice_id = str(payload.voice_id or settings.heygen_default_voice_id or "").strip()
+    if voice_id:
+        persona["voice_id"] = voice_id
+    language = str(payload.language or settings.heygen_default_language or "").strip()
+    if language:
+        persona["language"] = language
+
+    token_request: dict[str, Any] = {
+        "mode": mode,
+        "avatar_id": avatar_id,
+    }
+    # HeyGen FULL mode requires avatar_persona in the request body.
+    if mode == "FULL" or persona:
+        token_request["avatar_persona"] = persona
+
+    heygen_api_url = str(settings.heygen_api_url or "https://api.liveavatar.com").strip().rstrip("/")
+    if not heygen_api_url:
+        heygen_api_url = "https://api.liveavatar.com"
+    token_url = f"{heygen_api_url}/v1/sessions/token"
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                token_url,
+                headers={
+                    "X-Api-Key": heygen_api_key,
+                    "x-api-key": heygen_api_key,
+                    "Content-Type": "application/json",
+                },
+                json=token_request,
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach HeyGen LiveAvatar API: {exc}") from exc
+
+    content_type = str(response.headers.get("content-type") or "").lower()
+    response_payload: dict[str, Any] = {}
+    if "json" in content_type:
+        try:
+            decoded = response.json()
+            if isinstance(decoded, dict):
+                response_payload = decoded
+        except Exception:
+            response_payload = {}
+
+    if response.status_code >= 300:
+        provider_message = ""
+        for key in ("message", "error", "detail"):
+            raw = response_payload.get(key)
+            if isinstance(raw, str) and raw.strip():
+                provider_message = raw.strip()
+                break
+        if not provider_message:
+            provider_message = response.text.strip()[:280] or "HeyGen session token request failed."
+        raise HTTPException(
+            status_code=502,
+            detail=f"HeyGen session token request failed ({response.status_code}): {provider_message}",
+        )
+
+    session_token, session_id = _extract_heygen_session_token(response_payload)
+    if not session_token:
+        raise HTTPException(status_code=502, detail="HeyGen response did not include a session token.")
+
+    return {
+        "session_token": session_token,
+        "session_id": session_id,
+        "api_url": heygen_api_url,
+        "mode": mode,
+        "avatar_id": avatar_id,
+    }
+
+
 @router.post("/tracker/agents")
 async def create_tracker_agent(payload: TrackerAgentCreateRequest, request: Request, user_id: str | None = None) -> dict[str, Any]:
     resolved_user_id = _require_tracker_user_id(request, user_id)
@@ -1583,6 +1771,79 @@ async def get_tracker_agent(agent_id: str, request: Request, user_id: str | None
     return item
 
 
+@router.post("/tracker/agents/{agent_id}/avatar/session")
+async def create_tracker_agent_avatar_session(
+    agent_id: str,
+    payload: TrackerAvatarSessionRequest,
+    request: Request,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    resolved_user_id = _require_tracker_user_id(request, user_id)
+    agent = tracker_repo.get_agent(user_id=resolved_user_id, agent_id=agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    settings = request.app.state.settings
+    session_meta = await _request_heygen_session_token(settings, payload)
+
+    symbol = str(agent.get("symbol") or "").upper()
+    await log_agent_activity(
+        module="tracker",
+        agent_name=str(agent.get("name") or "Tracker Agent"),
+        action=f"Opened HeyGen video session for {symbol or 'TRACKER'}",
+        status="success",
+        user_id=resolved_user_id,
+        details={
+            "agent_id": agent_id,
+            "symbol": symbol,
+            "mode": session_meta.get("mode"),
+            "avatar_id": session_meta.get("avatar_id"),
+            "provider": "heygen_liveavatar",
+        },
+    )
+
+    return {
+        "ok": True,
+        "agent_id": agent_id,
+        "symbol": symbol,
+        **session_meta,
+    }
+
+
+@router.post("/tracker/broker/avatar/session")
+async def create_tracker_broker_avatar_session(
+    payload: TrackerAvatarSessionRequest,
+    request: Request,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    resolved_user_id = _require_tracker_user_id(request, user_id)
+    settings = request.app.state.settings
+    session_meta = await _request_heygen_session_token(settings, payload)
+
+    agents = tracker_repo.list_agents(user_id=resolved_user_id)
+    active_count = len([agent for agent in agents if str(agent.get("status") or "").lower() == "active"])
+    await log_agent_activity(
+        module="tracker",
+        agent_name="Main Broker",
+        action="Opened main broker video session",
+        status="success",
+        user_id=resolved_user_id,
+        details={
+            "description": "Started a unified broker avatar call that can reason across tracker agents.",
+            "active_agent_count": active_count,
+            "mode": session_meta.get("mode"),
+            "avatar_id": session_meta.get("avatar_id"),
+            "provider": "heygen_liveavatar",
+        },
+    )
+    return {
+        "ok": True,
+        "broker": "main",
+        "active_agent_count": active_count,
+        **session_meta,
+    }
+
+
 @router.get("/tracker/agents/{agent_id}/detail")
 async def get_tracker_agent_detail(agent_id: str, request: Request, user_id: str | None = None) -> dict[str, Any]:
     resolved_user_id = _require_tracker_user_id(request, user_id)
@@ -1670,6 +1931,18 @@ async def get_tracker_agent_context(
         agent_id=agent_id,
         limit=min(max(csv_limit, 1), 1000),
     )
+    memory_json_tail = await asyncio.to_thread(
+        read_agent_memory_json_tail,
+        user_id=resolved_user_id,
+        agent_id=agent_id,
+        limit=min(max(csv_limit, 1), 1200),
+    )
+    memory_text_tail = await asyncio.to_thread(
+        read_agent_memory_text_tail,
+        user_id=resolved_user_id,
+        agent_id=agent_id,
+        max_chars=min(max(csv_limit, 1), 2000) * 120,
+    )
     return {
         "agent": agent,
         "thesis": thesis,
@@ -1678,6 +1951,8 @@ async def get_tracker_agent_context(
         "csv_export": csv_tail,
         "alert_context": alert_context,
         "alert_context_csv": alert_context_csv,
+        "memory_json": memory_json_tail,
+        "memory_text": memory_text_tail,
     }
 
 
@@ -1712,6 +1987,18 @@ async def query_tracker_agent_context(
         agent_id=agent_id,
         limit=min(max(payload.csv_limit, 1), 1000),
     )
+    memory_json_tail = await asyncio.to_thread(
+        read_agent_memory_json_tail,
+        user_id=resolved_user_id,
+        agent_id=agent_id,
+        limit=min(max(payload.csv_limit, 1), 1200),
+    )
+    memory_text_tail = await asyncio.to_thread(
+        read_agent_memory_text_tail,
+        user_id=resolved_user_id,
+        agent_id=agent_id,
+        max_chars=min(max(payload.csv_limit, 1), 2000) * 120,
+    )
     context = {
         "agent": {
             "id": str(agent.get("id")),
@@ -1726,6 +2013,8 @@ async def query_tracker_agent_context(
         "csv_rows": csv_tail.get("rows") if isinstance(csv_tail, dict) else [],
         "alert_context": alert_context,
         "alert_context_rows": alert_context_csv.get("rows") if isinstance(alert_context_csv, dict) else [],
+        "memory_json_rows": memory_json_tail.get("rows") if isinstance(memory_json_tail, dict) else [],
+        "memory_text": memory_text_tail.get("text") if isinstance(memory_text_tail, dict) else "",
     }
     settings = request.app.state.settings
     answer = await tracker_context_query_response(settings, question=payload.question, context=context)
@@ -1755,6 +2044,12 @@ async def query_tracker_agent_context(
             "csv_bucket": csv_tail.get("bucket"),
             "alert_context_csv_path": alert_context_csv.get("path"),
             "alert_context_csv_bucket": alert_context_csv.get("bucket"),
+            "memory_json_rows": len(memory_json_tail.get("rows") or []),
+            "memory_json_path": memory_json_tail.get("path"),
+            "memory_json_bucket": memory_json_tail.get("bucket"),
+            "memory_text_chars": len(str(memory_text_tail.get("text") or "")),
+            "memory_text_path": memory_text_tail.get("path"),
+            "memory_text_bucket": memory_text_tail.get("bucket"),
         },
     }
 
@@ -1897,6 +2192,250 @@ async def create_tracker_agent_nl(payload: TrackerNLCreateRequest, request: Requ
     }
 
 
+@router.post("/tracker/broker/interact")
+async def interact_tracker_main_broker(payload: TrackerMainBrokerInteractRequest, request: Request) -> dict[str, Any]:
+    resolved_user_id = _require_tracker_user_id(request, payload.user_id)
+    settings = request.app.state.settings
+    message = str(payload.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="message is required")
+
+    all_agents = tracker_repo.list_agents(user_id=resolved_user_id)
+    if not all_agents:
+        reply = await tracker_main_broker_chat_response(
+            settings,
+            user_message=message,
+            broker_context={"selected_agents": [], "all_agents_summary": []},
+        )
+        return {
+            "ok": True,
+            "reply": reply,
+            "selected_agents": [],
+            "tool_outputs": {"note": "No tracker agents available for this user."},
+        }
+
+    active_agents = [agent for agent in all_agents if str(agent.get("status") or "").lower() == "active"] or all_agents
+    ticker_mentions = set(_extract_message_tickers(message))
+    selected_agents = [
+        agent
+        for agent in active_agents
+        if str(agent.get("symbol") or "").upper() in ticker_mentions
+    ]
+    if not selected_agents:
+        selected_agents = active_agents
+    limit = min(max(int(payload.agent_limit or 4), 1), 8)
+    selected_agents = selected_agents[:limit]
+
+    selected_contexts: list[dict[str, Any]] = []
+    per_agent_tool_outputs: dict[str, Any] = {}
+    for agent in selected_agents:
+        agent_id = str(agent.get("id") or "")
+        symbol = str(agent.get("symbol") or "").upper()
+        if not symbol:
+            continue
+
+        try:
+            metric = await asyncio.to_thread(fetch_metric, symbol)
+            market_state = metric.model_dump() if metric else {}
+        except Exception:
+            market_state = {}
+
+        triggers = sanitize_tracker_triggers(agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {})
+        available_tools = [
+            str(item).strip().lower()
+            for item in (triggers.get("tools") or ["price", "volume", "sentiment", "news", "prediction_markets", "deep_research", "simulation"])
+            if str(item).strip()
+        ]
+        available_sources = [
+            str(item).strip().lower()
+            for item in (triggers.get("research_sources") or ["perplexity", "x", "reddit", "prediction_markets", "deep"])
+            if str(item).strip()
+        ]
+        runtime_plan = await decide_tracker_runtime_plan(
+            settings,
+            manager_prompt=message,
+            available_tools=available_tools,
+            available_sources=available_sources,
+            market_state=market_state,
+            event_hint="chat",
+        )
+        runtime_tools = [str(item).strip().lower() for item in (runtime_plan.get("tools") or []) if str(item).strip()]
+        runtime_sources = [str(item).strip().lower() for item in (runtime_plan.get("research_sources") or []) if str(item).strip()]
+        if not runtime_tools:
+            runtime_tools = available_tools
+        if not runtime_sources:
+            runtime_sources = available_sources
+
+        mcp_research = await collect_tracker_research_via_mcp(
+            settings,
+            ticker=symbol,
+            manager_prompt=message,
+            tools=runtime_tools,
+            sources=runtime_sources,
+            market_state=market_state,
+            timeframe=str(triggers.get("research_timeframe") or "7d"),
+            event_hint="chat",
+        )
+        if isinstance(mcp_research, dict) and isinstance(mcp_research.get("mcp_debug"), dict):
+            try:
+                print(
+                    f"[main-broker-mcp-debug][{agent_id}:{symbol}] "
+                    f"{json.dumps(mcp_research.get('mcp_debug'), ensure_ascii=True)[:6000]}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+        recent_runs = tracker_repo.list_runs(user_id=resolved_user_id, agent_id=agent_id, limit=8)
+        recent_history = tracker_repo.list_history(user_id=resolved_user_id, agent_id=agent_id, limit=8)
+        recent_alerts = tracker_repo.list_alerts(user_id=resolved_user_id, agent_id=agent_id, limit=8)
+        thesis = tracker_repo.get_thesis(user_id=resolved_user_id, agent_id=agent_id)
+        csv_tail = await asyncio.to_thread(
+            read_agent_response_csv_tail,
+            user_id=resolved_user_id,
+            agent_id=agent_id,
+            limit=100,
+        )
+        alert_context_csv = await asyncio.to_thread(
+            read_alert_context_csv_tail,
+            user_id=resolved_user_id,
+            agent_id=agent_id,
+            limit=100,
+        )
+        memory_json_tail = await asyncio.to_thread(
+            read_agent_memory_json_tail,
+            user_id=resolved_user_id,
+            agent_id=agent_id,
+            limit=140,
+        )
+        memory_text_tail = await asyncio.to_thread(
+            read_agent_memory_text_tail,
+            user_id=resolved_user_id,
+            agent_id=agent_id,
+            max_chars=14000,
+        )
+
+        context_payload = {
+            "agent": {
+                "id": agent_id,
+                "name": str(agent.get("name") or ""),
+                "symbol": symbol,
+                "status": str(agent.get("status") or ""),
+                "triggers": triggers,
+                "total_alerts": int(agent.get("total_alerts") or 0),
+                "last_alert_at": agent.get("last_alert_at"),
+            },
+            "market_state": market_state,
+            "runtime_plan": runtime_plan,
+            "mcp_research": mcp_research or {},
+            "recent_runs": recent_runs,
+            "recent_history": recent_history,
+            "recent_alerts": recent_alerts,
+            "thesis": thesis or {},
+            "storage_context": {
+                "csv_rows": csv_tail.get("rows") if isinstance(csv_tail, dict) else [],
+                "alert_context_rows": alert_context_csv.get("rows") if isinstance(alert_context_csv, dict) else [],
+                "memory_json_rows": memory_json_tail.get("rows") if isinstance(memory_json_tail, dict) else [],
+                "memory_text": memory_text_tail.get("text") if isinstance(memory_text_tail, dict) else "",
+            },
+        }
+        selected_contexts.append(context_payload)
+        per_agent_tool_outputs[agent_id] = {
+            "runtime_plan": runtime_plan,
+            "runtime_tools": runtime_tools,
+            "runtime_sources": runtime_sources,
+            "mcp_debug": (
+                mcp_research.get("mcp_debug")
+                if isinstance(mcp_research, dict) and isinstance(mcp_research.get("mcp_debug"), dict)
+                else {}
+            ),
+        }
+
+    broker_context = {
+        "message": message,
+        "message_tickers": list(ticker_mentions),
+        "selected_agents": selected_contexts,
+        "all_agents_summary": [
+            {
+                "id": str(agent.get("id") or ""),
+                "name": str(agent.get("name") or ""),
+                "symbol": str(agent.get("symbol") or "").upper(),
+                "status": str(agent.get("status") or ""),
+                "total_alerts": int(agent.get("total_alerts") or 0),
+                "last_alert_at": agent.get("last_alert_at"),
+            }
+            for agent in all_agents[:24]
+        ],
+    }
+    reply = await tracker_main_broker_chat_response(
+        settings,
+        user_message=message,
+        broker_context=broker_context,
+    )
+
+    for agent_ctx in selected_contexts:
+        agent_meta = agent_ctx.get("agent") if isinstance(agent_ctx.get("agent"), dict) else {}
+        agent_id = str(agent_meta.get("id") or "")
+        symbol = str(agent_meta.get("symbol") or "")
+        if not agent_id or not symbol:
+            continue
+        try:
+            await asyncio.to_thread(
+                append_agent_memory_documents,
+                user_id=resolved_user_id,
+                agent_id=agent_id,
+                symbol=symbol,
+                generated_at=str(reply.get("generated_at") or datetime.now(timezone.utc).isoformat()),
+                event_type="main_broker_interaction",
+                manager_instruction=message,
+                agent_response=str(reply.get("response") or ""),
+                context_payload={
+                    "broker_context": {
+                        "selected_agent_ids": [str((ctx.get("agent") or {}).get("id") or "") for ctx in selected_contexts],
+                        "selected_count": len(selected_contexts),
+                    },
+                    "agent_tool_output": per_agent_tool_outputs.get(agent_id) or {},
+                },
+                mcp_debug=(
+                    per_agent_tool_outputs.get(agent_id, {}).get("mcp_debug")
+                    if isinstance(per_agent_tool_outputs.get(agent_id, {}), dict)
+                    else {}
+                ),
+            )
+        except Exception:
+            pass
+
+    await log_agent_activity(
+        module="tracker",
+        agent_name="Main Broker",
+        action="Processed main broker interaction",
+        status="success",
+        user_id=resolved_user_id,
+        details={
+            "description": "Main broker answered across tracker agents, MCP tools, and saved storage context.",
+            "selected_agent_count": len(selected_contexts),
+            "message": message,
+        },
+    )
+
+    return {
+        "ok": True,
+        "reply": reply,
+        "selected_agents": [
+            {
+                "id": str((ctx.get("agent") or {}).get("id") or ""),
+                "name": str((ctx.get("agent") or {}).get("name") or ""),
+                "symbol": str((ctx.get("agent") or {}).get("symbol") or ""),
+            }
+            for ctx in selected_contexts
+        ],
+        "tool_outputs": {
+            "per_agent": per_agent_tool_outputs,
+            "selected_agent_count": len(selected_contexts),
+        },
+    }
+
+
 @router.post("/tracker/agents/{agent_id}/interact")
 async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractRequest, request: Request) -> dict[str, Any]:
     resolved_user_id = _require_tracker_user_id(request, payload.user_id)
@@ -1907,16 +2446,104 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
     settings = request.app.state.settings
     symbol = str(agent.get("symbol", "")).upper()
     metric = await asyncio.to_thread(fetch_metric, symbol) if symbol else None
-    research = await run_research(
-        ResearchRequest(ticker=symbol or "AAPL", timeframe="7d", include_prediction_markets=False),
-        settings,
-    )
-    research_state = {
-        "aggregate_sentiment": research.aggregate_sentiment,
-        "recommendation": research.recommendation,
-        "breakdown": {entry.source: entry.score for entry in research.source_breakdown},
-    }
     market_state = metric.model_dump() if metric else {}
+    parsed = await parse_tracker_instruction(settings, payload.message)
+    intent = str(parsed.get("intent") or "")
+    if isinstance(parsed.get("triggers"), dict):
+        parsed["triggers"] = _apply_prompt_overrides(payload.message, parsed.get("triggers"))
+    elif payload.message.strip():
+        interval = _extract_interval_seconds(payload.message)
+        wants_report = any(token in payload.message.lower() for token in {"report every", "summary every", "update every", "send report"})
+        if interval is not None or wants_report:
+            parsed["triggers"] = _apply_prompt_overrides(payload.message, {})
+
+    triggers = sanitize_tracker_triggers(agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {})
+    available_tools = [
+        str(item).strip().lower()
+        for item in (triggers.get("tools") or ["price", "volume", "sentiment", "news", "prediction_markets", "deep_research", "simulation"])
+        if str(item).strip()
+    ]
+    if not available_tools:
+        available_tools = ["price", "volume", "sentiment", "news", "prediction_markets", "deep_research", "simulation"]
+    available_sources = [
+        str(item).strip().lower()
+        for item in (triggers.get("research_sources") or ["perplexity", "x", "reddit", "prediction_markets", "deep"])
+        if str(item).strip()
+    ]
+    if not available_sources:
+        available_sources = ["perplexity", "x", "reddit", "prediction_markets", "deep"]
+
+    runtime_plan = await decide_tracker_runtime_plan(
+        settings,
+        manager_prompt=payload.message,
+        available_tools=available_tools,
+        available_sources=available_sources,
+        market_state=market_state,
+        event_hint="chat",
+    )
+    runtime_tools = [str(item).strip().lower() for item in (runtime_plan.get("tools") or []) if str(item).strip()]
+    runtime_sources = [str(item).strip().lower() for item in (runtime_plan.get("research_sources") or []) if str(item).strip()]
+    explicit_sources, exclusive_sources = _extract_explicit_research_sources(payload.message)
+    explicit_tools = _extract_explicit_tools(payload.message)
+    if explicit_tools:
+        runtime_tools = list(dict.fromkeys([*runtime_tools, *explicit_tools]))
+    if explicit_sources:
+        runtime_sources = list(dict.fromkeys(explicit_sources)) if exclusive_sources else list(dict.fromkeys([*runtime_sources, *explicit_sources]))
+    if not runtime_sources:
+        runtime_sources = available_sources
+    if not runtime_tools:
+        runtime_tools = available_tools
+
+    include_prediction_markets = ("prediction_markets" in set(runtime_tools)) or ("prediction_markets" in set(runtime_sources))
+    mcp_research = await collect_tracker_research_via_mcp(
+        settings,
+        ticker=symbol or "AAPL",
+        manager_prompt=payload.message,
+        tools=runtime_tools,
+        sources=runtime_sources,
+        market_state=market_state,
+        timeframe=str(triggers.get("research_timeframe") or "7d"),
+        event_hint="chat",
+    )
+    if isinstance(mcp_research, dict) and mcp_research:
+        research_state = {
+            "aggregate_sentiment": float(mcp_research.get("aggregate_sentiment", 0.0) or 0.0),
+            "recommendation": str(mcp_research.get("recommendation") or "hold"),
+            "breakdown": mcp_research.get("breakdown") if isinstance(mcp_research.get("breakdown"), dict) else {},
+            "breakdown_summaries": (
+                mcp_research.get("breakdown_summaries")
+                if isinstance(mcp_research.get("breakdown_summaries"), dict)
+                else {}
+            ),
+            "prediction_markets": (
+                mcp_research.get("prediction_markets")
+                if isinstance(mcp_research.get("prediction_markets"), list)
+                else []
+            ),
+        }
+    else:
+        research = await run_research(
+            ResearchRequest(ticker=symbol or "AAPL", timeframe="7d", include_prediction_markets=include_prediction_markets),
+            settings,
+        )
+        research_state = {
+            "aggregate_sentiment": research.aggregate_sentiment,
+            "recommendation": research.recommendation,
+            "breakdown": {entry.source: entry.score for entry in research.source_breakdown},
+            "breakdown_summaries": {entry.source: entry.summary for entry in research.source_breakdown},
+            "prediction_markets": list(research.prediction_markets or []),
+        }
+
+    if isinstance(mcp_research, dict) and isinstance(mcp_research.get("mcp_debug"), dict):
+        try:
+            print(
+                f"[tracker-mcp-debug][{agent_id}] "
+                f"{json.dumps(mcp_research.get('mcp_debug'), ensure_ascii=True)[:6000]}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
     recent_history = tracker_repo.list_history(user_id=resolved_user_id, agent_id=agent_id, limit=12)
     recent_runs = tracker_repo.list_runs(user_id=resolved_user_id, agent_id=agent_id, limit=12)
     recent_alerts = tracker_repo.list_alerts(user_id=resolved_user_id, agent_id=agent_id, limit=12)
@@ -1930,33 +2557,16 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
         ),
         "",
     )
-    memory_context = {
-        "latest_instruction": latest_instruction or None,
-        "recent_history": recent_history[:8],
-        "recent_runs": recent_runs[:8],
-        "recent_alerts": recent_alerts[:8],
-        "recent_alert_context": recent_alert_context[:8],
-        "thesis": thesis or {},
-    }
-    reply = await tracker_agent_chat_response(
-        settings,
-        agent,
-        market_state,
-        research_state,
-        payload.message,
-        memory_context=memory_context,
-    )
-    parsed = await parse_tracker_instruction(settings, payload.message)
-    intent = str(parsed.get("intent") or "")
-    if isinstance(parsed.get("triggers"), dict):
-        parsed["triggers"] = _apply_prompt_overrides(payload.message, parsed.get("triggers"))
-    elif payload.message.strip():
-        interval = _extract_interval_seconds(payload.message)
-        wants_report = any(token in payload.message.lower() for token in {"report every", "summary every", "update every", "send report"})
-        if interval is not None or wants_report:
-            parsed["triggers"] = _apply_prompt_overrides(payload.message, {})
     message_lower = payload.message.lower()
-    tool_outputs: dict[str, Any] = {}
+    tool_outputs: dict[str, Any] = {
+        "runtime_plan": runtime_plan,
+        "runtime_tools": runtime_tools,
+        "runtime_sources": runtime_sources,
+        "research": research_state,
+    }
+    if isinstance(mcp_research, dict):
+        tool_outputs["mcp_debug"] = mcp_research.get("mcp_debug")
+        tool_outputs["mcp_investigation"] = str(mcp_research.get("investigation") or "")[:1200]
 
     if any(token in message_lower for token in {"chart", "candlestick", "price action", "technical"}):
         period, interval = _chart_params_from_message(payload.message)
@@ -1982,8 +2592,7 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
             },
         )
 
-    if any(token in message_lower for token in {"research", "sentiment", "twitter", "x ", "reddit", "news"}):
-        tool_outputs["research"] = research_state
+    if any(token in message_lower for token in {"research", "sentiment", "twitter", "x ", "reddit", "news", "analysis", "analyze"}):
         await log_agent_activity(
             module="tracker",
             agent_name=str(agent.get("name") or "Tracker Associate"),
@@ -2024,6 +2633,64 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
                 "session_id": sim.session_id,
             },
         )
+
+    csv_tail = await asyncio.to_thread(
+        read_agent_response_csv_tail,
+        user_id=resolved_user_id,
+        agent_id=agent_id,
+        limit=180,
+    )
+    alert_context_csv = await asyncio.to_thread(
+        read_alert_context_csv_tail,
+        user_id=resolved_user_id,
+        agent_id=agent_id,
+        limit=180,
+    )
+    memory_json_tail = await asyncio.to_thread(
+        read_agent_memory_json_tail,
+        user_id=resolved_user_id,
+        agent_id=agent_id,
+        limit=220,
+    )
+    memory_text_tail = await asyncio.to_thread(
+        read_agent_memory_text_tail,
+        user_id=resolved_user_id,
+        agent_id=agent_id,
+        max_chars=18000,
+    )
+    storage_context = {
+        "csv_rows": csv_tail.get("rows") if isinstance(csv_tail, dict) else [],
+        "csv_path": csv_tail.get("path") if isinstance(csv_tail, dict) else None,
+        "csv_bucket": csv_tail.get("bucket") if isinstance(csv_tail, dict) else None,
+        "alert_context_rows": alert_context_csv.get("rows") if isinstance(alert_context_csv, dict) else [],
+        "alert_context_path": alert_context_csv.get("path") if isinstance(alert_context_csv, dict) else None,
+        "alert_context_bucket": alert_context_csv.get("bucket") if isinstance(alert_context_csv, dict) else None,
+        "memory_json_rows": memory_json_tail.get("rows") if isinstance(memory_json_tail, dict) else [],
+        "memory_json_path": memory_json_tail.get("path") if isinstance(memory_json_tail, dict) else None,
+        "memory_json_bucket": memory_json_tail.get("bucket") if isinstance(memory_json_tail, dict) else None,
+        "memory_text": memory_text_tail.get("text") if isinstance(memory_text_tail, dict) else "",
+        "memory_text_path": memory_text_tail.get("path") if isinstance(memory_text_tail, dict) else None,
+        "memory_text_bucket": memory_text_tail.get("bucket") if isinstance(memory_text_tail, dict) else None,
+    }
+    memory_context = {
+        "latest_instruction": latest_instruction or None,
+        "storage_context": storage_context,
+        "recent_history": recent_history[:8],
+        "recent_runs": recent_runs[:8],
+        "recent_alerts": recent_alerts[:8],
+        "recent_alert_context": recent_alert_context[:8],
+        "thesis": thesis or {},
+        "live_tool_outputs": tool_outputs,
+    }
+    reply = await tracker_agent_chat_response(
+        settings,
+        agent,
+        market_state,
+        research_state,
+        payload.message,
+        memory_context=memory_context,
+    )
+
     if intent == "update_agent" and isinstance(parsed.get("triggers"), dict):
         new_triggers = {**sanitize_tracker_triggers(agent.get("triggers") if isinstance(agent.get("triggers"), dict) else {}), **sanitize_tracker_triggers(parsed["triggers"])}
         agent = tracker_repo.update_agent(
@@ -2097,6 +2764,36 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
 
     if csv_export:
         tool_outputs["csv_export"] = csv_export
+    memory_export: dict[str, Any] | None = None
+    memory_export_error: str | None = None
+    try:
+        memory_export = await asyncio.to_thread(
+            append_agent_memory_documents,
+            user_id=resolved_user_id,
+            agent_id=agent_id,
+            symbol=symbol,
+            generated_at=str(reply.get("generated_at") or datetime.now(timezone.utc).isoformat()),
+            event_type=intent or "conversation",
+            manager_instruction=payload.message,
+            agent_response=str(reply.get("response") or ""),
+            context_payload={
+                "market_state": market_state,
+                "research_state": research_state,
+                "runtime_plan": runtime_plan,
+                "parsed_intent": parsed if isinstance(parsed, dict) else {},
+                "tool_outputs": tool_outputs,
+            },
+            mcp_debug=(
+                mcp_research.get("mcp_debug")
+                if isinstance(mcp_research, dict) and isinstance(mcp_research.get("mcp_debug"), dict)
+                else {}
+            ),
+        )
+    except Exception as exc:
+        memory_export_error = str(exc)
+
+    if memory_export:
+        tool_outputs["memory_export"] = memory_export
 
     await log_agent_activity(
         module="tracker",
@@ -2121,6 +2818,7 @@ async def interact_tracker_agent(agent_id: str, payload: TrackerAgentInteractReq
         "research_state": research_state,
         "tool_outputs": tool_outputs,
         "csv_export_error": csv_export_error,
+        "memory_export_error": memory_export_error,
     }
 
 

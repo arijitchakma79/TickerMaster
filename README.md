@@ -59,6 +59,17 @@ For SMS notifications, also configure Twilio:
 - `TWILIO_FROM_NUMBER`
 - optional fallback recipient `TWILIO_DEFAULT_TO_NUMBER`
 
+Tracker tool routing can also run through a local MCP server (enabled by default in backend):
+- `MCP_TRACKER_ROUTER_ENABLED=true`
+- optional custom command: `MCP_TRACKER_SERVER_COMMAND=python -m app.mcp.tracker_tools_server`
+- optional timeout: `MCP_TRACKER_TIMEOUT_SECONDS=6`
+
+Poke integration uses the official Python SDK/API:
+- Install dependency from `backend/requirements.txt` (`poke==0.1.1`)
+- Configure:
+  - `POKE_API_KEY`
+  - optional `POKE_API` (defaults to `https://poke.com/api/v1`)
+
 For Modal sandbox runtime, also set:
 - `MODAL_SIMULATION_APP_NAME` (default `tickermaster-simulation`)
 - `MODAL_SANDBOX_TIMEOUT_SECONDS` (default `600`)

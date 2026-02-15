@@ -243,7 +243,45 @@ export interface TrackerAgentInteractResponse {
     chart?: { period: string; interval: string; points: CandlePoint[] };
     research?: Record<string, unknown>;
     simulation?: { session_id: string; ticker: string };
+    runtime_plan?: Record<string, unknown>;
+    runtime_tools?: string[];
+    runtime_sources?: string[];
+    mcp_debug?: Record<string, unknown>;
+    mcp_investigation?: string;
+    csv_export?: { bucket?: string; path?: string };
+    memory_export?: { bucket?: string; jsonl_path?: string; txt_path?: string };
   };
+  csv_export_error?: string | null;
+  memory_export_error?: string | null;
+}
+
+export interface TrackerAgentAvatarSession {
+  ok: boolean;
+  agent_id: string;
+  symbol: string;
+  session_token: string;
+  session_id?: string | null;
+  api_url?: string | null;
+  mode?: string | null;
+  avatar_id?: string | null;
+}
+
+export interface MainBrokerAvatarSession {
+  ok: boolean;
+  broker: "main" | string;
+  active_agent_count?: number;
+  session_token: string;
+  session_id?: string | null;
+  api_url?: string | null;
+  mode?: string | null;
+  avatar_id?: string | null;
+}
+
+export interface MainBrokerInteractResponse {
+  ok: boolean;
+  reply: { response: string; model: string; generated_at: string };
+  selected_agents?: Array<{ id: string; name: string; symbol: string }>;
+  tool_outputs?: Record<string, unknown>;
 }
 
 export interface TrackerAgentHistoryItem {
@@ -305,6 +343,16 @@ export interface TrackerAgentContext {
     bucket?: string | null;
     path?: string | null;
     rows?: Array<Record<string, string>>;
+  };
+  memory_json?: {
+    bucket?: string | null;
+    path?: string | null;
+    rows?: Array<Record<string, unknown>>;
+  };
+  memory_text?: {
+    bucket?: string | null;
+    path?: string | null;
+    text?: string;
   };
 }
 

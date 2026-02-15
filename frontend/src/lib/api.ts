@@ -14,6 +14,9 @@ import type {
   ResearchChatResponse,
   ResearchResponse,
   TrackerAgent,
+  TrackerAgentAvatarSession,
+  MainBrokerAvatarSession,
+  MainBrokerInteractResponse,
   TrackerAgentContext,
   TrackerAgentHistoryItem,
   TrackerAgentDetail,
@@ -757,6 +760,45 @@ export async function getTrackerAgentDetail(agentId: string): Promise<TrackerAge
   return data;
 }
 
+export async function createTrackerAvatarSession(
+  agentId: string,
+  payload?: {
+    avatar_id?: string;
+    mode?: "FULL" | "LITE";
+    voice_id?: string;
+    context_id?: string;
+    language?: string;
+  },
+): Promise<TrackerAgentAvatarSession> {
+  try {
+    const { data } = await client.post<TrackerAgentAvatarSession>(`/api/tracker/agents/${agentId}/avatar/session`, payload ?? {});
+    return data;
+  } catch (error) {
+    const detail = extractBackendError(error);
+    if (detail) throw new Error(detail);
+    throw error;
+  }
+}
+
+export async function createMainBrokerAvatarSession(
+  payload?: {
+    avatar_id?: string;
+    mode?: "FULL" | "LITE";
+    voice_id?: string;
+    context_id?: string;
+    language?: string;
+  },
+): Promise<MainBrokerAvatarSession> {
+  try {
+    const { data } = await client.post<MainBrokerAvatarSession>("/api/tracker/broker/avatar/session", payload ?? {});
+    return data;
+  } catch (error) {
+    const detail = extractBackendError(error);
+    if (detail) throw new Error(detail);
+    throw error;
+  }
+}
+
 export async function getTrackerAgentHistory(agentId: string, limit = 20): Promise<TrackerAgentHistoryItem[]> {
   try {
     const { data } = await client.get<{ items?: TrackerAgentHistoryItem[] }>(`/api/tracker/agents/${agentId}/history`, {
@@ -791,6 +833,26 @@ export async function interactWithTrackerAgent(agentId: string, message: string,
     const { data } = await client.post<TrackerAgentInteractResponse>(`/api/tracker/agents/${agentId}/interact`, {
       message,
       user_id: resolvedUserId
+    });
+    return data;
+  } catch (error) {
+    const detail = extractBackendError(error);
+    if (detail) throw new Error(detail);
+    throw error;
+  }
+}
+
+export async function interactWithMainBroker(
+  message: string,
+  userId?: string,
+  options?: { agent_limit?: number },
+): Promise<MainBrokerInteractResponse> {
+  const resolvedUserId = userId ?? authSession?.user?.id;
+  try {
+    const { data } = await client.post<MainBrokerInteractResponse>("/api/tracker/broker/interact", {
+      message,
+      user_id: resolvedUserId,
+      agent_limit: options?.agent_limit,
     });
     return data;
   } catch (error) {

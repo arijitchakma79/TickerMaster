@@ -748,6 +748,8 @@ async def tracker_agent_chat_response(
         "You are a personal broker-style assistant for a beginner investor. "
         "Help configure and operate stock tracker agents and explain updates clearly. "
         "Write naturally, concise but complete, with practical next actions and key risks. "
+        "When the manager asks for analysis, use provided tool outputs (including MCP source calls) and cite which source drove the view. "
+        "You may ask a short clarifying question when instruction is ambiguous, and suggest concrete next instructions for this specific tracker agent. "
         "Use only provided context. If data is missing, state exactly what is missing."
     )
     payload = {
@@ -865,5 +867,86 @@ async def tracker_context_query_response(
         return {
             "response": "Context query failed at model layer. Use recent runs/history tables for manual inspection.",
             "model": "context-fallback",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+async def tracker_main_broker_chat_response(
+    settings: Settings,
+    *,
+    user_message: str,
+    broker_context: Dict[str, Any],
+) -> Dict[str, str]:
+    message = str(user_message or "").strip()
+    if not message:
+        return {
+            "response": "No question provided.",
+            "model": "main-broker-fallback",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    selected_agents = broker_context.get("selected_agents") if isinstance(broker_context.get("selected_agents"), list) else []
+    if not settings.openai_api_key:
+        if not selected_agents:
+            return {
+                "response": "Main Broker is online, but no active tracker agents are available yet.",
+                "model": "main-broker-fallback",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        top = selected_agents[0] if isinstance(selected_agents[0], dict) else {}
+        symbol = str(top.get("symbol") or "N/A")
+        name = str(top.get("name") or "Tracker Agent")
+        return {
+            "response": (
+                f"Main Broker update: I reviewed {len(selected_agents)} tracked agents. "
+                f"Primary focus is {name} ({symbol}). Ask for sentiment, catalysts, or risk posture and I will summarize."
+            ),
+            "model": "main-broker-fallback",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    system = (
+        "You are the Main Broker for a multi-agent stock tracking desk. "
+        "You can coordinate across all tracker agents, MCP tool outputs, and saved storage context. "
+        "Give concise, practical answers with concrete next actions. "
+        "When relevant, mention which tracker agent(s) and which source/tool (reddit/x/prediction/perplexity/deep) informed the answer. "
+        "If data is missing, say exactly what is missing and what instruction the user should give next."
+    )
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "message": message,
+                        "broker_context": broker_context,
+                    },
+                    ensure_ascii=True,
+                ),
+            },
+        ],
+        "temperature": 0.25,
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.openai_api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            content = str(data["choices"][0]["message"]["content"]).strip()
+            return {
+                "response": content,
+                "model": str(data.get("model") or "gpt-4o-mini"),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+    except Exception:
+        return {
+            "response": "Main Broker request failed at model layer. Try a narrower question tied to one or two symbols.",
+            "model": "main-broker-fallback",
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
