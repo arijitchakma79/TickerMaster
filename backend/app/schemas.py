@@ -76,11 +76,13 @@ class AgentConfig(BaseModel):
 
 class SimulationStartRequest(BaseModel):
     ticker: str = "AAPL"
+    target_tickers: List[str] = Field(default_factory=list)
     user_id: Optional[str] = None
     duration_seconds: int = Field(180, ge=30, le=3600)
     initial_price: float = Field(185.0, gt=0)
     starting_cash: float = Field(100_000, gt=0)
     volatility: float = Field(0.02, ge=0.001, le=0.3)
+    inference_runtime: Literal["direct", "modal"] = "direct"
     agents: List[AgentConfig] = Field(default_factory=list)
 
 
@@ -99,17 +101,19 @@ class TradeRecord(BaseModel):
 class SimulationState(BaseModel):
     session_id: str
     ticker: str
+    tickers: List[str] = Field(default_factory=list)
     running: bool
     paused: bool
     tick: int
     current_price: float
+    market_prices: Dict[str, float] = Field(default_factory=dict)
     volatility: float
     started_at: str
     ends_at: str
     crash_mode: bool
     recent_news: List[str] = Field(default_factory=list)
     trades: List[TradeRecord] = Field(default_factory=list)
-    portfolios: Dict[str, Dict[str, float]] = Field(default_factory=dict)
+    portfolios: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     order_book: Dict[str, List[Dict[str, float]]] = Field(default_factory=dict)
 
 

@@ -44,6 +44,9 @@ NEGATIVE_WORDS = {
     "recession",
 }
 
+_MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
+_MARKDOWN_CITATION_PATTERN = re.compile(r"\s*\[(?:\d+(?:\s*,\s*\d+)*)\]")
+
 
 def _label(score: float) -> str:
     if score >= 0.2:
@@ -73,6 +76,33 @@ def _sentiment_score_from_text(text: str) -> float:
     neg = sum(token in NEGATIVE_WORDS for token in tokens)
     score = (pos - neg) / max(1, int(math.sqrt(len(tokens))))
     return max(-1.0, min(1.0, score))
+
+
+def _sanitize_perplexity_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+
+    cleaned_lines: List[str] = []
+    for line in raw.splitlines():
+        clean = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        if not clean:
+            continue
+        clean = _MARKDOWN_LINK_PATTERN.sub(r"\1", clean)
+        clean = clean.replace("**", "").replace("__", "").replace("`", "")
+        clean = _MARKDOWN_CITATION_PATTERN.sub("", clean)
+        clean = re.sub(r"\s{2,}", " ", clean).strip()
+        if clean:
+            cleaned_lines.append(clean)
+
+    if cleaned_lines:
+        return " ".join(cleaned_lines)
+
+    compact = _MARKDOWN_LINK_PATTERN.sub(r"\1", raw)
+    compact = compact.replace("**", "").replace("__", "").replace("`", "")
+    compact = _MARKDOWN_CITATION_PATTERN.sub("", compact)
+    compact = re.sub(r"\s{2,}", " ", compact).strip()
+    return compact
 
 
 async def _perplexity_summary(ticker: str, settings: Settings) -> Dict[str, Any]:
@@ -121,7 +151,7 @@ async def _perplexity_summary(ticker: str, settings: Settings) -> Dict[str, Any]
             resp = await client.post("https://api.perplexity.ai/chat/completions", headers=headers, json=body)
             resp.raise_for_status()
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+            content = _sanitize_perplexity_text(data["choices"][0]["message"]["content"])
             citations = data.get("citations", [])
             links = [
                 SourceLink(source="Perplexity", title=f"Source {idx + 1}", url=url)

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import json
+import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 import httpx
 
 from app.config import Settings
+
+_MODAL_INFERENCE_BACKOFF_UNTIL: datetime | None = None
 
 
 def _default_commentary(context: Dict[str, Any] | None = None) -> str:
@@ -88,6 +93,91 @@ def _safe_json_extract(raw: str) -> Dict[str, Any]:
     return {}
 
 
+def _modal_sdk_available() -> bool:
+    return importlib.util.find_spec("modal") is not None
+
+
+def _normalize_agent_decision_output(raw: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    if isinstance(raw, dict):
+        payload = raw
+    elif isinstance(raw, str):
+        payload = _safe_json_extract(raw)
+
+    side = str(payload.get("side", "hold")).lower().strip()
+    if side not in {"buy", "sell", "hold"}:
+        side = "hold"
+
+    try:
+        quantity = int(payload.get("quantity", 0))
+    except (TypeError, ValueError):
+        quantity = 0
+    quantity = int(max(0, min(5000, quantity)))
+
+    try:
+        confidence = float(payload.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = float(max(0, min(1, confidence)))
+
+    rationale = str(payload.get("rationale", "No rationale returned."))
+    target_ticker_raw = payload.get("target_ticker", payload.get("ticker", ""))
+    target_ticker = ""
+    if isinstance(target_ticker_raw, str):
+        normalized = target_ticker_raw.strip().upper().replace(".", "-")
+        if normalized:
+            target_ticker = normalized
+    return {
+        "side": side,
+        "quantity": quantity,
+        "confidence": confidence,
+        "rationale": rationale,
+        "target_ticker": target_ticker,
+    }
+
+
+def _invoke_modal_agent_decision_sync(settings: Settings, request_payload: Dict[str, Any]) -> Any:
+    import modal  # type: ignore[import-not-found]
+
+    os.environ.setdefault("MODAL_TOKEN_ID", settings.modal_token_id)
+    os.environ.setdefault("MODAL_TOKEN_SECRET", settings.modal_token_secret)
+
+    fn = modal.Function.from_name(
+        settings.modal_simulation_app_name,
+        settings.modal_inference_function_name,
+    )
+    return fn.remote(request_payload)
+
+
+async def _generate_agent_decision_via_modal(
+    settings: Settings,
+    request_payload: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    global _MODAL_INFERENCE_BACKOFF_UNTIL
+
+    now = datetime.now(timezone.utc)
+    if _MODAL_INFERENCE_BACKOFF_UNTIL and now < _MODAL_INFERENCE_BACKOFF_UNTIL:
+        return None
+
+    if not settings.modal_token_id or not settings.modal_token_secret:
+        return None
+    if not _modal_sdk_available():
+        return None
+
+    timeout = max(5, settings.modal_inference_timeout_seconds)
+
+    try:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(_invoke_modal_agent_decision_sync, settings, request_payload),
+            timeout=timeout,
+        )
+        return _normalize_agent_decision_output(raw)
+    except Exception:
+        # Back off repeated failing lookups/remotes to avoid stalling simulation ticks.
+        _MODAL_INFERENCE_BACKOFF_UNTIL = now + timedelta(seconds=90)
+        return None
+
+
 async def generate_agent_decision(
     settings: Settings,
     agent_name: str,
@@ -95,18 +185,12 @@ async def generate_agent_decision(
     personality: str,
     market_state: Dict[str, Any],
     user_constraints: Dict[str, Any],
+    use_modal_inference: bool = False,
 ) -> Dict[str, Any]:
-    if not settings.openrouter_api_key:
-        return {
-            "side": "hold",
-            "quantity": 0,
-            "confidence": 0.41,
-            "rationale": "OpenRouter API key missing. Using deterministic baseline policy.",
-        }
-
     system_prompt = (
         "You are a trading agent in a simulated market arena. "
-        "Return strict JSON only with keys: side (buy/sell/hold), quantity (int), confidence (0-1), rationale (string). "
+        "Return strict JSON only with keys: side (buy/sell/hold), quantity (int), confidence (0-1), "
+        "target_ticker (string from allowed_tickers), rationale (string). "
         f"Agent personality: {personality}. Respect user constraints exactly."
     )
 
@@ -124,6 +208,32 @@ async def generate_agent_decision(
         ],
         "temperature": 0.3,
     }
+
+    if use_modal_inference:
+        modal_out = await _generate_agent_decision_via_modal(
+            settings,
+            {
+                "agent_name": agent_name,
+                "personality": personality,
+                "market_state": market_state,
+                "user_constraints": user_constraints,
+                "openrouter_request": payload,
+            },
+        )
+        if modal_out:
+            return modal_out
+
+    if not settings.openrouter_api_key:
+        return {
+            "side": "hold",
+            "quantity": 0,
+            "confidence": 0.41,
+            "rationale": (
+                "OpenRouter API key missing. Configure OPENROUTER_API_KEY, or enable Modal inference "
+                "with a deployed function."
+            ),
+        }
+
     headers = {
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "Content-Type": "application/json",
@@ -136,19 +246,7 @@ async def generate_agent_decision(
             resp = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers)
             resp.raise_for_status()
             output = resp.json()["choices"][0]["message"]["content"]
-            parsed = _safe_json_extract(output)
-            side = parsed.get("side", "hold")
-            if side not in {"buy", "sell", "hold"}:
-                side = "hold"
-            quantity = int(max(0, min(5000, int(parsed.get("quantity", 0)))))
-            confidence = float(max(0, min(1, float(parsed.get("confidence", 0.5)))))
-            rationale = str(parsed.get("rationale", "No rationale returned."))
-            return {
-                "side": side,
-                "quantity": quantity,
-                "confidence": confidence,
-                "rationale": rationale,
-            }
+            return _normalize_agent_decision_output(output)
     except Exception:
         return {
             "side": "hold",

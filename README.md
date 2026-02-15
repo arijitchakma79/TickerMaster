@@ -54,6 +54,19 @@ BACKEND_URL=http://localhost:8000
 
 Add your API keys for Alpaca / Finnhub / Perplexity / OpenAI / OpenRouter / X / Browserbase / Modal as needed.
 
+For Modal sandbox runtime, also set:
+- `MODAL_SIMULATION_APP_NAME` (default `tickermaster-simulation`)
+- `MODAL_SANDBOX_TIMEOUT_SECONDS` (default `600`)
+- `MODAL_SANDBOX_IDLE_TIMEOUT_SECONDS` (default `120`)
+- `MODAL_INFERENCE_FUNCTION_NAME` (default `agent_inference`)
+- `MODAL_INFERENCE_TIMEOUT_SECONDS` (default `15`)
+
+To enable Modal inference function:
+```bash
+modal secret create tickermaster-secrets OPENROUTER_API_KEY=<your-openrouter-key>
+modal deploy simulation/modal_inference.py
+```
+
 ### 2) Apply database schema in Supabase
 In Supabase Dashboard:
 1. Open `SQL Editor`.
@@ -128,6 +141,8 @@ If cache writes appear but activity/alerts do not, confirm backend is using `SUP
 
 ### Simulation
 - Natural-language sandbox trigger endpoint for Modal (`/simulation/modal/sandbox`).
+- Backend now launches Modal sandboxes through the Modal Python SDK (`modal==1.3.3`) when credentials are present.
+- Simulation sessions started with `inference_runtime=modal` first call a Modal function for agent decisions, then fall back to direct OpenRouter if Modal inference is unavailable.
 - OpenRouter-powered agents with user-defined parameters:
   - personality
   - model

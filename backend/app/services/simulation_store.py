@@ -39,3 +39,13 @@ def complete_simulation_record(record_id: str, results: dict[str, Any], status: 
         ).eq("id", record_id).execute()
     except Exception:
         return
+
+
+def attach_modal_sandbox(record_id: str, sandbox_id: str) -> None:
+    client = get_supabase()
+    if client is None:
+        return
+    try:
+        client.table("simulations").update({"modal_sandbox_id": sandbox_id}).eq("id", record_id).execute()
+    except Exception:
+        return

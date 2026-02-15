@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.schemas import SimulationStartRequest
+from app.services.simulation_store import attach_modal_sandbox
 from app.services.modal_integration import modal_cron_health, spin_modal_sandbox
 from app.services.user_context import get_user_id_from_request
 
@@ -68,7 +69,21 @@ async def list_simulation_sessions(request: Request):
 @router.post("/modal/sandbox")
 async def modal_sandbox(payload: SandboxRequest, request: Request):
     settings = request.app.state.settings
-    return await spin_modal_sandbox(settings, payload.prompt, payload.session_id)
+    orchestrator = request.app.state.orchestrator
+    runtime = orchestrator.sessions.get(payload.session_id)
+    metadata = {
+        "source": "simulation_page",
+    }
+    if runtime:
+        metadata["ticker"] = runtime.ticker
+        metadata["tick"] = runtime.tick
+        metadata["running"] = runtime.running
+
+    result = await spin_modal_sandbox(settings, payload.prompt, payload.session_id, metadata=metadata)
+    sandbox_id = result.get("sandbox_id")
+    if sandbox_id and runtime and runtime.simulation_record_id:
+        attach_modal_sandbox(runtime.simulation_record_id, str(sandbox_id))
+    return result
 
 
 @router.get("/modal/cron-health")

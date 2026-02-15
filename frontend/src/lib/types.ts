@@ -168,24 +168,78 @@ export interface TradeRecord {
   rationale: string;
 }
 
+export interface PortfolioPosition {
+  holdings: number;
+  avg_cost: number;
+  market_price: number;
+  market_value: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  net_gain: number;
+}
+
+export interface PortfolioSnapshot {
+  cash: number;
+  holdings: number;
+  avg_cost: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  total_pnl?: number;
+  equity: number;
+  positions?: Record<string, PortfolioPosition>;
+}
+
 export interface SimulationState {
   session_id: string;
   ticker: string;
+  tickers: string[];
   running: boolean;
   paused: boolean;
   tick: number;
   current_price: number;
+  market_prices: Record<string, number>;
   volatility: number;
   started_at: string;
   ends_at: string;
   crash_mode: boolean;
   recent_news: string[];
   trades: TradeRecord[];
-  portfolios: Record<string, Record<string, number>>;
+  portfolios: Record<string, PortfolioSnapshot>;
   order_book: {
     bids: Array<{ price: number; size: number }>;
     asks: Array<{ price: number; size: number }>;
   };
+}
+
+export interface ModalSandboxResponse {
+  status: "started" | "failed" | "stub" | string;
+  message?: string;
+  error?: string;
+  hint?: string;
+  session_id: string;
+  sandbox_id?: string;
+  app_id?: string;
+  app_name?: string;
+  dashboard_url?: string;
+  app_dashboard_url?: string;
+  sandbox_dashboard_url?: string;
+  prompt_preview?: string;
+  stdout_preview?: string[];
+  metadata?: Record<string, unknown>;
+  link?: string;
+}
+
+export interface ModalCronHealthResponse {
+  status: "configured" | "stub" | string;
+  message: string;
+  polling_interval_seconds: number;
+  app_name?: string;
+  sdk_available?: boolean;
+  sandbox_timeout_seconds?: number;
+  sandbox_idle_timeout_seconds?: number;
+  inference_function_name?: string;
+  inference_timeout_seconds?: number;
+  install_hint?: string;
 }
 
 export interface WSMessage {

@@ -5,6 +5,8 @@ import type { WSMessage } from "../lib/types";
 interface Props {
   connected: boolean;
   simulationEvent?: WSMessage;
+  activeSessionId?: string | null;
+  simulationActive?: boolean;
   className?: string;
 }
 
@@ -27,17 +29,35 @@ function toPortfolioSnapshot(raw: unknown): Record<string, { equity?: number }> 
   return out;
 }
 
-export default function EventRail({ connected, simulationEvent, className = "" }: Props) {
-  const [activeSessionId, setActiveSessionId] = useState<string>("");
+export default function EventRail({
+  connected,
+  simulationEvent,
+  activeSessionId,
+  simulationActive = false,
+  className = ""
+}: Props) {
   const [ticker, setTicker] = useState<string>("-");
   const [tick, setTick] = useState<number>(0);
   const [baselineEquity, setBaselineEquity] = useState<Record<string, number>>({});
   const [currentEquity, setCurrentEquity] = useState<Record<string, number>>({});
+  const hasSession = Boolean(activeSessionId);
 
   useEffect(() => {
+    if (!activeSessionId) {
+      setTicker("-");
+      setTick(0);
+      setBaselineEquity({});
+      setCurrentEquity({});
+      return;
+    }
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    if (!activeSessionId) return;
     if (!simulationEvent || simulationEvent.type !== "tick") return;
 
     const sessionId = typeof simulationEvent.session_id === "string" ? simulationEvent.session_id : "";
+    if (!sessionId || sessionId !== activeSessionId) return;
     const eventTicker = typeof simulationEvent.ticker === "string" ? simulationEvent.ticker : "-";
     const eventTick = Number(simulationEvent.tick ?? 0);
     const portfolio = toPortfolioSnapshot(simulationEvent.portfolio_snapshot);
@@ -51,13 +71,8 @@ export default function EventRail({ connected, simulationEvent, className = "" }
     setTick(eventTick);
     setCurrentEquity(current);
 
-    if (sessionId && sessionId !== activeSessionId) {
-      setActiveSessionId(sessionId);
-      setBaselineEquity(current);
-      return;
-    }
-
     setBaselineEquity((prev) => {
+      if (Object.keys(prev).length === 0) return current;
       const next = { ...prev };
       for (const [agent, equity] of Object.entries(current)) {
         if (!(agent in next)) next[agent] = equity;
@@ -94,8 +109,8 @@ export default function EventRail({ connected, simulationEvent, className = "" }
       </div>
 
       <div className="board-meta">
-        <span>{ticker} roundtable</span>
-        <span>Tick {tick}</span>
+        <span>{hasSession ? (simulationActive ? `${ticker} roundtable` : `${ticker} final`) : "No active session"}</span>
+        <span>{hasSession ? `Tick ${tick}` : "Tick -"}</span>
       </div>
 
       {standings.length === 0 ? <p className="muted">Run a simulation to view top winners and losers.</p> : null}
