@@ -94,6 +94,7 @@ const ALL_MARKET_PROMPT_PATTERN =
   /\b(all stocks|all tickers|entire market|whole market|market-wide|across the market)\b/i;
 
 const TICKER_PROMPT_STOPWORDS = new Set([
+  "ABOUT",
   "A",
   "AI",
   "ALL",
@@ -120,6 +121,7 @@ const TICKER_PROMPT_STOPWORDS = new Set([
   "OF",
   "ON",
   "OR",
+  "ONLY",
   "PRICE",
   "RISK",
   "SELL",
@@ -137,6 +139,7 @@ const TICKER_PROMPT_STOPWORDS = new Set([
   "USE",
   "VOL",
   "VOLATILITY",
+  "WORRY",
   "WHEN",
   "WITH"
 ]);
@@ -279,6 +282,19 @@ function statusTone(status: string) {
   return "idle";
 }
 
+function positionRowsForCard(portfolio: SimulationState["portfolios"][string] | undefined) {
+  if (!portfolio?.positions) return [];
+  return Object.entries(portfolio.positions)
+    .filter(([, position]) => (position.holdings ?? 0) > 0 || Math.abs(position.net_gain ?? 0) >= 0.01)
+    .sort((a, b) => Math.abs((b[1].net_gain ?? 0)) - Math.abs((a[1].net_gain ?? 0)))
+    .slice(0, 4)
+    .map(([ticker, position]) => ({
+      ticker,
+      holdings: position.holdings ?? 0,
+      netGain: position.net_gain ?? 0
+    }));
+}
+
 function makeUniqueName(baseName: string, takenNames: Set<string>) {
   const seed = baseName.trim() || SELF_AGENT_NAME;
   let candidate = seed;
@@ -306,16 +322,24 @@ function normalizeSymbol(value: string) {
   return value.trim().toUpperCase().replace(/\./g, "-");
 }
 
-function extractTickerCandidatesFromPrompt(prompt: string): string[] {
-  const matches = prompt.match(/\b[A-Za-z]{1,5}(?:[.-][A-Za-z]{1,2})?\b/g) ?? [];
+function extractTickerCandidatesFromPrompt(prompt: string, watchlist: string[]): string[] {
+  const matches = prompt.match(/\b\$?[A-Za-z]{1,5}(?:[.-][A-Za-z]{1,2})?\b/g) ?? [];
+  const normalizedWatchlist = new Set(watchlist.map(normalizeSymbol).filter(Boolean));
   const seen = new Set<string>();
   const out: string[] = [];
 
   for (const token of matches) {
-    const symbol = normalizeSymbol(token);
+    const hasDollarPrefix = token.startsWith("$");
+    const rawToken = hasDollarPrefix ? token.slice(1) : token;
+    const symbol = normalizeSymbol(rawToken);
     if (!symbol) continue;
     if (TICKER_PROMPT_STOPWORDS.has(symbol)) continue;
     if (!/^[A-Z][A-Z0-9-]{0,9}$/.test(symbol)) continue;
+    const isExplicitUppercase = rawToken === rawToken.toUpperCase();
+    const inWatchlist = normalizedWatchlist.has(symbol);
+    // Avoid turning normal sentence words into fake tickers (e.g. Play -> PLAY).
+    if (!hasDollarPrefix && !isExplicitUppercase && !inWatchlist) continue;
+    if (symbol.length === 1 && !hasDollarPrefix && !inWatchlist) continue;
     if (!seen.has(symbol)) {
       seen.add(symbol);
       out.push(symbol);
@@ -326,22 +350,53 @@ function extractTickerCandidatesFromPrompt(prompt: string): string[] {
 }
 
 function resolveTickersFromPrompt(prompt: string, activeTicker: string, watchlist: string[]): string[] {
-  const inferred = extractTickerCandidatesFromPrompt(prompt);
-  if (inferred.length > 0) return inferred;
+  const inferred = extractTickerCandidatesFromPrompt(prompt, watchlist);
+  const normalizedWatchlist = watchlist.map(normalizeSymbol).filter(Boolean);
+  const dedupedWatchlist = Array.from(new Set(normalizedWatchlist));
+  const primary = normalizeSymbol(activeTicker) || dedupedWatchlist[0] || "AAPL";
+
+  if (inferred.length > 0) {
+    const merged = [...inferred, ...dedupedWatchlist.filter((symbol) => !inferred.includes(symbol))];
+    return merged.slice(0, 12);
+  }
 
   if (ALL_MARKET_PROMPT_PATTERN.test(prompt)) {
-    const normalizedWatchlist = watchlist.map(normalizeSymbol).filter(Boolean);
-    if (normalizedWatchlist.length > 0) {
-      const deduped = Array.from(new Set(normalizedWatchlist));
-      if (deduped.includes("SPY")) {
-        return ["SPY", ...deduped.filter((symbol) => symbol !== "SPY")];
+    if (dedupedWatchlist.length > 0) {
+      if (dedupedWatchlist.includes("SPY")) {
+        return ["SPY", ...dedupedWatchlist.filter((symbol) => symbol !== "SPY")];
       }
-      return deduped;
+      return dedupedWatchlist;
     }
   }
 
-  const fallback = normalizeSymbol(activeTicker) || "AAPL";
-  return [fallback];
+  if (dedupedWatchlist.length > 1) {
+    if (dedupedWatchlist.includes(primary)) {
+      return [primary, ...dedupedWatchlist.filter((symbol) => symbol !== primary)];
+    }
+    return [primary, ...dedupedWatchlist];
+  }
+
+  return [primary];
+}
+
+async function filterTradableTickers(candidates: string[], fallbackTicker: string): Promise<string[]> {
+  const unique = Array.from(new Set(candidates.map(normalizeSymbol).filter(Boolean))).slice(0, 12);
+  if (unique.length === 0) return [fallbackTicker];
+
+  const checks = await Promise.all(
+    unique.map(async (symbol) => {
+      try {
+        const quote = await fetchRealtimeQuote(symbol);
+        return Number.isFinite(quote.price) && quote.price > 0 ? symbol : null;
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  const valid = checks.filter((value): value is string => Boolean(value));
+  if (valid.length > 0) return valid;
+  return [fallbackTicker];
 }
 
 export default function SimulationPanel({
@@ -382,6 +437,7 @@ export default function SimulationPanel({
   const [modalSandboxLoading, setModalSandboxLoading] = useState(false);
   const [modalSandboxError, setModalSandboxError] = useState("");
   const [promptInferredTickers, setPromptInferredTickers] = useState<string[]>([]);
+  const [sessionStartError, setSessionStartError] = useState("");
 
   useEffect(() => {
     const symbol = activeTicker.trim().toUpperCase();
@@ -444,6 +500,9 @@ export default function SimulationPanel({
         ...prev,
         tick: nextTick,
         current_price: nextPrice,
+        tickers: Array.isArray(simulationEvent.tickers) ? (simulationEvent.tickers as string[]) : prev.tickers,
+        market_prices:
+          (simulationEvent.market_prices as SimulationState["market_prices"]) ?? prev.market_prices,
         paused: false,
         crash_mode: Boolean(simulationEvent.crash_mode),
         recent_news: Array.isArray(simulationEvent.news) ? (simulationEvent.news as string[]) : prev.recent_news,
@@ -617,6 +676,7 @@ export default function SimulationPanel({
   async function handlePlay() {
     setLoading(true);
     setModalSandboxError("");
+    setSessionStartError("");
     try {
       if (session?.running && session.paused) {
         const resumed = await resumeSimulation(session.session_id);
@@ -634,7 +694,9 @@ export default function SimulationPanel({
       ]
         .join(" ")
         .trim();
-      const resolvedTickers = resolveTickersFromPrompt(strategyContext, activeTicker, watchlist);
+      const rawResolvedTickers = resolveTickersFromPrompt(strategyContext, activeTicker, watchlist);
+      const fallbackTicker = normalizeSymbol(activeTicker) || "AAPL";
+      const resolvedTickers = await filterTradableTickers(rawResolvedTickers, fallbackTicker);
       const cleanTicker = resolvedTickers[0] ?? (normalizeSymbol(activeTicker) || "AAPL");
       setPromptInferredTickers(resolvedTickers);
       onTickerChange(cleanTicker);
@@ -648,12 +710,17 @@ export default function SimulationPanel({
         }
       }
 
-      const initialPrice = quote?.price ?? DEFAULT_SETTINGS.fallbackInitialPrice;
+      const candidateInitialPrice = Number(quote?.price);
+      const initialPrice =
+        Number.isFinite(candidateInitialPrice) && candidateInitialPrice > 0
+          ? candidateInitialPrice
+          : DEFAULT_SETTINGS.fallbackInitialPrice;
       const volatility = deriveVolatilityFromQuote(quote?.change_percent);
 
       const configuredAgents = previewAgents;
       const next = await startSimulation({
         ticker: cleanTicker,
+        target_tickers: resolvedTickers,
         duration_seconds: DEFAULT_SETTINGS.duration,
         initial_price: initialPrice,
         starting_cash: Math.max(1000, Number(startingCapital) || DEFAULT_SETTINGS.startingCash),
@@ -684,6 +751,10 @@ export default function SimulationPanel({
           setModalSandboxLoading(false);
         }
       }
+    } catch {
+      setSessionStartError(
+        "Unable to start simulation. Try a known stock ticker or reset to your watchlist symbols."
+      );
     } finally {
       setLoading(false);
     }
@@ -728,6 +799,7 @@ export default function SimulationPanel({
       setModalSandboxResult(null);
       setModalSandboxLoading(false);
       setModalSandboxError("");
+      setSessionStartError("");
       setPromptInferredTickers([]);
       setAddedCustomAgents([]);
       setCustomEmoji("");
@@ -999,6 +1071,10 @@ export default function SimulationPanel({
           {displayedAgents.map((agent) => {
             const latestTrade = latestTradeByAgent.get(agent.name);
             const portfolio = session?.portfolios[agent.name];
+            const positionRows = positionRowsForCard(portfolio);
+            const totalPnl =
+              portfolio?.total_pnl ??
+              ((portfolio?.realized_pnl ?? 0) + (portfolio?.unrealized_pnl ?? 0));
             const isPreset = institutionalAgentNames.has(agent.name);
             const status = buildAgentStatus(session, latestTrade, isPreset);
             const tone = statusTone(status);
@@ -1020,6 +1096,25 @@ export default function SimulationPanel({
                 <h4 className="character-name">{agent.name}</h4>
                 <p className="character-role">{personalityLabel(agent.personality)}</p>
                 <p className="character-equity">{portfolio ? formatCurrency(portfolio.equity ?? 0) : "-"}</p>
+                <p className={`character-total-pnl ${totalPnl >= 0 ? "text-green" : "text-red"}`}>
+                  {totalPnl >= 0 ? "+" : ""}
+                  {formatCurrency(totalPnl)}
+                </p>
+                {positionRows.length > 0 ? (
+                  <ul className="character-positions">
+                    {positionRows.map((row) => (
+                      <li key={`${agent.name}-${row.ticker}`}>
+                        <span>{row.ticker} · {Math.round(row.holdings)} sh</span>
+                        <span className={row.netGain >= 0 ? "text-green" : "text-red"}>
+                          {row.netGain >= 0 ? "+" : ""}
+                          {formatCurrency(row.netGain)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted character-positions-empty">No active positions</p>
+                )}
               </article>
             );
           })}
@@ -1058,6 +1153,7 @@ export default function SimulationPanel({
             <p className="error">{modalHealth.install_hint}</p>
           ) : null}
           {modalSandboxError ? <p className="error">{modalSandboxError}</p> : null}
+          {sessionStartError ? <p className="error">{sessionStartError}</p> : null}
           {modalSandboxResult?.dashboard_url ? (
             <a href={modalSandboxResult.dashboard_url} target="_blank" rel="noreferrer">
               Open Modal App Dashboard
@@ -1077,29 +1173,31 @@ export default function SimulationPanel({
           />
         </label>
 
-        <button
-          className="start-trading-button"
-          onClick={handlePlay}
-          disabled={loading || Boolean(session?.running && !session?.paused)}
-        >
-          ▶ {session?.running && session.paused ? "Resume Trading" : "Start Trading"}
-        </button>
+        {!session?.running ? (
+          <button className="start-trading-button" onClick={handlePlay} disabled={loading}>
+            ▶ Start Trading
+          </button>
+        ) : (
+          <div className="simulation-control-row">
+            <button
+              className="secondary"
+              onClick={session.paused ? handlePlay : handlePause}
+              disabled={loading || !session.running}
+            >
+              {session.paused ? "▶ Continue" : "⏸ Pause"}
+            </button>
+            <button className="secondary" onClick={handleStop} disabled={loading || !session.running}>
+              ⏹ Stop / Cancel
+            </button>
+            <button className="secondary" onClick={handleReset} disabled={loading}>
+              ↺ Reset (Clean Slate)
+            </button>
 
-        <div className="simulation-control-row">
-          <button className="secondary" onClick={handlePause} disabled={loading || !session?.running || Boolean(session?.paused)}>
-            ⏸ Pause
-          </button>
-          <button className="secondary" onClick={handleStop} disabled={loading || !session?.running}>
-            ⏹ Stop / Cancel
-          </button>
-          <button className="secondary" onClick={handleReset} disabled={loading}>
-            ↺ Reset (Clean Slate)
-          </button>
-
-          <span className={session?.running ? (session.paused ? "pill neutral" : "pill bullish") : "pill bearish"}>
-            {session?.running ? (session.paused ? "Paused" : "Live") : "Idle"}
-          </span>
-        </div>
+            <span className={session.paused ? "pill neutral" : "pill bullish"}>
+              {session.paused ? "Paused" : "Live"}
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="telemetry-board-row">
@@ -1137,50 +1235,31 @@ export default function SimulationPanel({
           </div>
         </div>
 
-        <EventRail connected={connected} simulationEvent={simulationEvent} className="event-rail-inline" />
+        <EventRail
+          connected={connected}
+          simulationEvent={simulationEvent}
+          activeSessionId={session?.session_id ?? null}
+          simulationActive={Boolean(session?.running)}
+          className="event-rail-inline"
+        />
       </div>
 
-      <div className="card-row card-row-split">
+      <div className="card-row-split">
         <div className="glass-card">
-          <h3>Order Book</h3>
-          <div className="orderbook-grid">
-            <div>
-              <h4>Bids</h4>
-              <ul>
-                {(session?.order_book.bids ?? []).map((bid, idx) => (
-                  <li key={`bid-${idx}`}>
-                    <span>{bid.price.toFixed(2)}</span>
-                    <span>{bid.size}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-            <div>
-              <h4>Asks</h4>
-              <ul>
-                {(session?.order_book.asks ?? []).map((ask, idx) => (
-                  <li key={`ask-${idx}`}>
-                    <span>{ask.price.toFixed(2)}</span>
-                    <span>{ask.size}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </div>
-          <h4>News Latency Feed</h4>
+          <h3>Latest News</h3>
           <ul className="news-feed">
-            {(session?.recent_news ?? []).slice(0, 5).map((news, idx) => (
-              <li key={`news-${idx}`}>{news}</li>
-            ))}
+            {(session?.recent_news ?? []).slice(0, 8).map((news, idx) => <li key={`news-${idx}`}>{news}</li>)}
+            {(session?.recent_news ?? []).length === 0 ? <li className="muted">No headlines yet.</li> : null}
           </ul>
         </div>
 
         <div className="glass-card">
           <h3>Trades</h3>
-          <div className="table-wrap">
+          <div className="table-wrap trades-table-wrap">
             <table>
               <thead>
                 <tr>
+                  <th>Ticker</th>
                   <th>Agent</th>
                   <th>Side</th>
                   <th>Qty</th>
@@ -1188,8 +1267,9 @@ export default function SimulationPanel({
                 </tr>
               </thead>
               <tbody>
-                {(session?.trades ?? []).slice(0, 14).map((trade, idx) => (
+                {(session?.trades ?? []).map((trade, idx) => (
                   <tr key={`trade-${idx}`}>
+                    <td>{trade.ticker}</td>
                     <td>{trade.agent}</td>
                     <td className={trade.side === "buy" ? "text-green" : "text-red"}>{trade.side}</td>
                     <td>{trade.quantity}</td>

@@ -168,20 +168,43 @@ export interface TradeRecord {
   rationale: string;
 }
 
+export interface PortfolioPosition {
+  holdings: number;
+  avg_cost: number;
+  market_price: number;
+  market_value: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  net_gain: number;
+}
+
+export interface PortfolioSnapshot {
+  cash: number;
+  holdings: number;
+  avg_cost: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  total_pnl?: number;
+  equity: number;
+  positions?: Record<string, PortfolioPosition>;
+}
+
 export interface SimulationState {
   session_id: string;
   ticker: string;
+  tickers: string[];
   running: boolean;
   paused: boolean;
   tick: number;
   current_price: number;
+  market_prices: Record<string, number>;
   volatility: number;
   started_at: string;
   ends_at: string;
   crash_mode: boolean;
   recent_news: string[];
   trades: TradeRecord[];
-  portfolios: Record<string, Record<string, number>>;
+  portfolios: Record<string, PortfolioSnapshot>;
   order_book: {
     bids: Array<{ price: number; size: number }>;
     asks: Array<{ price: number; size: number }>;

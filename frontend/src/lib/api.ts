@@ -70,6 +70,7 @@ export async function searchTickerDirectory(query: string, limit = 8): Promise<T
 }
 export async function startSimulation(payload: {
   ticker: string;
+  target_tickers?: string[];
   duration_seconds: number;
   initial_price: number;
   starting_cash: number;
