@@ -40,19 +40,20 @@ export default function EventRail({
   const [tick, setTick] = useState<number>(0);
   const [baselineEquity, setBaselineEquity] = useState<Record<string, number>>({});
   const [currentEquity, setCurrentEquity] = useState<Record<string, number>>({});
+  const hasSession = Boolean(activeSessionId);
 
   useEffect(() => {
-    if (!simulationActive || !activeSessionId) {
+    if (!activeSessionId) {
       setTicker("-");
       setTick(0);
       setBaselineEquity({});
       setCurrentEquity({});
       return;
     }
-  }, [simulationActive, activeSessionId]);
+  }, [activeSessionId]);
 
   useEffect(() => {
-    if (!simulationActive || !activeSessionId) return;
+    if (!activeSessionId) return;
     if (!simulationEvent || simulationEvent.type !== "tick") return;
 
     const sessionId = typeof simulationEvent.session_id === "string" ? simulationEvent.session_id : "";
@@ -78,7 +79,7 @@ export default function EventRail({
       }
       return next;
     });
-  }, [simulationEvent, simulationActive, activeSessionId]);
+  }, [simulationEvent, activeSessionId]);
 
   const standings = useMemo<StandingRow[]>(() => {
     return Object.entries(currentEquity).map(([agent, equity]) => {
@@ -108,8 +109,8 @@ export default function EventRail({
       </div>
 
       <div className="board-meta">
-        <span>{simulationActive && activeSessionId ? `${ticker} roundtable` : "No active session"}</span>
-        <span>{simulationActive && activeSessionId ? `Tick ${tick}` : "Tick -"}</span>
+        <span>{hasSession ? (simulationActive ? `${ticker} roundtable` : `${ticker} final`) : "No active session"}</span>
+        <span>{hasSession ? `Tick ${tick}` : "Tick -"}</span>
       </div>
 
       {standings.length === 0 ? <p className="muted">Run a simulation to view top winners and losers.</p> : null}

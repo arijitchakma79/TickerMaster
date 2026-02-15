@@ -974,6 +974,19 @@ th {
   margin-left: auto;
 }
 
+.post-session-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.post-session-actions .start-trading-button {
+  width: auto;
+  flex: 1 1 220px;
+  padding: 12px 16px;
+  font-size: 1rem;
+}
+
 .roundtable-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

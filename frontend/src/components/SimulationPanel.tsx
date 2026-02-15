@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { jsPDF } from "jspdf";
 import {
   CartesianGrid,
   Line,
@@ -819,6 +820,112 @@ export default function SimulationPanel({
     }
   }
 
+  function formatDateTime(value: string) {
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return value;
+    return parsed.toLocaleString();
+  }
+
+  function handleDownloadReport() {
+    if (!session || session.running) return;
+
+    const reportTime = new Date();
+    const doc = new jsPDF({ unit: "pt", format: "a4" });
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const margin = 40;
+    const contentWidth = pageWidth - margin * 2;
+    let y = margin;
+
+    const ensureSpace = (height: number) => {
+      if (y + height > pageHeight - margin) {
+        doc.addPage();
+        y = margin;
+      }
+    };
+
+    const addLine = (text: string, size = 11, bold = false, gapBefore = 0, gapAfter = 6) => {
+      y += gapBefore;
+      doc.setFont("helvetica", bold ? "bold" : "normal");
+      doc.setFontSize(size);
+      const wrapped = doc.splitTextToSize(text, contentWidth);
+      const lineHeight = Math.max(14, size + 2);
+      ensureSpace(wrapped.length * lineHeight + gapAfter);
+      doc.text(wrapped, margin, y);
+      y += wrapped.length * lineHeight + gapAfter;
+    };
+
+    const rankedAgents = Object.entries(session.portfolios)
+      .map(([agent, portfolio]) => {
+        const totalPnl =
+          portfolio.total_pnl ??
+          ((portfolio.realized_pnl ?? 0) + (portfolio.unrealized_pnl ?? 0));
+        return {
+          agent,
+          equity: portfolio.equity ?? 0,
+          totalPnl
+        };
+      })
+      .sort((a, b) => b.equity - a.equity);
+
+    addLine("TickerMaster Simulation Report", 20, true, 0, 12);
+    addLine(`Generated: ${reportTime.toLocaleString()}`, 10, false, 0, 10);
+
+    addLine("Session Summary", 13, true, 6, 6);
+    addLine(`Primary ticker: ${session.ticker}`);
+    addLine(`Universe: ${session.tickers.join(", ") || session.ticker}`);
+    addLine(`Session ID: ${session.session_id}`, 10);
+    addLine(`Started: ${formatDateTime(session.started_at)}`, 10);
+    addLine(`Ended: ${formatDateTime(session.ends_at)}`, 10);
+    addLine(`Final tick: ${session.tick}`);
+    addLine(`Final price: ${formatCurrency(session.current_price)}`);
+    addLine(`Combined equity: ${formatCurrency(totalEquity)}`);
+    addLine(`Total trades: ${session.trades.length}`);
+
+    addLine("Top Agents", 13, true, 8, 6);
+    if (rankedAgents.length === 0) {
+      addLine("No agent portfolio data available.", 10);
+    } else {
+      rankedAgents.slice(0, 8).forEach((row, index) => {
+        const pnlLabel = `${row.totalPnl >= 0 ? "+" : ""}${formatCurrency(row.totalPnl)}`;
+        addLine(
+          `${index + 1}. ${row.agent} | Equity ${formatCurrency(row.equity)} | Net PnL ${pnlLabel}`,
+          10
+        );
+      });
+    }
+
+    addLine("Latest News", 13, true, 8, 6);
+    if (session.recent_news.length === 0) {
+      addLine("No headlines captured for this run.", 10);
+    } else {
+      session.recent_news.slice(0, 10).forEach((news, index) => addLine(`${index + 1}. ${news}`, 10));
+    }
+
+    addLine("Recent Trades", 13, true, 8, 6);
+    if (session.trades.length === 0) {
+      addLine("No executed trades.", 10);
+    } else {
+      session.trades.slice(0, 25).forEach((trade, index) => {
+        addLine(
+          `${index + 1}. ${trade.agent} | ${trade.side.toUpperCase()} ${trade.quantity} ${trade.ticker} @ ${trade.price.toFixed(2)}`,
+          10
+        );
+      });
+    }
+
+    addLine("Post-Run Commentary", 13, true, 8, 6);
+    addLine(
+      autoCommentaryLoading
+        ? "Commentary is still generating."
+        : autoCommentary || "No automatic commentary was generated.",
+      10
+    );
+
+    const stamp = reportTime.toISOString().replace(/[:.]/g, "-");
+    doc.save(`tickermaster-report-${session.ticker}-${stamp}.pdf`);
+  }
+
   const totalEquity = useMemo(() => {
     if (!session) return 0;
     return Object.values(session.portfolios).reduce((sum, portfolio) => sum + (portfolio.equity ?? 0), 0);
@@ -1155,10 +1262,16 @@ export default function SimulationPanel({
           ) : null}
           {modalSandboxError ? <p className="error">{modalSandboxError}</p> : null}
           {sessionStartError ? <p className="error">{sessionStartError}</p> : null}
-          {modalSandboxResult?.dashboard_url ? (
-            <a href={modalSandboxResult.dashboard_url} target="_blank" rel="noreferrer">
-              Open Modal Sandbox
-            </a>
+          {modalSandboxResult?.sandbox_id ? (
+            <p className="muted">Sandbox ID: {modalSandboxResult.sandbox_id}</p>
+          ) : null}
+          {modalSandboxResult?.dashboard_url && modalSandboxResult.status === "started" ? (
+            <>
+              <a href={modalSandboxResult.dashboard_url} target="_blank" rel="noreferrer">
+                Open Modal Sandbox (same workspace login)
+              </a>
+              <p className="muted">If this 404s, your browser login likely differs from backend token workspace.</p>
+            </>
           ) : null}
         </div>
 
@@ -1174,11 +1287,11 @@ export default function SimulationPanel({
           />
         </label>
 
-        {!session?.running ? (
+        {!session ? (
           <button className="start-trading-button" onClick={handlePlay} disabled={loading}>
             ▶ Start Trading
           </button>
-        ) : (
+        ) : session.running ? (
           <div className="simulation-control-row">
             <button
               className="secondary"
@@ -1197,6 +1310,15 @@ export default function SimulationPanel({
             <span className={session.paused ? "pill neutral" : "pill bullish"}>
               {session.paused ? "Paused" : "Live"}
             </span>
+          </div>
+        ) : (
+          <div className="post-session-actions">
+            <button className="secondary" onClick={handleDownloadReport} disabled={loading}>
+              ⬇ Save Report to PDF
+            </button>
+            <button className="start-trading-button" onClick={handlePlay} disabled={loading}>
+              ▶ Start New Trade
+            </button>
           </div>
         )}
       </div>
