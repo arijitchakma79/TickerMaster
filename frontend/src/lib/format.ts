@@ -19,3 +19,11 @@ export function formatPercent(value?: number | null) {
   const sign = value > 0 ? "+" : "";
   return `${sign}${value.toFixed(2)}%`;
 }
+
+export function formatToCents(value?: number | null) {
+  if (value == null || !Number.isFinite(value)) return "-";
+  return new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }).format(value);
+}
