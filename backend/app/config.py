@@ -10,11 +10,11 @@ from urllib.parse import urlparse
 
 
 def _load_dotenv(path: str = ".env") -> None:
-    candidates = [
-        Path(path),
-        Path(__file__).resolve().parents[2] / ".env",
-        Path(__file__).resolve().parents[3] / ".env",
-    ]
+    candidates = [Path(path)]
+    resolved = Path(__file__).resolve()
+    # Probe parent directories safely without assuming a fixed depth.
+    for parent in resolved.parents:
+        candidates.append(parent / ".env")
     seen: set[Path] = set()
     for env_path in candidates:
         if env_path in seen or not env_path.exists():
