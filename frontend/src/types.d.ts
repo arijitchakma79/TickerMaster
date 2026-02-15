@@ -4,3 +4,8 @@ declare module "*.png" {
 }
 
 declare module "lodash";
+
+declare module "*.mp4" {
+  const value: string;
+  export default value;
+}

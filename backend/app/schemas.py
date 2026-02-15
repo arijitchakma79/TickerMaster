@@ -142,3 +142,20 @@ class ChatResponse(BaseModel):
     response: str
     model: str
     generated_at: str
+
+
+class ResearchChatRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=4000)
+    ticker: Optional[str] = None
+    timeframe: str = "7d"
+    include_deep: bool = False
+    auto_fetch_if_missing: bool = True
+
+
+class ResearchChatResponse(BaseModel):
+    ticker: str
+    response: str
+    model: str
+    generated_at: str
+    context_refreshed: bool = True
+    sources: List[str] = Field(default_factory=list)

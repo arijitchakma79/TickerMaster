@@ -121,6 +121,14 @@ CREATE TABLE IF NOT EXISTS public.watchlist (
     UNIQUE(user_id, symbol)
 );
 
+CREATE TABLE IF NOT EXISTS public.favorite_stocks (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+    symbol TEXT NOT NULL,
+    added_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, symbol)
+);
+
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.tracker_agents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.tracker_alerts ENABLE ROW LEVEL SECURITY;
@@ -128,6 +136,7 @@ ALTER TABLE public.simulations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.agent_activity ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.research_cache ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.watchlist ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.favorite_stocks ENABLE ROW LEVEL SECURITY;
 
 DO $$ BEGIN
     CREATE POLICY "Users can view own profile" ON public.profiles
@@ -171,6 +180,11 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
     CREATE POLICY "Users can CRUD own watchlist" ON public.watchlist
+        FOR ALL USING (auth.uid() = user_id);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE POLICY "Users can CRUD own favorites" ON public.favorite_stocks
         FOR ALL USING (auth.uid() = user_id);
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 

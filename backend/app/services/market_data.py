@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
@@ -72,6 +73,34 @@ def _synthetic_candles(symbol: str, count: int = 30) -> List[CandlestickPoint]:
 
 def _settings():
     return get_settings()
+
+
+def _is_symbol_candidate(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9-]{0,9}", value))
+
+
+def resolve_symbol_input(raw: str) -> str:
+    clean = raw.strip()
+    if not clean:
+        raise ValueError("Ticker input is empty.")
+
+    direct = clean.upper().replace(".", "-")
+    if _is_symbol_candidate(direct):
+        return direct
+
+    # Support formats like "Alaska Airlines (ALK)".
+    grouped = re.search(r"\(([A-Za-z][A-Za-z0-9.-]{0,9})\)", clean)
+    if grouped:
+        grouped_symbol = grouped.group(1).upper().replace(".", "-")
+        if _is_symbol_candidate(grouped_symbol):
+            return grouped_symbol
+
+    # Natural-language fallback: resolve via provider search.
+    hits = _finnhub_search(clean, limit=8)
+    if hits:
+        return hits[0].ticker.upper().strip()
+
+    raise ValueError(f"Could not resolve ticker symbol from input: {raw!r}")
 
 
 def _iso_z(dt: datetime) -> str:
@@ -719,12 +748,17 @@ def _metric_from_finnhub(symbol: str) -> MarketMetric | None:
 
 
 def fetch_metric(ticker: str) -> MarketMetric:
-    symbol = ticker.upper().strip()
+    symbol = resolve_symbol_input(ticker)
 
-    # Primary provider: Alpaca (real-time snapshot).
+    # Primary provider: Finnhub.
+    finnhub_metric = _metric_from_finnhub(symbol)
+    if finnhub_metric is not None:
+        _LAST_METRIC_CACHE[symbol] = finnhub_metric
+        return finnhub_metric
+
+    # Backup provider: Alpaca (real-time snapshot).
     alpaca_metric = _alpaca_metric(symbol)
     if alpaca_metric is not None:
-        # Opportunistically enrich with Finnhub fundamentals (no hard dependency).
         basic = _finnhub_basic_metrics(symbol)
         profile = _finnhub_profile(symbol)
         pe_ratio = _safe_float(basic.get("peTTM")) or _safe_float(basic.get("peBasicExclExtraTTM"))
@@ -745,20 +779,11 @@ def fetch_metric(ticker: str) -> MarketMetric:
         _LAST_METRIC_CACHE[symbol] = out
         return out
 
-    # Backup provider: Finnhub.
-    finnhub_metric = _metric_from_finnhub(symbol)
-    if finnhub_metric is not None:
-        _LAST_METRIC_CACHE[symbol] = finnhub_metric
-        return finnhub_metric
-
     cached = _LAST_METRIC_CACHE.get(symbol)
     if cached is not None:
         return cached
 
-    # Last-resort sandbox fallback.
-    out = _synthetic_metric(symbol)
-    _LAST_METRIC_CACHE[symbol] = out
-    return out
+    raise RuntimeError(f"No quote data available for {symbol}")
 
 
 def fetch_watchlist_metrics(tickers: List[str]) -> List[MarketMetric]:
@@ -811,20 +836,20 @@ async def search_tickers(query: str, limit: int = 8) -> List[TickerLookup]:
 
 
 def fetch_candles(ticker: str, period: str = "1mo", interval: str = "1d") -> List[CandlestickPoint]:
-    symbol = ticker.upper().strip()
+    symbol = resolve_symbol_input(ticker)
     cache_key = f"{symbol}:{period}:{interval}"
 
-    # Primary provider: Alpaca bars.
-    alpaca = _alpaca_bars(symbol, period=period, interval=interval)
-    if alpaca:
-        _LAST_CANDLES_CACHE[cache_key] = alpaca
-        return alpaca
-
-    # Backup provider: Finnhub candles.
+    # Primary provider: Finnhub candles.
     finnhub = _finnhub_candles(symbol, period=period, interval=interval)
     if finnhub:
         _LAST_CANDLES_CACHE[cache_key] = finnhub
         return finnhub
+
+    # Backup provider: Alpaca bars.
+    alpaca = _alpaca_bars(symbol, period=period, interval=interval)
+    if alpaca:
+        _LAST_CANDLES_CACHE[cache_key] = alpaca
+        return alpaca
 
     # Backup provider: Twelve Data candles.
     twelvedata = _twelvedata_candles(symbol, period=period, interval=interval)
@@ -842,10 +867,7 @@ def fetch_candles(ticker: str, period: str = "1mo", interval: str = "1d") -> Lis
     if cached:
         return cached
 
-    # Last-resort sandbox fallback.
-    synthetic = _synthetic_candles(symbol, count=max(20, min(240, _period_days(period))))
-    _LAST_CANDLES_CACHE[cache_key] = synthetic
-    return synthetic
+    raise RuntimeError(f"No candle data available for {symbol}")
 
 
 def fetch_sp500_returns_window(period: str = "10y") -> Tuple[np.ndarray, float]:
@@ -896,7 +918,7 @@ def _recommendation_label(row: dict[str, Any]) -> str | None:
 
 
 def fetch_advanced_stock_data(ticker: str) -> Dict[str, Any]:
-    symbol = ticker.upper().strip()
+    symbol = resolve_symbol_input(ticker)
 
     profile = _finnhub_profile(symbol)
     basic = _finnhub_basic_metrics(symbol)
@@ -906,7 +928,15 @@ def fetch_advanced_stock_data(ticker: str) -> Dict[str, Any]:
     try:
         metric = fetch_metric(symbol)
     except Exception:
-        metric = _synthetic_metric(symbol)
+        metric = MarketMetric(
+            ticker=symbol,
+            price=0.0,
+            change_percent=0.0,
+            pe_ratio=None,
+            beta=None,
+            volume=None,
+            market_cap=None,
+        )
 
     insider = _finnhub_insider_transactions(symbol)
     if not insider:

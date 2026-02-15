@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from app.schemas import AlertConfig, TrackerWatchlistRequest
+from app.services.market_data import fetch_watchlist_metrics
 from app.services.tracker_repository import tracker_repo
 from app.services.user_context import get_user_id_from_request
+from app.services.user_preferences import get_watchlist as get_persisted_watchlist
+from app.services.user_preferences import set_watchlist as set_persisted_watchlist
 
 router = APIRouter(prefix="/tracker", tags=["tracker"])
 
@@ -38,18 +43,35 @@ class TrackerEmitAlertRequest(BaseModel):
 
 @router.get("/snapshot")
 async def snapshot(request: Request):
+    user_id = get_user_id_from_request(request)
+    if user_id:
+        watchlist = get_persisted_watchlist(user_id)
+        metrics = await asyncio.to_thread(fetch_watchlist_metrics, watchlist) if watchlist else []
+        alerts = tracker_repo.list_alerts(user_id=user_id, limit=8)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "tickers": [item.model_dump() for item in metrics],
+            "alerts_triggered": alerts,
+        }
     tracker = request.app.state.tracker
     return await tracker.snapshot()
 
 
 @router.post("/watchlist")
 async def set_watchlist(payload: TrackerWatchlistRequest, request: Request):
+    user_id = get_user_id_from_request(request)
+    if user_id:
+        return {"watchlist": set_persisted_watchlist(user_id, payload.tickers)}
     tracker = request.app.state.tracker
     return {"watchlist": tracker.set_watchlist(payload.tickers)}
 
 
 @router.get("/watchlist")
 async def get_watchlist(request: Request):
+    user_id = get_user_id_from_request(request)
+    if user_id:
+        watchlist = get_persisted_watchlist(user_id)
+        return {"watchlist": watchlist}
     tracker = request.app.state.tracker
     return {"watchlist": tracker.list_watchlist()}
 

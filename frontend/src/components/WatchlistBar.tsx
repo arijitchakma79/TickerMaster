@@ -3,9 +3,18 @@ interface Props {
   activeTicker: string;
   onSelectTicker: (ticker: string) => void;
   onRemoveTicker: (ticker: string) => void;
+  favorites: string[];
+  onToggleFavorite: (ticker: string) => void;
 }
 
-export default function WatchlistBar({ watchlist, activeTicker, onSelectTicker, onRemoveTicker }: Props) {
+export default function WatchlistBar({
+  watchlist,
+  activeTicker,
+  onSelectTicker,
+  onRemoveTicker,
+  favorites,
+  onToggleFavorite
+}: Props) {
   return (
     <section className="integration-row watchlist-row">
       {watchlist.map((symbol) => (
@@ -15,11 +24,19 @@ export default function WatchlistBar({ watchlist, activeTicker, onSelectTicker, 
           </button>
           <button
             type="button"
+            className={`watchlist-favorite ${favorites.includes(symbol) ? "active" : ""}`}
+            onClick={() => onToggleFavorite(symbol)}
+            aria-label={`${favorites.includes(symbol) ? "Remove" : "Add"} ${symbol} ${favorites.includes(symbol) ? "from" : "to"} favorites`}
+            title={favorites.includes(symbol) ? "Unfavorite" : "Favorite"}
+          >
+            ★
+          </button>
+          <button
+            type="button"
             className="watchlist-remove"
             onClick={() => onRemoveTicker(symbol)}
             aria-label={`Remove ${symbol} from watchlist`}
             title={`Remove ${symbol}`}
-            disabled={watchlist.length <= 1}
           >
             ×
           </button>

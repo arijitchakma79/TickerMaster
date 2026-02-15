@@ -67,13 +67,20 @@ modal secret create tickermaster-secrets OPENROUTER_API_KEY=<your-openrouter-key
 modal deploy simulation/modal_inference.py
 ```
 
+For frontend auth, add these in `frontend/.env`:
+```bash
+VITE_API_URL=http://localhost:8000
+VITE_SUPABASE_URL=https://<your-project>.supabase.co
+VITE_SUPABASE_ANON_KEY=<your-publishable-key>
+```
+
 ### 2) Apply database schema in Supabase
 In Supabase Dashboard:
 1. Open `SQL Editor`.
 2. Paste contents of `supabase/schema.sql`.
 3. Run it once.
 
-This creates tables like `research_cache`, `agent_activity`, `simulations`, `tracker_agents`, and `tracker_alerts`.
+This creates tables like `research_cache`, `agent_activity`, `simulations`, `tracker_agents`, `tracker_alerts`, `watchlist`, and `favorite_stocks`.
 
 ### 3) Start backend (Terminal A)
 ```bash

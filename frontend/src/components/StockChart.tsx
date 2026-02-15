@@ -10,11 +10,12 @@ import {
 } from "lightweight-charts";
 import type { CandlePoint } from "../lib/types";
 
+export type ChartOverlayIndicator = "sma20" | "sma50" | "sma200" | "ema21" | "ema50" | "vwap" | "bbands";
+
 interface Props {
   points: CandlePoint[];
   mode: "candles" | "line";
-  showSma: boolean;
-  showEma: boolean;
+  indicators: Partial<Record<ChartOverlayIndicator, boolean>>;
 }
 
 function toTs(value: string): UTCTimestamp {
@@ -62,7 +63,44 @@ function ema(points: CandlePoint[], period: number): LineData<UTCTimestamp>[] {
   return out;
 }
 
-export default function StockChart({ points, mode, showSma, showEma }: Props) {
+function vwap(points: CandlePoint[]): LineData<UTCTimestamp>[] {
+  const out: LineData<UTCTimestamp>[] = [];
+  let cumulativeVolume = 0;
+  let cumulativeTpv = 0;
+  for (const point of points) {
+    const volume = Math.max(0, point.volume ?? 0);
+    const typicalPrice = (point.high + point.low + point.close) / 3;
+    cumulativeVolume += volume;
+    cumulativeTpv += typicalPrice * volume;
+    if (cumulativeVolume <= 0) continue;
+    out.push({ time: toTs(point.timestamp), value: cumulativeTpv / cumulativeVolume });
+  }
+  return out;
+}
+
+function bollinger(points: CandlePoint[], period = 20, stdDev = 2): {
+  upper: LineData<UTCTimestamp>[];
+  mid: LineData<UTCTimestamp>[];
+  lower: LineData<UTCTimestamp>[];
+} {
+  const upper: LineData<UTCTimestamp>[] = [];
+  const mid: LineData<UTCTimestamp>[] = [];
+  const lower: LineData<UTCTimestamp>[] = [];
+  if (points.length < period) return { upper, mid, lower };
+  for (let i = period - 1; i < points.length; i += 1) {
+    const slice = points.slice(i - period + 1, i + 1);
+    const mean = slice.reduce((acc, cur) => acc + cur.close, 0) / period;
+    const variance = slice.reduce((acc, cur) => acc + ((cur.close - mean) ** 2), 0) / period;
+    const sigma = Math.sqrt(variance);
+    const time = toTs(points[i].timestamp);
+    mid.push({ time, value: mean });
+    upper.push({ time, value: mean + (stdDev * sigma) });
+    lower.push({ time, value: mean - (stdDev * sigma) });
+  }
+  return { upper, mid, lower };
+}
+
+export default function StockChart({ points, mode, indicators }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const safePoints = useMemo(() => normalizePoints(points), [points]);
   const candles = useMemo(
@@ -141,18 +179,43 @@ export default function StockChart({ points, mode, showSma, showEma }: Props) {
     });
     volumeSeries.setData(volume);
 
-    if (showSma) {
-      const smaSeries = chart.addSeries(LineSeries, { color: "#63a8ff", lineWidth: 1 });
-      smaSeries.setData(sma(safePoints, 20));
+    if (indicators.sma20) {
+      const series = chart.addSeries(LineSeries, { color: "#63a8ff", lineWidth: 1 });
+      series.setData(sma(safePoints, 20));
     }
-    if (showEma) {
-      const emaSeries = chart.addSeries(LineSeries, { color: "#e5a24b", lineWidth: 1 });
-      emaSeries.setData(ema(safePoints, 21));
+    if (indicators.sma50) {
+      const series = chart.addSeries(LineSeries, { color: "#4f84e6", lineWidth: 1 });
+      series.setData(sma(safePoints, 50));
+    }
+    if (indicators.sma200) {
+      const series = chart.addSeries(LineSeries, { color: "#2f5fae", lineWidth: 1 });
+      series.setData(sma(safePoints, 200));
+    }
+    if (indicators.ema21) {
+      const series = chart.addSeries(LineSeries, { color: "#e5a24b", lineWidth: 1 });
+      series.setData(ema(safePoints, 21));
+    }
+    if (indicators.ema50) {
+      const series = chart.addSeries(LineSeries, { color: "#d88726", lineWidth: 1 });
+      series.setData(ema(safePoints, 50));
+    }
+    if (indicators.vwap) {
+      const series = chart.addSeries(LineSeries, { color: "#14b8a6", lineWidth: 1 });
+      series.setData(vwap(safePoints));
+    }
+    if (indicators.bbands) {
+      const bands = bollinger(safePoints, 20, 2);
+      const upper = chart.addSeries(LineSeries, { color: "rgba(163, 173, 186, 0.9)", lineWidth: 1 });
+      const mid = chart.addSeries(LineSeries, { color: "rgba(140, 158, 176, 0.8)", lineWidth: 1 });
+      const lower = chart.addSeries(LineSeries, { color: "rgba(163, 173, 186, 0.9)", lineWidth: 1 });
+      upper.setData(bands.upper);
+      mid.setData(bands.mid);
+      lower.setData(bands.lower);
     }
 
     chart.timeScale().fitContent();
     return () => chart.remove();
-  }, [candles, mode, safePoints, showEma, showSma, volume]);
+  }, [candles, indicators, mode, safePoints, volume]);
 
   return <div ref={containerRef} className="advanced-chart" />;
 }
